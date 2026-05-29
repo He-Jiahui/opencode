@@ -60,6 +60,8 @@ import type {
   FileListResponses,
   FilePartInput,
   FilePartSource,
+  FilePlanSaveErrors,
+  FilePlanSaveResponses,
   FileReadErrors,
   FileReadResponses,
   FileStatusErrors,
@@ -1549,6 +1551,47 @@ export class Find extends HeyApiClient {
   }
 }
 
+export class Plan extends HeyApiClient {
+  /**
+   * Save plan file
+   *
+   * Save a markdown plan under the project .opencode/plans directory.
+   */
+  public save<ThrowOnError extends boolean = false>(
+    parameters?: {
+      directory?: string
+      workspace?: string
+      title?: string
+      content?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+            { in: "body", key: "title" },
+            { in: "body", key: "content" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).post<FilePlanSaveResponses, FilePlanSaveErrors, ThrowOnError>({
+      url: "/file/plan",
+      ...options,
+      ...params,
+      headers: {
+        "Content-Type": "application/json",
+        ...options?.headers,
+        ...params.headers,
+      },
+    })
+  }
+}
+
 export class Ignore extends HeyApiClient {
   /**
    * Get ignore file
@@ -1711,6 +1754,11 @@ export class File extends HeyApiClient {
       ...options,
       ...params,
     })
+  }
+
+  private _plan?: Plan
+  get plan(): Plan {
+    return (this._plan ??= new Plan({ client: this.client }))
   }
 
   private _ignore?: Ignore

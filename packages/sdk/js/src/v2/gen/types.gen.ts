@@ -4952,6 +4952,40 @@ export type FileReadResponses = {
 
 export type FileReadResponse = FileReadResponses[keyof FileReadResponses]
 
+export type FilePlanSaveData = {
+  body?: {
+    title?: string
+    content: string
+  }
+  path?: never
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/file/plan"
+}
+
+export type FilePlanSaveErrors = {
+  /**
+   * Bad request
+   */
+  400: BadRequestError
+}
+
+export type FilePlanSaveError = FilePlanSaveErrors[keyof FilePlanSaveErrors]
+
+export type FilePlanSaveResponses = {
+  /**
+   * Saved plan file
+   */
+  200: {
+    title: string
+    path: string
+  }
+}
+
+export type FilePlanSaveResponse = FilePlanSaveResponses[keyof FilePlanSaveResponses]
+
 export type FileIgnoreGetData = {
   body?: never
   path?: never

@@ -106,6 +106,35 @@ Instructions here.
     ),
   )
 
+  it.live("discovers project skills from .codex/skills/ directory", () =>
+    provideTmpdirInstance(
+      (dir) =>
+        Effect.gen(function* () {
+          yield* Effect.promise(() =>
+            Bun.write(
+              path.join(dir, ".codex", "skills", "codex-skill", "SKILL.md"),
+              `---
+name: codex-skill
+description: A project skill in the .codex/skills directory.
+---
+
+# Codex Skill
+
+Instructions here.
+`,
+            ),
+          )
+
+          const skill = yield* Skill.Service
+          const list = (yield* skill.all()).filter((s) => s.location !== "<built-in>")
+          const item = list.find((x) => x.name === "codex-skill")
+          expect(item).toBeDefined()
+          expect(item!.description).toBe("A project skill in the .codex/skills directory.")
+          expect(item!.location).toContain(path.join(".codex", "skills", "codex-skill", "SKILL.md"))
+        }),
+    ),
+  )
+
   it.live("returns skill directories from Skill.dirs", () =>
     provideTmpdirInstance(
       (dir) =>

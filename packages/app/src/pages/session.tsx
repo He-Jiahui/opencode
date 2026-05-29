@@ -49,6 +49,7 @@ import { useSettings } from "@/context/settings"
 import { useSync } from "@/context/sync"
 import { useTerminal } from "@/context/terminal"
 import { type FollowupDraft, sendFollowupDraft } from "@/components/prompt-input/submit"
+import type { OpencodePlanBlock } from "@/utils/opencode-plan"
 import { createSessionComposerState, SessionComposerRegion } from "@/pages/session/composer"
 import {
   createOpenReviewFile,
@@ -2092,6 +2093,23 @@ export default function Page() {
     return planSession.milestones[id] ?? emptyPlanMilestones
   })
 
+  const savePlanBlock = async (block: OpencodePlanBlock) => {
+    return sdk.client.file
+      .plan.save({
+        title: block.title,
+        content: block.content,
+      })
+      .then((result) => result.data?.path)
+      .catch((err) => {
+        showToast({
+          variant: "error",
+          title: language.t("common.requestFailed"),
+          description: formatServerError(err, language.t, language.t("common.requestFailed")),
+        })
+        return undefined
+      })
+  }
+
   const parsePlanMilestones = (output: string) => {
     const matches = output.matchAll(PLAN_MILESTONE_PATTERN)
     return [...matches].map((match) => match[1]?.trim()).filter((text): text is string => !!text)
@@ -2162,6 +2180,28 @@ export default function Page() {
       PLAN_FOLLOWUP_PREFIX + Identifier.ascending("message"),
     )
     return true
+  }
+
+  const usePlanBlock = async (block: OpencodePlanBlock) => {
+    const sessionID = params.id
+    if (!sessionID) return
+    const path = await savePlanBlock(block)
+    if (!path) return
+    batch(() => {
+      setPlanSession("file", sessionID, path)
+      setPlanSession("enabled", sessionID, true)
+      setPlanSession("lastAssistant", sessionID, undefined)
+      setPlanSession("milestones", sessionID, [])
+      setFollowup("paused", sessionID, undefined)
+      removeQueuedPlanFollowups(sessionID)
+    })
+    if (queuePlanFollowup(sessionID, path, { notify: true })) return
+    showToast({
+      variant: "success",
+      icon: "circle-check",
+      title: language.t("session.plan.block.ready.title"),
+      description: language.t("session.plan.block.ready.description"),
+    })
   }
 
   const enablePlanSession = (sessionID: string, path: string, opts?: { resetMilestones?: boolean }) => {
@@ -2694,6 +2734,8 @@ export default function Page() {
                 <Show when={messagesReady()}>
                   <MessageTimeline
                     actions={actions}
+                    onPlanSave={savePlanBlock}
+                    onPlanContinue={usePlanBlock}
                     scroll={ui.scroll}
                     onResumeScroll={resumeScroll}
                     setScrollRef={setScrollRef}

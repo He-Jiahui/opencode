@@ -1,6 +1,7 @@
 import { describe, expect } from "bun:test"
 import { Deferred, Effect, Exit, Layer } from "effect"
 import { Session as SessionNs } from "@/session/session"
+import { ProjectID } from "@/project/schema"
 import { GlobalBus, type GlobalEvent } from "../../src/bus/global"
 import * as Log from "@opencode-ai/core/util/log"
 import { MessageV2 } from "../../src/session/message-v2"
@@ -13,6 +14,8 @@ import { Storage } from "@/storage/storage"
 import { SyncEvent } from "@/sync"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { BackgroundJob } from "@/background/job"
+import { AppFileSystem } from "@opencode-ai/core/filesystem"
+import path from "path"
 
 void Log.init({ print: false })
 
@@ -26,6 +29,7 @@ const it = testEffect(
       Layer.provide(BackgroundJob.defaultLayer),
     ),
     CrossSpawnSpawner.defaultLayer,
+    AppFileSystem.defaultLayer,
   ),
 )
 
@@ -171,6 +175,30 @@ describe("step-finish token propagation via Bus event", () => {
 })
 
 describe("Session", () => {
+  it.live("uses .codex/plans when the project has a .codex directory", () =>
+    Effect.gen(function* () {
+      const dir = yield* tmpdirScoped()
+      yield* AppFileSystem.use.ensureDir(path.join(dir, ".codex"))
+
+      const plan = SessionNs.plan(
+        { slug: "codex-plan", time: { created: 123 } },
+        {
+          directory: dir,
+          worktree: dir,
+          project: {
+            id: ProjectID.make("project-codex-plan"),
+            worktree: dir,
+            vcs: "git",
+            time: { created: 0, updated: 0 },
+            sandboxes: [],
+          },
+        },
+      )
+
+      expect(plan).toBe(path.join(dir, ".codex", "plans", "123-codex-plan.md"))
+    }),
+  )
+
   it.live("remove works without an instance", () =>
     Effect.gen(function* () {
       const session = yield* SessionNs.Service

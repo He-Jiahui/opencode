@@ -16,10 +16,12 @@ import * as Log from "@opencode-ai/core/util/log"
 import { Discovery } from "./discovery"
 import CUSTOMIZE_OPENCODE_SKILL_BODY from "./prompt/customize-opencode.md" with { type: "text" }
 import { isRecord } from "@/util/record"
+import { Flag } from "@opencode-ai/core/flag/flag"
 
 const log = Log.create({ service: "skill" })
 const CLAUDE_EXTERNAL_DIR = ".claude"
 const AGENTS_EXTERNAL_DIR = ".agents"
+const CODEX_PROJECT_DIR = ".codex"
 const EXTERNAL_SKILL_PATTERN = "skills/**/SKILL.md"
 const OPENCODE_SKILL_PATTERN = "{skill,skills}/**/SKILL.md"
 const SKILL_PATTERN = "**/SKILL.md"
@@ -199,6 +201,16 @@ const discoverSkills = Effect.fnUntraced(function* (
 
     for (const root of upDirs) {
       yield* scan(state, root, EXTERNAL_SKILL_PATTERN, { dot: true, scope: "project" })
+    }
+  }
+
+  if (!Flag.OPENCODE_DISABLE_PROJECT_CONFIG) {
+    const codexDirs = yield* fsys
+      .up({ targets: [CODEX_PROJECT_DIR], start: directory, stop: worktree })
+      .pipe(Effect.catch(() => Effect.succeed([] as string[])))
+
+    for (const root of codexDirs) {
+      yield* scan(state, root, OPENCODE_SKILL_PATTERN, { dot: true, scope: "project" })
     }
   }
 

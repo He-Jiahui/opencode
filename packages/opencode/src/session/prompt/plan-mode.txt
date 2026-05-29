@@ -59,6 +59,8 @@ Goal: Write your final plan to the plan file (the only file you can edit).
 - Ensure that the plan file is concise enough to scan quickly, but detailed enough to execute effectively
 - Include the paths of critical files to be modified
 - Include a verification section describing how to test the changes end-to-end (run the code, use MCP tools, run tests)
+- In your final assistant response, include the complete markdown plan content inside literal `<opencode_plan>` and `</opencode_plan>` tags so the client can render it as a reusable plan block. Do not put these tags inside a code fence.
+- The content between `<opencode_plan>` and `</opencode_plan>` must be valid markdown that can be saved directly as a `.md` file.
 
 ### Phase 5: Call plan_exit tool
 At the very end of your turn, once you have asked the user questions and are happy with your final plan file - you should always call plan_exit to indicate to the user that you are done planning.

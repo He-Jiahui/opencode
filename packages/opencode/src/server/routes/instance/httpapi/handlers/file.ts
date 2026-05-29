@@ -1,6 +1,7 @@
 import * as InstanceState from "@/effect/instance-state"
 import { File } from "@/file"
 import { FileIgnore } from "@/file/ignore"
+import * as PlanFile from "@/file/plan"
 import { Ripgrep } from "@/file/ripgrep"
 import { Effect } from "effect"
 import path from "path"
@@ -49,6 +50,19 @@ export const fileHandlers = HttpApiBuilder.group(InstanceHttpApi, "file", (handl
       return yield* svc.read(ctx.query.path)
     })
 
+    const savePlan = Effect.fn("FileHttpApi.savePlan")(function* (ctx: {
+      payload: { title?: string; content: string }
+    }) {
+      const instance = yield* InstanceState.context
+      return yield* Effect.promise(() =>
+        PlanFile.save({
+          worktree: instance.worktree,
+          title: ctx.payload.title,
+          content: ctx.payload.content,
+        }),
+      )
+    })
+
     const ignoreGet = Effect.fn("FileHttpApi.ignoreGet")(function* () {
       return yield* ignore.get()
     })
@@ -67,6 +81,7 @@ export const fileHandlers = HttpApiBuilder.group(InstanceHttpApi, "file", (handl
       .handle("findSymbol", findSymbol)
       .handle("list", list)
       .handle("content", content)
+      .handle("savePlan", savePlan)
       .handle("ignoreGet", ignoreGet)
       .handle("ignoreUpdate", ignoreUpdate)
       .handle("status", status)

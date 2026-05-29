@@ -2123,11 +2123,10 @@ export const layer: Layer.Layer<
         yield* runTester(workflow)
         return yield* get(workflowID)
       }
-      const active = items.some((item) =>
+      const activeCount = items.filter((item) =>
         ["planning", "executing", "reviewing", "testing"].includes(item.status),
-      )
-      if (active) return workflow
-      const ready = readyMilestones(definition, milestoneStates(items)).slice(0, 4)
+      ).length
+      const ready = readyMilestones(definition, milestoneStates(items)).slice(0, Math.max(0, 4 - activeCount))
       if (ready.length === 0) {
         if (items.some((item) => item.status === "rejected")) {
           for (const item of items.filter((item) => item.status === "rejected")) {
@@ -2136,6 +2135,7 @@ export const layer: Layer.Layer<
           yield* schedule(workflowID)
           return yield* get(workflowID)
         }
+        if (activeCount > 0) return workflow
         return yield* blockWorkflow(workflow, "No runnable milestones are available")
       }
       yield* setStatus(workflowID, "executing")

@@ -69,6 +69,9 @@ import { notifySessionTabsRemoved } from "@/components/titlebar-session-events"
 import { messageAgentColor } from "@/utils/agent"
 import { sessionTitle } from "@/utils/session-title"
 import { makeTimer } from "@solid-primitives/timer"
+import { Markdown } from "@opencode-ai/ui/markdown"
+import { OpencodePlanBlock } from "@/components/opencode-plan-block"
+import { parseOpencodePlanSegments, type OpencodePlanBlock as PlanBlock } from "@/utils/opencode-plan"
 import { MessageComment, SummaryDiff, Timeline, TimelineRow, TimelineRowMap } from "./message-timeline.data"
 
 const emptyMessages: MessageType[] = []
@@ -265,6 +268,8 @@ function TimelineDiffView(props: { diff: SummaryDiff }) {
 
 export function MessageTimeline(props: {
   actions?: UserActions
+  onPlanSave?: (plan: PlanBlock) => Promise<string | undefined>
+  onPlanContinue?: (plan: PlanBlock) => Promise<void> | void
   scroll: { overflow: boolean; bottom: boolean; jump: boolean }
   onResumeScroll: () => void
   setScrollRef: (el: HTMLDivElement | undefined) => void
@@ -1048,24 +1053,63 @@ export function MessageTimeline(props: {
       if (!item) return
       return partDefaultOpen(item, settings.general.shellToolPartsExpanded(), settings.general.editToolPartsExpanded())
     })
+    const planSegments = createMemo(() => {
+      const item = part()
+      if (!item || item.type !== "text") return
+      const text = (sync.data.part_text_accum_delta[item.id] ?? item.text)?.trim()
+      if (!text?.includes("<opencode_plan")) return
+      return parseOpencodePlanSegments(text)
+    })
 
     return (
       <Show when={message()}>
         {(message) => (
           <Show when={part()}>
-            {(part) => (
-              <MessagePart
-                part={part()}
-                message={message()}
-                showAssistantCopyPartID={assistantCopyPartID(row().userMessageID)}
-                turnDurationMs={turnDurationMs(row().userMessageID)}
-                defaultOpen={defaultOpen()}
-                toolOpen={toolOpen[part().id] ?? defaultOpen()}
-                onToolOpenChange={(open) => setToolOpen(part().id, open)}
-                deferToolContent={false}
-                virtualizeDiff={false}
-              />
-            )}
+            {(part) => {
+              const segments = planSegments()
+              if (segments) {
+                return (
+                  <div class="flex flex-col gap-3">
+                    <Index each={segments}>
+                      {(segment) => {
+                        const item = segment()
+                        if (item.type === "plan") {
+                          return (
+                            <OpencodePlanBlock
+                              plan={item}
+                              onSave={(plan) => props.onPlanSave?.(plan) ?? Promise.resolve(undefined)}
+                              onContinue={(plan) => props.onPlanContinue?.(plan)}
+                            />
+                          )
+                        }
+                        if (!item.text.trim()) return null
+                        return (
+                          <Markdown
+                            text={item.text}
+                            cacheKey={`${part().id}-${item.type}-${item.text.length}`}
+                            streaming={false}
+                          />
+                        )
+                      }}
+                    </Index>
+                  </div>
+                )
+              }
+
+              return (
+                <MessagePart
+                  part={part()}
+                  message={message()}
+                  showAssistantCopyPartID={assistantCopyPartID(row().userMessageID)}
+                  turnDurationMs={turnDurationMs(row().userMessageID)}
+                  defaultOpen={defaultOpen()}
+                  toolOpen={toolOpen[part().id] ?? defaultOpen()}
+                  onToolOpenChange={(open) => setToolOpen(part().id, open)}
+                  deferToolContent={false}
+                  virtualizeDiff={false}
+                />
+              )
+            }}
           </Show>
         )}
       </Show>

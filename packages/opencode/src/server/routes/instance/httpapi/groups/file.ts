@@ -22,6 +22,16 @@ export const FileIgnoreUpdate = Schema.Struct({
   content: Schema.String,
 })
 
+export const FilePlanSave = Schema.Struct({
+  title: Schema.optional(Schema.String),
+  content: Schema.String,
+})
+
+export const FilePlanSaved = Schema.Struct({
+  title: Schema.String,
+  path: Schema.String,
+})
+
 export const FindTextQuery = Schema.Struct({
   ...WorkspaceRoutingQueryFields,
   pattern: Schema.String,
@@ -48,6 +58,7 @@ export const FilePaths = {
   findSymbol: "/find/symbol",
   list: "/file",
   content: "/file/content",
+  plan: "/file/plan",
   ignore: "/file/ignore",
   status: "/file/status",
 } as const
@@ -104,6 +115,17 @@ export const FileApi = HttpApi.make("file")
             identifier: "file.read",
             summary: "Read file",
             description: "Read the content of a specified file.",
+          }),
+        ),
+        HttpApiEndpoint.post("savePlan", FilePaths.plan, {
+          query: WorkspaceRoutingQuery,
+          payload: FilePlanSave,
+          success: described(FilePlanSaved, "Saved plan file"),
+        }).annotateMerge(
+          OpenApi.annotations({
+            identifier: "file.plan.save",
+            summary: "Save plan file",
+            description: "Save a markdown plan under the project .opencode/plans directory.",
           }),
         ),
         HttpApiEndpoint.get("ignoreGet", FilePaths.ignore, {

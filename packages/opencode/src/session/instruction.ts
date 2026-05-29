@@ -11,11 +11,13 @@ import { Global } from "@opencode-ai/core/global"
 import type { MessageV2 } from "./message-v2"
 import type { MessageID } from "./schema"
 
-const files = (disableClaudeCodePrompt: boolean) => [
-  "AGENTS.md",
-  ...(disableClaudeCodePrompt ? [] : ["CLAUDE.md"]),
-  "CONTEXT.md", // deprecated
+const groups = (disableClaudeCodePrompt: boolean) => [
+  ["AGENTS.md", ".codex/AGENTS.md"],
+  ...(disableClaudeCodePrompt ? [] : [["CLAUDE.md"]]),
+  ["CONTEXT.md"], // deprecated
 ]
+
+const files = (disableClaudeCodePrompt: boolean) => groups(disableClaudeCodePrompt).flat()
 
 function extract(messages: MessageV2.WithParts[]) {
   const paths = new Set<string>()
@@ -118,14 +120,18 @@ export const layer: Layer.Layer<
         }
       }
 
-      // The first project-level match wins so we don't stack AGENTS.md/CLAUDE.md from every ancestor.
+      // The first project-level group wins so we don't stack AGENTS.md/CLAUDE.md from every ancestor.
       if (!Flag.OPENCODE_DISABLE_PROJECT_CONFIG) {
-        for (const file of instructionFiles) {
-          const matches = yield* fs
-            .findUp(file, ctx.directory, ctx.worktree)
-            .pipe(Effect.catch(() => Effect.succeed([])))
-          if (matches.length > 0) {
-            matches.forEach((item) => paths.add(path.resolve(item)))
+        for (const group of groups(flags.disableClaudeCodePrompt)) {
+          const matches = yield* Effect.forEach(
+            group,
+            (file) =>
+              fs.findUp(file, ctx.directory, ctx.worktree).pipe(Effect.catch(() => Effect.succeed([] as string[]))),
+            { concurrency: group.length },
+          )
+          const flattened = matches.flat()
+          if (flattened.length > 0) {
+            flattened.forEach((item) => paths.add(path.resolve(item)))
             break
           }
         }

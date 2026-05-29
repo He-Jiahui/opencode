@@ -218,6 +218,28 @@ describe("Instruction.system", () => {
     }),
   )
 
+  it.live("loads project .codex/AGENTS.md alongside root AGENTS.md", () =>
+    Effect.gen(function* () {
+      const projectTmp = yield* tmpWithFiles({
+        "AGENTS.md": "# Project Instructions",
+        ".codex/AGENTS.md": "# Codex Project Instructions",
+      })
+
+      yield* Effect.gen(function* () {
+        const svc = yield* Instruction.Service
+        const paths = yield* svc.systemPaths()
+        expect(paths.has(path.join(projectTmp, "AGENTS.md"))).toBe(true)
+        expect(paths.has(path.join(projectTmp, ".codex", "AGENTS.md"))).toBe(true)
+
+        const rules = yield* svc.system()
+        expect(rules).toContain(`Instructions from: ${path.join(projectTmp, "AGENTS.md")}\n# Project Instructions`)
+        expect(rules).toContain(
+          `Instructions from: ${path.join(projectTmp, ".codex", "AGENTS.md")}\n# Codex Project Instructions`,
+        )
+      }).pipe(provideInstance(projectTmp), provideInstruction({ home: projectTmp, config: projectTmp }))
+    }),
+  )
+
   it.live("skips project and global CLAUDE.md when Claude Code prompt is disabled", () =>
     Effect.gen(function* () {
       const globalTmp = yield* tmpWithFiles({ ".claude/CLAUDE.md": "# Global Claude" })

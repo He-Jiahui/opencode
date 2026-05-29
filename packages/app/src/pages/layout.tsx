@@ -84,6 +84,7 @@ import {
   LocalWorkspace,
   SortableWorkspace,
   WorkspaceDragOverlay,
+  WorkspaceSessionPanel,
   type WorkspaceSidebarContext,
 } from "./layout/sidebar-workspace"
 import { ProjectDragOverlay, SortableProject, type ProjectSidebarContext } from "./layout/sidebar-project"
@@ -163,6 +164,7 @@ export default function Layout(props: ParentProps) {
     sizing: false,
     peek: undefined as string | undefined,
     peeked: false,
+    sessionSidebarOpen: false,
   })
 
   const [update, setUpdate] = createStore({
@@ -1005,7 +1007,14 @@ export default function Layout(props: ParentProps) {
         title: language.t("command.sidebar.toggle"),
         category: language.t("command.category.view"),
         keybind: "mod+b",
-        onSelect: () => layout.sidebar.toggle(),
+        onSelect: () => {
+          if (!USE_NEW_DESIGN) {
+            layout.sidebar.toggle()
+            return
+          }
+          if (!params.dir) return
+          setState("sessionSidebarOpen", (open) => !open)
+        },
       },
       {
         id: "project.open",
@@ -2363,11 +2372,56 @@ export default function Layout(props: ParentProps) {
     />
   )
 
+  const v2SessionSidebar = () => (
+    <Show when={currentDir()}>
+      <Show when={!state.sessionSidebarOpen}>
+        <Tooltip value={language.t("sidebar.project.viewAllSessions")} placement="right">
+          <IconButton
+            icon="sidebar"
+            variant="secondary"
+            size="large"
+            class="absolute left-4 top-[52px] z-50 size-8 rounded-md shadow-[var(--v2-elevation-raised)]"
+            aria-label={language.t("sidebar.project.viewAllSessions")}
+            aria-expanded={state.sessionSidebarOpen}
+            aria-controls="session-sidebar"
+            onClick={() => setState("sessionSidebarOpen", true)}
+          />
+        </Tooltip>
+      </Show>
+      <Show when={state.sessionSidebarOpen}>
+        <aside
+          id="session-sidebar"
+          aria-label={language.t("sidebar.project.viewAllSessions")}
+          class="absolute bottom-2 left-2 top-[52px] z-40 flex w-[320px] max-w-[calc(100vw-16px)] flex-col overflow-hidden rounded-[10px] border border-border-weaker-base bg-background-base shadow-[var(--v2-elevation-floating)]"
+        >
+          <div class="flex h-10 shrink-0 items-center justify-between gap-2 border-b border-border-weaker-base px-3">
+            <div class="min-w-0 truncate text-14-medium text-text-strong">
+              {language.t("command.category.session")}
+            </div>
+            <Tooltip value={language.t("common.close")} placement="bottom">
+              <IconButton
+                icon="close-small"
+                variant="ghost"
+                class="size-7 rounded-md"
+                aria-label={language.t("common.close")}
+                onClick={() => setState("sessionSidebarOpen", false)}
+              />
+            </Tooltip>
+          </div>
+          <div class="min-h-0 flex-1 px-2">
+            <WorkspaceSessionPanel ctx={workspaceSidebarCtx} directory={currentDir} sortNow={sortNow} />
+          </div>
+        </aside>
+      </Show>
+    </Show>
+  )
+
   if (USE_NEW_DESIGN) {
     return (
       <div class="relative bg-v2-background-bg-deep flex-1 min-h-0 min-w-0 flex flex-col select-none [&_input]:select-text [&_textarea]:select-text [&_[contenteditable]]:select-text">
         {autoselecting() ?? ""}
         <Titlebar update={titlebarUpdate} />
+        {v2SessionSidebar()}
         <main
           class="flex-1 min-h-0 min-w-0 overflow-x-hidden flex flex-col items-start contain-strict bg-v2-background-bg-base"
           classList={{

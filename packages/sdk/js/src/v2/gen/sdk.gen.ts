@@ -52,6 +52,10 @@ import type {
   ExperimentalWorkspaceSyncListResponses,
   ExperimentalWorkspaceWarpErrors,
   ExperimentalWorkspaceWarpResponses,
+  FileIgnoreGetErrors,
+  FileIgnoreGetResponses,
+  FileIgnoreUpdateErrors,
+  FileIgnoreUpdateResponses,
   FileListErrors,
   FileListResponses,
   FilePartInput,
@@ -274,6 +278,21 @@ import type {
   VcsGetResponses,
   VcsStatusErrors,
   VcsStatusResponses,
+  WorkflowCancelErrors,
+  WorkflowCancelResponses,
+  WorkflowGetErrors,
+  WorkflowGetResponses,
+  WorkflowGraphErrors,
+  WorkflowGraphResponses,
+  WorkflowListErrors,
+  WorkflowListResponses,
+  WorkflowResumeErrors,
+  WorkflowResumeResponses,
+  WorkflowStartErrors,
+  WorkflowStartInput,
+  WorkflowStartResponses,
+  WorkflowUpdateXmlErrors,
+  WorkflowUpdateXmlResponses,
   WorktreeCreateErrors,
   WorktreeCreateInput,
   WorktreeCreateResponses,
@@ -1530,6 +1549,75 @@ export class Find extends HeyApiClient {
   }
 }
 
+export class Ignore extends HeyApiClient {
+  /**
+   * Get ignore file
+   *
+   * Read the active OpenCode ignore file for this project.
+   */
+  public get<ThrowOnError extends boolean = false>(
+    parameters?: {
+      directory?: string
+      workspace?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).get<FileIgnoreGetResponses, FileIgnoreGetErrors, ThrowOnError>({
+      url: "/file/ignore",
+      ...options,
+      ...params,
+    })
+  }
+
+  /**
+   * Update ignore file
+   *
+   * Create or update the project .opencode/.ignore file.
+   */
+  public update<ThrowOnError extends boolean = false>(
+    parameters?: {
+      directory?: string
+      workspace?: string
+      content?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+            { in: "body", key: "content" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).put<FileIgnoreUpdateResponses, FileIgnoreUpdateErrors, ThrowOnError>({
+      url: "/file/ignore",
+      ...options,
+      ...params,
+      headers: {
+        "Content-Type": "application/json",
+        ...options?.headers,
+        ...params.headers,
+      },
+    })
+  }
+}
+
 export class File extends HeyApiClient {
   /**
    * List files
@@ -1623,6 +1711,11 @@ export class File extends HeyApiClient {
       ...options,
       ...params,
     })
+  }
+
+  private _ignore?: Ignore
+  get ignore(): Ignore {
+    return (this._ignore ??= new Ignore({ client: this.client }))
   }
 }
 
@@ -5009,6 +5102,244 @@ export class Tui extends HeyApiClient {
   }
 }
 
+export class Workflow extends HeyApiClient {
+  /**
+   * List workflows
+   *
+   * List automated agent workflows in the current project.
+   */
+  public list<ThrowOnError extends boolean = false>(
+    parameters?: {
+      directory?: string
+      workspace?: string
+      sessionID?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+            { in: "query", key: "sessionID" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).get<WorkflowListResponses, WorkflowListErrors, ThrowOnError>({
+      url: "/workflow",
+      ...options,
+      ...params,
+    })
+  }
+
+  /**
+   * Start workflow
+   *
+   * Start an automated product-manager, executor, reviewer, and tester workflow.
+   */
+  public start<ThrowOnError extends boolean = false>(
+    parameters?: {
+      directory?: string
+      workspace?: string
+      workflowStartInput?: WorkflowStartInput
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+            { key: "workflowStartInput", map: "body" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).post<WorkflowStartResponses, WorkflowStartErrors, ThrowOnError>({
+      url: "/workflow",
+      ...options,
+      ...params,
+      headers: {
+        "Content-Type": "application/json",
+        ...options?.headers,
+        ...params.headers,
+      },
+    })
+  }
+
+  /**
+   * Get workflow
+   *
+   * Get workflow status and metadata.
+   */
+  public get<ThrowOnError extends boolean = false>(
+    parameters: {
+      workflowID: string
+      directory?: string
+      workspace?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "workflowID" },
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).get<WorkflowGetResponses, WorkflowGetErrors, ThrowOnError>({
+      url: "/workflow/{workflowID}",
+      ...options,
+      ...params,
+    })
+  }
+
+  /**
+   * Get workflow graph
+   *
+   * Get graph nodes and edges for a workflow.
+   */
+  public graph<ThrowOnError extends boolean = false>(
+    parameters: {
+      workflowID: string
+      directory?: string
+      workspace?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "workflowID" },
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).get<WorkflowGraphResponses, WorkflowGraphErrors, ThrowOnError>({
+      url: "/workflow/{workflowID}/graph",
+      ...options,
+      ...params,
+    })
+  }
+
+  /**
+   * Update workflow XML
+   *
+   * Replace the canonical workflow XML and rebuild the dependency graph.
+   */
+  public updateXml<ThrowOnError extends boolean = false>(
+    parameters: {
+      workflowID: string
+      directory?: string
+      workspace?: string
+      xml?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "workflowID" },
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+            { in: "body", key: "xml" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).patch<WorkflowUpdateXmlResponses, WorkflowUpdateXmlErrors, ThrowOnError>({
+      url: "/workflow/{workflowID}/xml",
+      ...options,
+      ...params,
+      headers: {
+        "Content-Type": "application/json",
+        ...options?.headers,
+        ...params.headers,
+      },
+    })
+  }
+
+  /**
+   * Resume workflow
+   *
+   * Resume a blocked or paused workflow.
+   */
+  public resume<ThrowOnError extends boolean = false>(
+    parameters: {
+      workflowID: string
+      directory?: string
+      workspace?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "workflowID" },
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).post<WorkflowResumeResponses, WorkflowResumeErrors, ThrowOnError>({
+      url: "/workflow/{workflowID}/resume",
+      ...options,
+      ...params,
+    })
+  }
+
+  /**
+   * Cancel workflow
+   *
+   * Cancel an automated workflow.
+   */
+  public cancel<ThrowOnError extends boolean = false>(
+    parameters: {
+      workflowID: string
+      directory?: string
+      workspace?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "workflowID" },
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).post<WorkflowCancelResponses, WorkflowCancelErrors, ThrowOnError>({
+      url: "/workflow/{workflowID}/cancel",
+      ...options,
+      ...params,
+    })
+  }
+}
+
 export class OpencodeClient extends HeyApiClient {
   public static readonly __registry = new HeyApiRegistry<OpencodeClient>()
 
@@ -5150,5 +5481,10 @@ export class OpencodeClient extends HeyApiClient {
   private _tui?: Tui
   get tui(): Tui {
     return (this._tui ??= new Tui({ client: this.client }))
+  }
+
+  private _workflow?: Workflow
+  get workflow(): Workflow {
+    return (this._workflow ??= new Workflow({ client: this.client }))
   }
 }

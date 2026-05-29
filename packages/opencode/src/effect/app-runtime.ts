@@ -10,6 +10,7 @@ import { Config } from "@/config/config"
 import { Git } from "@/git"
 import { Ripgrep } from "@/file/ripgrep"
 import { File } from "@/file"
+import { FileIgnore } from "@/file/ignore"
 import { FileWatcher } from "@/file/watcher"
 import { Storage } from "@/storage/storage"
 import { Snapshot } from "@/snapshot"
@@ -45,6 +46,7 @@ import { Project } from "@/project/project"
 import { Vcs } from "@/project/vcs"
 import { Reference } from "@/reference/reference"
 import { Workspace } from "@/control-plane/workspace"
+import { Workflow } from "@/workflow/workflow"
 import { Worktree } from "@/worktree"
 import { Pty } from "@/pty"
 import { PtyTicket } from "@/pty/ticket"
@@ -69,6 +71,7 @@ export const AppLayer = Layer.mergeAll(
   Git.defaultLayer,
   Ripgrep.defaultLayer,
   File.defaultLayer,
+  FileIgnore.defaultLayer,
   FileWatcher.defaultLayer,
   Storage.defaultLayer,
   Snapshot.defaultLayer,
@@ -105,6 +108,7 @@ export const AppLayer = Layer.mergeAll(
   Vcs.defaultLayer,
   Reference.defaultLayer,
   Workspace.defaultLayer,
+  Workflow.defaultLayer,
   Worktree.appLayer,
   Pty.defaultLayer,
   PtyTicket.defaultLayer,

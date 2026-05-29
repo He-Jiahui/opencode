@@ -37,6 +37,7 @@ import { DialogModel } from "@tui/component/dialog-model"
 import { useConnected } from "@tui/component/use-connected"
 import { DialogMcp } from "@tui/component/dialog-mcp"
 import { DialogStatus } from "@tui/component/dialog-status"
+import { DialogWorkflow } from "@tui/component/dialog-workflow"
 import { DialogThemeList } from "@tui/component/dialog-theme-list"
 import { DialogHelp } from "./ui/dialog-help"
 import { DialogAgent } from "@tui/component/dialog-agent"
@@ -106,6 +107,7 @@ const appBindingCommands = [
   "provider.connect",
   "console.org.switch",
   "opencode.status",
+  "workflow.view",
   "theme.switch",
   "theme.switch_mode",
   "theme.mode.lock",
@@ -647,6 +649,19 @@ function App(props: { onSnapshot?: () => Promise<string[]> }) {
           dialog.replace(() => <DialogStatus />)
         },
         category: "System",
+      },
+      {
+        name: "workflow.view",
+        title: "View workflow",
+        slashName: "workflow",
+        enabled: () => route.data.type === "session",
+        run: () => {
+          const current = route.data
+          if (current.type !== "session") return
+          dialog.setSize("large")
+          dialog.replace(() => <DialogWorkflow sessionID={current.sessionID} />)
+        },
+        category: "Session",
       },
       {
         name: "theme.switch",

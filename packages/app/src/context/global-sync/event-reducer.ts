@@ -10,6 +10,9 @@ import type {
   SessionStatus,
   SnapshotFileDiff,
   Todo,
+  Workflow,
+  WorkflowGraph,
+  WorkflowMilestone,
 } from "@opencode-ai/sdk/v2/client"
 import type { State, VcsCache } from "./types"
 import { trimSessions } from "./session-trim"
@@ -164,6 +167,66 @@ export function applyDirectoryEvent(input: {
       cleanupSessionCaches(input.setStore, info.id, input.setSessionTodo)
       if (info.parentID) break
       input.setStore("sessionTotal", (value) => Math.max(0, value - 1))
+      break
+    }
+    case "workflow.created":
+    case "workflow.updated": {
+      const info = (event.properties as { info: Workflow }).info
+      const result = Binary.search(input.store.workflow, info.id, (item) => item.id)
+      if (result.found) {
+        input.setStore("workflow", result.index, reconcile(info))
+        break
+      }
+      input.setStore(
+        "workflow",
+        produce((draft) => {
+          draft.splice(result.index, 0, info)
+        }),
+      )
+      break
+    }
+    case "workflow.node.updated": {
+      const props = event.properties as { workflowID: string; milestone: WorkflowMilestone }
+      const graph = input.store.workflow_graph[props.workflowID]
+      if (!graph) break
+      input.setStore(
+        "workflow_graph",
+        props.workflowID,
+        "milestones",
+        (milestones) => milestones.map((milestone) => (milestone.id === props.milestone.id ? props.milestone : milestone)),
+      )
+      input.setStore(
+        "workflow_graph",
+        props.workflowID,
+        "nodes",
+        (nodes) =>
+          nodes.map((node) =>
+            node.milestoneID === props.milestone.id
+              ? {
+                  ...node,
+                  status: props.milestone.status,
+                  title: props.milestone.title ?? props.milestone.id,
+                  path: props.milestone.planPath,
+                }
+              : node,
+          ),
+      )
+      break
+    }
+    case "workflow.graph.updated": {
+      const graph = (event.properties as { graph: WorkflowGraph }).graph
+      input.setStore("workflow_graph", graph.workflow.id, reconcile(graph))
+      const result = Binary.search(input.store.workflow, graph.workflow.id, (item) => item.id)
+      if (result.found) {
+        input.setStore("workflow", result.index, reconcile(graph.workflow))
+        break
+      }
+      input.setStore(
+        "workflow",
+        produce((draft) => {
+          draft.splice(result.index, 0, graph.workflow)
+        }),
+      )
       break
     }
     case "session.diff": {

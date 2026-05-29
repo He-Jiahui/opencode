@@ -86,6 +86,7 @@ import { getScrollAcceleration } from "../../util/scroll"
 import { collapseToolOutput } from "../../util/collapse-tool-output"
 import { TuiPluginRuntime } from "@/cli/cmd/tui/plugin/runtime"
 import { DialogRetryAction } from "../../component/dialog-retry-action"
+import { DialogWorkflow } from "../../component/dialog-workflow"
 import { SessionRetry } from "@/session/retry"
 import { getRevertDiffFiles } from "../../util/revert-diff"
 import { OPENCODE_BASE_MODE, useBindings, useCommandShortcut, useOpencodeKeymap } from "../../keymap"
@@ -123,6 +124,7 @@ const sessionBindingCommands = [
   "session.timeline",
   "session.fork",
   "session.compact",
+  "workflow.view",
   "session.unshare",
   "session.undo",
   "session.redo",
@@ -562,6 +564,17 @@ export function Session() {
           providerID: selectedModel.providerID,
         })
         dialog.clear()
+      },
+    },
+    {
+      title: "View workflow",
+      value: "workflow.view",
+      category: "Session",
+      slash: {
+        name: "workflow",
+      },
+      run: () => {
+        dialog.replace(() => <DialogWorkflow sessionID={route.sessionID} />)
       },
     },
     {

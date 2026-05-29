@@ -1,5 +1,6 @@
 import { createMemo, createSignal } from "solid-js"
 import { useLocal } from "@tui/context/local"
+import { DEFAULT_MODEL_VARIANT } from "@tui/context/model-variant"
 import { useSync } from "@tui/context/sync"
 import { map, pipe, flatMap, entries, filter, sortBy, take } from "remeda"
 import { DialogSelect } from "@tui/ui/dialog-select"
@@ -134,7 +135,7 @@ export function DialogModel(props: { providerID?: string }) {
     local.model.set({ providerID, modelID }, { recent: true })
     const list = local.model.variant.list()
     const cur = local.model.variant.selected()
-    if (cur === "default" || (cur && list.includes(cur))) {
+    if (cur === DEFAULT_MODEL_VARIANT || (cur && list.includes(cur)) || local.model.variant.current()) {
       dialog.clear()
       return
     }

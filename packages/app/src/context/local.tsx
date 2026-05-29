@@ -6,7 +6,7 @@ import { createStore } from "solid-js/store"
 import { useModels } from "@/context/models"
 import { useProviders } from "@/hooks/use-providers"
 import { Persist, persisted } from "@/utils/persist"
-import { cycleModelVariant, getConfiguredAgentVariant, resolveModelVariant } from "./model-variant"
+import { cycleModelVariant, getConfiguredAgentVariant, listModelVariants, resolveModelVariant } from "./model-variant"
 import { useSDK } from "./sdk"
 import { useSync } from "./sync"
 
@@ -320,6 +320,7 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
             configured: this.configured(),
           })
           if (resolved) return resolved
+          if (this.selected() === null) return
           const model = current()
           if (!model) return
           const saved = models.variant.get({ providerID: model.provider.id, modelID: model.id })
@@ -327,8 +328,8 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
         },
         list() {
           const item = current()
-          if (!item?.variants) return []
-          return Object.keys(item.variants)
+          if (!item) return []
+          return listModelVariants({ providerID: item.provider.id, modelID: item.id, variants: item.variants })
         },
         set(value: string | undefined) {
           batch(() => {

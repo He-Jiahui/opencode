@@ -348,6 +348,67 @@ export const useSessionCommands = (actions: SessionCommandContext) => {
     })
   }
 
+  const workflowPrompt = () => {
+    const message = visibleUserMessages().at(-1)
+    if (!message) return info()?.title ?? ""
+    return extractPromptFromParts(sync.data.part[message.id] ?? [], { directory: sdk.directory })
+      .map((part) => {
+        if (part.type === "image") return `[image:${part.filename}]`
+        if (part.type === "file") return `@${part.path}`
+        if (part.type === "agent") return `@${part.name}`
+        return part.content
+      })
+      .join("")
+      .trim()
+  }
+
+  const startWorkflow = async () => {
+    const sessionID = params.id
+    if (!sessionID) return
+    const workflowVariants = () => {
+      const variants = local.model.variant.list()
+      if (variants.length === 0) return []
+      return variants.includes("default") ? variants : ["default", ...variants]
+    }
+    void import("@/components/dialog-start-workflow").then((x) => {
+      dialog.show(() => (
+        <x.DialogStartWorkflow
+          initialRequest={workflowPrompt()}
+          variants={workflowVariants()}
+          initialVariant={local.model.variant.current() ?? "default"}
+          onStart={(input) => {
+            const model = local.model.current()
+            void sdk.client.workflow
+              .start({
+                workflowStartInput: {
+                  sessionID,
+                  prompt: input.request,
+                  model: model ? `${model.provider.id}/${model.id}` : undefined,
+                  variant: input.variant,
+                  agent: local.agent.current()?.name,
+                },
+              })
+              .then(() => {
+                dialog.close()
+                showToast({
+                  variant: "success",
+                  icon: "circle-check",
+                  title: language.t("session.workflow.started.title"),
+                })
+              })
+              .catch((error) =>
+                showToast({
+                  variant: "error",
+                  title: language.t("common.requestFailed"),
+                  description: error instanceof Error ? error.message : String(error),
+                }),
+              )
+          }}
+        />
+      ))
+    })
+  }
+
   const fork = () => {
     void import("@/components/dialog-fork").then((x) => {
       dialog.show(() => <x.DialogFork />)
@@ -409,6 +470,14 @@ export const useSessionCommands = (actions: SessionCommandContext) => {
       slash: "compact",
       disabled: !params.id || visibleUserMessages().length === 0,
       onSelect: compact,
+    }),
+    sessionCommand({
+      id: "session.workflow.start",
+      title: language.t("session.workflow.start"),
+      description: language.t("session.workflow.xml"),
+      slash: "workflow",
+      disabled: !params.id,
+      onSelect: startWorkflow,
     }),
     sessionCommand({
       id: "session.fork",

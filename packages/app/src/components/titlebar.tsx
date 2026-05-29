@@ -744,7 +744,7 @@ function TabNavItem(props: {
   const isActive = () => !!match()
   return (
     <div
-      class="group relative flex h-7 min-w-24 max-w-60 flex-row items-center gap-1.5 overflow-hidden whitespace-nowrap rounded-[6px] bg-[var(--tab-bg)] pl-1.5 [--tab-bg:var(--v2-background-bg-deep)] hover:[--tab-bg:var(--v2-background-bg-layer-02)] data-[active='true']:[--tab-bg:var(--v2-background-bg-layer-02)]"
+      class="group relative flex h-7 min-w-24 max-w-60 flex-row items-center gap-1.5 overflow-hidden whitespace-nowrap rounded-[6px] bg-[var(--tab-bg)] px-1.5 [--tab-bg:var(--v2-background-bg-deep)] hover:[--tab-bg:var(--v2-background-bg-layer-02)] data-[active='true']:[--tab-bg:var(--v2-background-bg-layer-02)]"
       data-active={isActive()}
     >
       <a
@@ -755,20 +755,27 @@ function TabNavItem(props: {
         <span class="text-clip leading-5">{props.title}</span>
       </a>
 
-      <div class="absolute right-0 inset-y-0 flex flex-row items-center pr-1 py-1 w-8 pl-2">
-        <div
-          class="absolute inset-0 bg-(image:--inactive-bg) group-hover:bg-(image:--active-bg) group-data-[active=true]:bg-(image:--active-bg)"
-          style={{
-            "--inactive-bg": "linear-gradient(to right, transparent 0%, var(--tab-bg) 80%)",
-            "--active-bg": "linear-gradient(90deg, transparent 0%, var(--tab-bg) 25%)",
-          }}
-        />
+      <div
+        class="shrink-0 flex items-center justify-center size-5 transition-opacity"
+        classList={{
+          "opacity-0 pointer-events-none": !!props.hideClose,
+          "opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 group-data-[active='true']:opacity-100": !props.hideClose,
+        }}
+      >
         <IconButtonV2
           size="small"
           variant="ghost-muted"
-          class="opacity-0 group-hover:opacity-100 group-data-[active='true']:opacity-100"
-          onClick={props.onClose}
+          onMouseDown={(event) => {
+            event.preventDefault()
+            event.stopPropagation()
+          }}
+          onClick={(event) => {
+            event.preventDefault()
+            event.stopPropagation()
+            props.onClose()
+          }}
           icon={<IconV2 name="xmark-small" />}
+          aria-label="Close tab"
         />
       </div>
     </div>

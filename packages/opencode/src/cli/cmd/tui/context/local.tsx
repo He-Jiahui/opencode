@@ -12,6 +12,12 @@ import { iife } from "@/util/iife"
 import { useToast } from "../ui/toast"
 import { useArgs } from "./args"
 import { useSDK } from "./sdk"
+import {
+  DEFAULT_MODEL_VARIANT,
+  cycleModelVariant,
+  getConfiguredAgentVariant,
+  resolveModelVariant,
+} from "./model-variant"
 import { RGBA } from "@opentui/core"
 import { Filesystem } from "@/util/filesystem"
 
@@ -120,12 +126,14 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
           providerID: string
           modelID: string
         }[]
+        selected: Record<string, string | undefined>
         variant: Record<string, string | undefined>
       }>({
         ready: false,
         model: {},
         recent: [],
         favorite: [],
+        selected: {},
         variant: {},
       })
 
@@ -145,6 +153,10 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
           favorite: modelStore.favorite,
           variant: modelStore.variant,
         })
+      }
+
+      function variantKey(model: { providerID: string; modelID: string }) {
+        return `${model.providerID}/${model.modelID}`
       }
 
       Filesystem.readJson(filePath)
@@ -336,17 +348,32 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
           })
         },
         variant: {
+          configured() {
+            const m = currentModel()
+            if (!m) return undefined
+            const provider = sync.data.provider.find((x) => x.id === m.providerID)
+            const info = provider?.models[m.modelID]
+            return getConfiguredAgentVariant({
+              agent: agent.current(),
+              model: info ? { providerID: m.providerID, modelID: m.modelID, variants: info.variants } : undefined,
+            })
+          },
           selected() {
             const m = currentModel()
             if (!m) return undefined
-            const key = `${m.providerID}/${m.modelID}`
-            return modelStore.variant[key]
+            return modelStore.selected[variantKey(m)]
           },
           current() {
-            const v = this.selected()
-            if (!v) return undefined
-            if (!this.list().includes(v)) return undefined
-            return v
+            const variants = this.list()
+            const selected = this.selected()
+            const configured = this.configured()
+            const resolved = resolveModelVariant({ variants, selected, configured })
+            if (resolved || selected === DEFAULT_MODEL_VARIANT) return resolved
+            const m = currentModel()
+            if (!m) return undefined
+            const saved = modelStore.variant[variantKey(m)]
+            if (saved === DEFAULT_MODEL_VARIANT) return undefined
+            if (saved && variants.includes(saved)) return saved
           },
           list() {
             const m = currentModel()
@@ -359,24 +386,24 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
           set(value: string | undefined) {
             const m = currentModel()
             if (!m) return
-            const key = `${m.providerID}/${m.modelID}`
-            setModelStore("variant", key, value ?? "default")
+            const key = variantKey(m)
+            setModelStore("selected", key, value ?? DEFAULT_MODEL_VARIANT)
+            setModelStore("variant", key, value ?? DEFAULT_MODEL_VARIANT)
             save()
           },
           cycle() {
             const variants = this.list()
             if (variants.length === 0) return
-            const current = this.current()
-            if (!current) {
-              this.set(variants[0])
-              return
-            }
-            const index = variants.indexOf(current)
-            if (index === -1 || index === variants.length - 1) {
-              this.set(undefined)
-              return
-            }
-            this.set(variants[index + 1])
+            const configured = this.configured()
+            const m = currentModel()
+            const saved = m ? modelStore.variant[variantKey(m)] : undefined
+            this.set(
+              cycleModelVariant({
+                variants,
+                selected: this.selected() ?? (configured ? undefined : saved),
+                configured,
+              }),
+            )
           },
         },
       }

@@ -19,6 +19,7 @@ import { disposeAllInstances, provideInstance, TestInstance, tmpdirScoped } from
 import { testEffect } from "../lib/effect"
 import { Reference } from "@/reference/reference"
 import { RepositoryCache } from "@/reference/repository-cache"
+import { FileIgnore } from "@/file/ignore"
 
 const FIXTURES_DIR = path.join(import.meta.dir, "fixtures")
 
@@ -51,6 +52,7 @@ const readLayer = (flags: Partial<RuntimeFlags.Info> = {}) =>
     CrossSpawnSpawner.defaultLayer,
     Instruction.defaultLayer,
     LSP.defaultLayer,
+    FileIgnore.defaultLayer,
     referenceLayer(flags),
     Truncate.defaultLayer,
   )
@@ -148,6 +150,20 @@ const asks = () => {
 }
 
 describe("tool.read external_directory permission", () => {
+  it.live("lists directories using opencode ignore instead of gitignore", () =>
+    Effect.gen(function* () {
+      const dir = yield* tmpdirScoped({ git: true })
+      yield* put(path.join(dir, ".gitignore"), "*.secret\n")
+      yield* put(path.join(dir, "visible.secret"), "visible")
+      yield* put(path.join(dir, "ignored.tmp"), "ignored")
+      yield* put(path.join(dir, ".opencode", ".ignore"), "*.tmp\n")
+
+      const result = yield* exec(dir, { filePath: dir })
+      expect(result.output).toContain("visible.secret")
+      expect(result.output).not.toContain("ignored.tmp")
+    }),
+  )
+
   it.live("allows reading absolute path inside project directory", () =>
     Effect.gen(function* () {
       const dir = yield* tmpdirScoped()
@@ -488,6 +504,17 @@ describe("tool.read truncation", () => {
       const result = yield* exec(dir, { filePath: path.join(dir, "dir"), offset: 6, limit: 5 })
       expect(result.metadata.truncated).toBe(false)
       expect(result.output).not.toContain("Showing 5 of 10 entries")
+    }),
+  )
+
+  it.live("shows child counts for directory entries", () =>
+    Effect.gen(function* () {
+      const dir = yield* tmpdirScoped()
+      yield* put(path.join(dir, "src", "index.ts"), "export {}")
+      yield* put(path.join(dir, "src", "main.ts"), "export {}")
+
+      const result = yield* exec(dir, { filePath: dir })
+      expect(result.output).toContain("src/ (2 entries)")
     }),
   )
 

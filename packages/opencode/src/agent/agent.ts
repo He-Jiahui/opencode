@@ -278,6 +278,118 @@ export const layer = Layer.effect(
             ),
             prompt: PROMPT_SUMMARY,
           },
+          "workflow-main-pm": {
+            name: "workflow-main-pm",
+            description: "Main product manager for automated workflow planning.",
+            mode: "all",
+            native: true,
+            hidden: true,
+            permission: Permission.merge(
+              defaults,
+              Permission.fromConfig({
+                read: "allow",
+                list: "allow",
+                glob: "allow",
+                grep: "allow",
+                bash: "deny",
+                task: "deny",
+                edit: {
+                  "*": "deny",
+                  [path.join(".opencode", "workflows", "**")]: "allow",
+                },
+              }),
+              user,
+            ),
+            prompt:
+              "You are the main product manager in an automated opencode workflow. Produce broad milestones, canonical XML, and high-level plans under .opencode/workflows.",
+            options: {},
+          },
+          "workflow-department-pm": {
+            name: "workflow-department-pm",
+            description: "Department product manager for a single workflow milestone.",
+            mode: "all",
+            native: true,
+            hidden: true,
+            permission: Permission.merge(
+              defaults,
+              Permission.fromConfig({
+                read: "allow",
+                list: "allow",
+                glob: "allow",
+                grep: "allow",
+                bash: "deny",
+                task: "deny",
+                edit: {
+                  "*": "deny",
+                  [path.join(".opencode", "workflows", "**")]: "allow",
+                },
+              }),
+              user,
+            ),
+            prompt:
+              "You are a department product manager in an automated opencode workflow. Turn one milestone into an implementation-ready plan file.",
+            options: {},
+          },
+          "workflow-executor": {
+            name: "workflow-executor",
+            description: "Executor for a workflow milestone.",
+            mode: "all",
+            native: true,
+            hidden: true,
+            permission: Permission.merge(
+              defaults,
+              Permission.fromConfig({
+                question: "allow",
+              }),
+              user,
+            ),
+            prompt:
+              "You are an executor in an automated opencode workflow. Follow the assigned milestone plan continuously until the milestone is complete.",
+            options: {},
+          },
+          "workflow-reviewer": {
+            name: "workflow-reviewer",
+            description: "Reviewer for workflow milestone completion.",
+            mode: "all",
+            native: true,
+            hidden: true,
+            permission: Permission.merge(
+              defaults,
+              Permission.fromConfig({
+                read: "allow",
+                list: "allow",
+                glob: "allow",
+                grep: "allow",
+                bash: "allow",
+                task: "deny",
+                edit: {
+                  "*": "deny",
+                  [path.join(".opencode", "workflows", "**")]: "allow",
+                },
+              }),
+              user,
+            ),
+            prompt:
+              "You are a reviewer in an automated opencode workflow. Decide approve or reject using the requested XML review marker.",
+            options: {},
+          },
+          "workflow-tester": {
+            name: "workflow-tester",
+            description: "Tester for an approved workflow.",
+            mode: "all",
+            native: true,
+            hidden: true,
+            permission: Permission.merge(
+              defaults,
+              Permission.fromConfig({
+                question: "allow",
+              }),
+              user,
+            ),
+            prompt:
+              "You are a tester in an automated opencode workflow. Add targeted tests and run relevant checks after all milestones are approved.",
+            options: {},
+          },
         }
 
         for (const [key, value] of Object.entries(cfg.agent ?? {})) {

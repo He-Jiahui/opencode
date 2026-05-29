@@ -29,6 +29,12 @@ export const roots = (store: SessionStore) =>
 
 export const sortedRootSessions = (store: SessionStore, now: number) => roots(store).sort(sortSessions(now))
 
+export const sortedChildSessions = (sessions: Session[] | undefined, parentID: string, now: number) =>
+  (sessions ?? []).filter((session) => session.parentID === parentID && !session.time?.archived).sort(sortSessions(now))
+
+export const childSessionCount = (sessions: Session[] | undefined, parentID: string) =>
+  (sessions ?? []).filter((session) => session.parentID === parentID && !session.time?.archived).length
+
 export const latestRootSession = (stores: SessionStore[], now: number) =>
   stores.flatMap(roots).sort(sortSessions(now))[0]
 
@@ -37,6 +43,12 @@ export function hasProjectPermissions<T>(
   include: (item: T) => boolean = () => true,
 ) {
   return Object.values(request ?? {}).some((list) => list?.some(include))
+}
+
+export const sessionOnPath = (sessions: Session[] | undefined, rootID: string, activeID?: string) => {
+  if (!activeID) return false
+  if (activeID === rootID) return true
+  return !!childSessionOnPath(sessions, rootID, activeID)
 }
 
 export const childSessionOnPath = (sessions: Session[] | undefined, rootID: string, activeID?: string) => {

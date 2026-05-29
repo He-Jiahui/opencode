@@ -3,6 +3,32 @@ import type { Prompt } from "@/context/prompt"
 import { buildRequestParts } from "./build-request-parts"
 
 describe("buildRequestParts", () => {
+  test("adds default prompt as hidden synthetic text", () => {
+    const result = buildRequestParts({
+      prompt: [{ type: "text", content: "hello", start: 0, end: 5 }],
+      context: [],
+      images: [],
+      text: "hello",
+      defaultPrompt: "  Always reply in Chinese  ",
+      messageID: "msg_default_prompt",
+      sessionID: "ses_default_prompt",
+      sessionDirectory: "/repo",
+    })
+
+    expect(result.requestParts[0]).toMatchObject({
+      type: "text",
+      text: "Always reply in Chinese",
+      synthetic: true,
+      metadata: { opencodeDefaultPrompt: true },
+    })
+    expect(result.requestParts[1]).toMatchObject({ type: "text", text: "hello" })
+    expect(result.optimisticParts[0]).toMatchObject({
+      type: "text",
+      text: "Always reply in Chinese",
+      synthetic: true,
+    })
+  })
+
   test("builds typed request and optimistic parts without cast path", () => {
     const prompt: Prompt = [
       { type: "text", content: "hello", start: 0, end: 5 },

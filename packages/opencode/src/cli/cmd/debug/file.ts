@@ -1,6 +1,7 @@
 import { EOL } from "os"
 import { Effect } from "effect"
 import { File } from "../../../file"
+import { FileIgnore } from "@/file/ignore"
 import { Ripgrep } from "@/file/ripgrep"
 import { effectCmd } from "../../effect-cmd"
 import { cmd } from "../cmd"
@@ -68,9 +69,13 @@ const FileTreeCommand = effectCmd({
       type: "string",
       description: "Directory to tree",
       default: process.cwd(),
-    }),
+  }),
   handler: Effect.fn("Cli.debug.file.tree")(function* (args) {
-    const tree = yield* Effect.orDie(Ripgrep.Service.use((svc) => svc.tree({ cwd: args.dir, limit: 200 })))
+    const ignore = yield* FileIgnore.Service
+    const patterns = yield* ignore.patterns()
+    const tree = yield* Effect.orDie(
+      Ripgrep.Service.use((svc) => svc.tree({ cwd: args.dir, ignore: patterns, limit: 200 })),
+    )
     console.log(JSON.stringify(tree, null, 2))
   }),
 })

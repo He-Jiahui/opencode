@@ -1099,6 +1099,19 @@ export function fromError(
 ): NonNullable<Assistant["error"]> {
   switch (true) {
     case e instanceof DOMException && e.name === "AbortError":
+      if (!ctx.aborted) {
+        return new APIError(
+          {
+            message: e.message || "Request aborted by transport",
+            isRetryable: true,
+            metadata: {
+              code: e.name,
+              message: e.message,
+            },
+          },
+          { cause: e },
+        ).toObject()
+      }
       return new AbortedError(
         { message: e.message },
         {

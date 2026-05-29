@@ -1890,7 +1890,7 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
                             </TooltipKeybind>
                           </Show>
                         </div>
-                        <Show when={variants().length > 2}>
+                        <Show when={local.model.current()}>
                           <div
                             data-component="prompt-variant-control"
                             style={providersShouldFadeIn() ? { animation: "fade-in 0.3s" } : undefined}
@@ -1910,6 +1910,7 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
                                   local.model.variant.set(value === "default" ? undefined : value)
                                   restoreFocus()
                                 }}
+                                disabled={variants().length === 1}
                                 class="capitalize max-w-[160px] text-text-base"
                                 valueClass="truncate text-13-regular text-text-base"
                                 triggerStyle={control()}

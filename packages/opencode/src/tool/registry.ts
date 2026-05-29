@@ -53,6 +53,7 @@ import { Permission } from "@/permission"
 import { Reference } from "@/reference/reference"
 import { BackgroundJob } from "@/background/job"
 import { RuntimeFlags } from "@/effect/runtime-flags"
+import { FileIgnore } from "@/file/ignore"
 
 const log = Log.create({ service: "tool.registry" })
 
@@ -104,6 +105,7 @@ export const layer: Layer.Layer<
   | Format.Service
   | Truncate.Service
   | RuntimeFlags.Service
+  | FileIgnore.Service
 > = Layer.effect(
   Service,
   Effect.gen(function* () {
@@ -386,13 +388,13 @@ export const defaultLayer = Layer.suspend(() =>
       Layer.provide(LSP.defaultLayer),
       Layer.provide(Instruction.defaultLayer),
       Layer.provide(AppFileSystem.defaultLayer),
+      Layer.provide(FileIgnore.defaultLayer),
       Layer.provide(Bus.layer),
       Layer.provide(FetchHttpClient.layer),
       Layer.provide(Format.defaultLayer),
       Layer.provide(CrossSpawnSpawner.defaultLayer),
-      Layer.provide(Ripgrep.defaultLayer),
-      Layer.provide(Truncate.defaultLayer),
     )
+    .pipe(Layer.provide(Ripgrep.defaultLayer), Layer.provide(Truncate.defaultLayer))
     .pipe(Layer.provide(RuntimeFlags.defaultLayer)),
 )
 

@@ -518,6 +518,8 @@ describe("file/index Filesystem patterns", () => {
             expect(node).toHaveProperty("ignored")
             expect(["file", "directory"]).toContain(node.type)
           }
+          expect(nodes.find((node) => node.name === "subdir")).toMatchObject({ children: 1 })
+          expect(nodes.find((node) => node.name === "file.txt")?.children).toBeUndefined()
         }),
       { git: true },
     )
@@ -563,7 +565,7 @@ describe("file/index Filesystem patterns", () => {
     )
 
     it.instance(
-      "marks gitignored files as ignored",
+      "filters default ignored files",
       () =>
         Effect.gen(function* () {
           const test = yield* TestInstance
@@ -573,9 +575,9 @@ describe("file/index Filesystem patterns", () => {
           yield* Effect.promise(() => fs.mkdir(path.join(test.directory, "build")))
 
           const nodes = yield* list()
-          expect(nodes.find((node) => node.name === "app.log")?.ignored).toBe(true)
+          expect(nodes.find((node) => node.name === "app.log")).toBeUndefined()
           expect(nodes.find((node) => node.name === "main.ts")?.ignored).toBe(false)
-          expect(nodes.find((node) => node.name === "build")?.ignored).toBe(true)
+          expect(nodes.find((node) => node.name === "build")).toBeUndefined()
         }),
       { git: true },
     )
@@ -631,6 +633,26 @@ describe("file/index Filesystem patterns", () => {
 
           const result = yield* search({ query: "", type: "file" })
           expect(result.length).toBeGreaterThan(0)
+        }),
+      { git: true },
+    )
+
+    it.instance(
+      "search uses project ignore list instead of gitignore",
+      () =>
+        Effect.gen(function* () {
+          const test = yield* TestInstance
+          yield* Effect.promise(() => fs.writeFile(path.join(test.directory, ".gitignore"), "*.secret\n", "utf-8"))
+          yield* Effect.promise(() => fs.writeFile(path.join(test.directory, "visible.secret"), "visible", "utf-8"))
+          yield* Effect.promise(() => fs.writeFile(path.join(test.directory, "custom.tmp"), "ignored", "utf-8"))
+          yield* Effect.promise(() => fs.mkdir(path.join(test.directory, ".opencode"), { recursive: true }))
+          yield* Effect.promise(() =>
+            fs.writeFile(path.join(test.directory, ".opencode", ".ignore"), "*.tmp\n", "utf-8"),
+          )
+          yield* init()
+
+          expect(yield* search({ query: "visible", type: "file" })).toContain("visible.secret")
+          expect(yield* search({ query: "custom", type: "file" })).not.toContain("custom.tmp")
         }),
       { git: true },
     )

@@ -31,10 +31,16 @@ function wrap(message: unknown): ReturnType<NamedError["toObject"]> {
 }
 
 describe("session.retry.delay", () => {
-  test("caps delay at 30 seconds when headers missing", () => {
+  test("caps delay at 1 minute when retry hints are missing", () => {
     const error = apiError()
     const delays = Array.from({ length: 10 }, (_, index) => SessionRetry.delay(index + 1, error))
-    expect(delays).toStrictEqual([2000, 4000, 8000, 16000, 30000, 30000, 30000, 30000, 30000, 30000])
+    expect(delays).toStrictEqual([2000, 4000, 8000, 16000, 32000, 60000, 60000, 60000, 60000, 60000])
+  })
+
+  test("caps delay at 1 minute when headers have no retry hints", () => {
+    const error = apiError({ "x-request-id": "req_123" })
+    const delays = Array.from({ length: 7 }, (_, index) => SessionRetry.delay(index + 1, error))
+    expect(delays).toStrictEqual([2000, 4000, 8000, 16000, 32000, 60000, 60000])
   })
 
   test("prefers retry-after-ms when shorter than exponential", () => {
@@ -219,6 +225,24 @@ describe("session.retry.retryable", () => {
     )
 
     expect(SessionRetry.retryable(error, retryProvider)).toBeUndefined()
+  })
+
+  test("retries network errors even when isRetryable is false", () => {
+    const error = Schema.decodeUnknownSync(MessageV2.APIError.Schema)(
+      new MessageV2.APIError({
+        message: "fetch failed",
+        isRetryable: false,
+        metadata: { message: "fetch failed" },
+      }).toObject(),
+    )
+
+    expect(SessionRetry.retryable(error, retryProvider)).toEqual({ message: "fetch failed" })
+  })
+
+  test("retries network errors serialized as unknown errors", () => {
+    const msg = "HTTP transport failed: fetch failed"
+    const error = wrap(msg)
+    expect(SessionRetry.retryable(error, retryProvider)).toEqual({ message: msg })
   })
 
   test("retries ZlibError decompression failures", () => {

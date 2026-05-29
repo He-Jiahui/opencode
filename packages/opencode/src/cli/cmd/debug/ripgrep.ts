@@ -1,6 +1,7 @@
 import { EOL } from "os"
 import { Effect, Stream } from "effect"
 import { Ripgrep } from "../../../file/ripgrep"
+import { FileIgnore } from "@/file/ignore"
 import { effectCmd } from "../../effect-cmd"
 import { cmd } from "../cmd"
 import { InstanceRef } from "@/effect/instance-ref"
@@ -22,7 +23,15 @@ const TreeCommand = effectCmd({
   handler: Effect.fn("Cli.debug.rg.tree")(function* (args) {
     const ctx = yield* InstanceRef
     if (!ctx) return
-    const tree = yield* Effect.orDie(Ripgrep.Service.use((svc) => svc.tree({ cwd: ctx.directory, limit: args.limit })))
+    const ignore = yield* FileIgnore.Service
+    const tree = yield* Effect.orDie(
+      Ripgrep.Service.use((svc) =>
+        Effect.gen(function* () {
+          const patterns = yield* ignore.patterns()
+          return yield* svc.tree({ cwd: ctx.directory, ignore: patterns, limit: args.limit })
+        }),
+      ),
+    )
     process.stdout.write(tree + EOL)
   }),
 })
@@ -48,10 +57,13 @@ const FilesCommand = effectCmd({
     const ctx = yield* InstanceRef
     if (!ctx) return
     const rg = yield* Ripgrep.Service
+    const ignore = yield* FileIgnore.Service
+    const patterns = yield* ignore.patterns()
     const files = yield* rg
       .files({
         cwd: ctx.directory,
         glob: args.glob ? [args.glob] : undefined,
+        ignore: patterns,
       })
       .pipe(
         Stream.take(args.limit ?? Infinity),
@@ -85,14 +97,19 @@ const SearchCommand = effectCmd({
     const ctx = yield* InstanceRef
     if (!ctx) return
     const results = yield* Effect.orDie(
-      Ripgrep.Service.use((svc) =>
-        svc.search({
-          cwd: ctx.directory,
-          pattern: args.pattern,
-          glob: args.glob as string[] | undefined,
-          limit: args.limit,
-        }),
-      ),
+      Effect.gen(function* () {
+        const ignore = yield* FileIgnore.Service
+        const patterns = yield* ignore.patterns()
+        return yield* Ripgrep.Service.use((svc) =>
+          svc.search({
+            cwd: ctx.directory,
+            pattern: args.pattern,
+            glob: args.glob as string[] | undefined,
+            ignore: patterns,
+            limit: args.limit,
+          }),
+        )
+      }),
     )
     process.stdout.write(JSON.stringify(results.items, null, 2) + EOL)
   }),

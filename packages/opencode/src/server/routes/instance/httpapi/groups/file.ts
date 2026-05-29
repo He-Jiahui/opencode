@@ -1,4 +1,5 @@
 import { File } from "@/file"
+import { FileIgnore } from "@/file/ignore"
 import { Ripgrep } from "@/file/ripgrep"
 import { LSP } from "@/lsp/lsp"
 import { Schema } from "effect"
@@ -15,6 +16,10 @@ import { described } from "./metadata"
 export const FileQuery = Schema.Struct({
   ...WorkspaceRoutingQueryFields,
   path: Schema.String,
+})
+
+export const FileIgnoreUpdate = Schema.Struct({
+  content: Schema.String,
 })
 
 export const FindTextQuery = Schema.Struct({
@@ -43,6 +48,7 @@ export const FilePaths = {
   findSymbol: "/find/symbol",
   list: "/file",
   content: "/file/content",
+  ignore: "/file/ignore",
   status: "/file/status",
 } as const
 
@@ -98,6 +104,27 @@ export const FileApi = HttpApi.make("file")
             identifier: "file.read",
             summary: "Read file",
             description: "Read the content of a specified file.",
+          }),
+        ),
+        HttpApiEndpoint.get("ignoreGet", FilePaths.ignore, {
+          query: WorkspaceRoutingQuery,
+          success: described(FileIgnore.Info, "Ignore file"),
+        }).annotateMerge(
+          OpenApi.annotations({
+            identifier: "file.ignore.get",
+            summary: "Get ignore file",
+            description: "Read the active OpenCode ignore file for this project.",
+          }),
+        ),
+        HttpApiEndpoint.put("ignoreUpdate", FilePaths.ignore, {
+          query: WorkspaceRoutingQuery,
+          payload: FileIgnoreUpdate,
+          success: described(FileIgnore.Info, "Updated ignore file"),
+        }).annotateMerge(
+          OpenApi.annotations({
+            identifier: "file.ignore.update",
+            summary: "Update ignore file",
+            description: "Create or update the project .opencode/.ignore file.",
           }),
         ),
         HttpApiEndpoint.get("status", FilePaths.status, {

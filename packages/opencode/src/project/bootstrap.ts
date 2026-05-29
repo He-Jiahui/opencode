@@ -8,6 +8,7 @@ import * as Vcs from "./vcs"
 import { Bus } from "../bus"
 import { InstanceState } from "@/effect/instance-state"
 import { FileWatcher } from "@/file/watcher"
+import { FileIgnore } from "@/file/ignore"
 import { ShareNext } from "@/share/share-next"
 import { Effect, Layer } from "effect"
 import { Config } from "@/config/config"
@@ -60,6 +61,7 @@ export const defaultLayer: Layer.Layer<Service> = layer.pipe(
     Bus.layer,
     Config.defaultLayer,
     File.defaultLayer,
+    FileIgnore.defaultLayer,
     FileWatcher.defaultLayer,
     Format.defaultLayer,
     LSP.defaultLayer,

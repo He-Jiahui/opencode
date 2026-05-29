@@ -10,6 +10,7 @@ import { assertExternalDirectoryEffect } from "./external-directory"
 import { Instruction } from "../session/instruction"
 import { isPdfAttachment, sniffAttachmentMime } from "@/util/media"
 import { Reference } from "@/reference/reference"
+import { FileIgnore } from "@/file/ignore"
 
 const DEFAULT_READ_LIMIT = 2000
 const MAX_LINE_LENGTH = 2000
@@ -43,6 +44,7 @@ export const ReadTool = Tool.define(
     const instruction = yield* Instruction.Service
     const lsp = yield* LSP.Service
     const reference = yield* Reference.Service
+    const ignore = yield* FileIgnore.Service
     const scope = yield* Scope.Scope
 
     const miss = Effect.fn("ReadTool.miss")(function* (filepath: string) {
@@ -71,19 +73,37 @@ export const ReadTool = Tool.define(
     })
 
     const list = Effect.fn("ReadTool.list")(function* (filepath: string) {
+      const instance = yield* InstanceState.context
+      const ignored = yield* ignore.patterns()
       const items = yield* fs.readDirectoryEntries(filepath)
       return yield* Effect.forEach(
-        items,
+        items.filter(
+          (item) =>
+            !FileIgnore.matchWithPatterns(path.relative(instance.directory, path.join(filepath, item.name)), ignored),
+        ),
         Effect.fnUntraced(function* (item) {
-          if (item.type === "directory") return item.name + "/"
+          if (item.type === "directory") {
+            const count = yield* countChildren(path.join(filepath, item.name), ignored, instance.directory)
+            return `${item.name}/ (${count} entries)`
+          }
           if (item.type !== "symlink") return item.name
 
           const target = yield* fs.stat(path.join(filepath, item.name)).pipe(Effect.catch(() => Effect.void))
-          if (target?.type === "Directory") return item.name + "/"
+          if (target?.type === "Directory") {
+            const count = yield* countChildren(path.join(filepath, item.name), ignored, instance.directory)
+            return `${item.name}/ (${count} entries)`
+          }
           return item.name
         }),
         { concurrency: "unbounded" },
       ).pipe(Effect.map((items: string[]) => items.sort((a, b) => a.localeCompare(b))))
+    })
+
+    const countChildren = Effect.fn("ReadTool.countChildren")(function* (dir: string, ignored: string[], root: string) {
+      const items = yield* fs.readDirectoryEntries(dir).pipe(Effect.orElseSucceed(() => []))
+      return items.filter(
+        (item) => !FileIgnore.matchWithPatterns(path.relative(root, path.join(dir, item.name)), ignored),
+      ).length
     })
 
     const warm = Effect.fn("ReadTool.warm")(function* (filepath: string) {

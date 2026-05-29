@@ -1520,6 +1520,29 @@ describe("session.message-v2.fromError", () => {
     })
   })
 
+  test("classifies non-user AbortError as retryable APIError", () => {
+    const result = MessageV2.fromError(new DOMException("The operation was aborted.", "AbortError"), { providerID })
+
+    expect(MessageV2.APIError.isInstance(result)).toBe(true)
+    expect(result).toStrictEqual({
+      name: "APIError",
+      data: {
+        message: "The operation was aborted.",
+        isRetryable: true,
+        metadata: {
+          code: "AbortError",
+          message: "The operation was aborted.",
+        },
+      },
+    })
+  })
+
+  test("classifies user AbortError as AbortedError when abort context is provided", () => {
+    const result = MessageV2.fromError(new DOMException("Aborted", "AbortError"), { providerID, aborted: true })
+
+    expect(result.name).toBe("MessageAbortedError")
+  })
+
   test("classifies ZlibError from fetch as retryable APIError", () => {
     const zlibError = new Error(
       'ZlibError fetching "https://opencode.cloudflare.dev/anthropic/messages". For more information, pass `verbose: true` in the second argument to fetch()',

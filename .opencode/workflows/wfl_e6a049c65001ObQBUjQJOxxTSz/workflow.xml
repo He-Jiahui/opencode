@@ -1,0 +1,7 @@
+<workflow>
+  <ordered>
+    <milestone id="requirements" title="Clarify requirements" department="product">Clarify the user request, constraints, and acceptance criteria.</milestone>
+    <milestone id="implementation" title="Implement solution" department="engineering">Implement the requested change end to end.</milestone>
+    <milestone id="verification" title="Verify solution" department="quality">Verify behavior with focused tests and checks.</milestone>
+  </ordered>
+</workflow>

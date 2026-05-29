@@ -1,19 +1,29 @@
 import * as InstanceState from "@/effect/instance-state"
 import { File } from "@/file"
+import { FileIgnore } from "@/file/ignore"
 import { Ripgrep } from "@/file/ripgrep"
 import { Effect } from "effect"
+import path from "path"
 import { HttpApiBuilder } from "effect/unstable/httpapi"
 import { InstanceHttpApi } from "../api"
 
 export const fileHandlers = HttpApiBuilder.group(InstanceHttpApi, "file", (handlers) =>
   Effect.gen(function* () {
     const svc = yield* File.Service
+    const ignore = yield* FileIgnore.Service
     const ripgrep = yield* Ripgrep.Service
 
     const findText = Effect.fn("FileHttpApi.findText")(function* (ctx: { query: { pattern: string } }) {
+      const instance = yield* InstanceState.context
+      const ignored = yield* ignore.patterns()
       return (yield* ripgrep
-        .search({ cwd: (yield* InstanceState.context).directory, pattern: ctx.query.pattern, limit: 10 })
-        .pipe(Effect.orDie)).items
+        .search({ cwd: instance.directory, pattern: ctx.query.pattern, ignore: ignored, limit: 10 })
+        .pipe(Effect.orDie)).items.filter((item) => {
+        const file = path.isAbsolute(item.path.text)
+          ? path.relative(instance.directory, item.path.text)
+          : item.path.text
+        return !FileIgnore.matchWithPatterns(file, ignored)
+      })
     })
 
     const findFile = Effect.fn("FileHttpApi.findFile")(function* (ctx: {
@@ -39,6 +49,14 @@ export const fileHandlers = HttpApiBuilder.group(InstanceHttpApi, "file", (handl
       return yield* svc.read(ctx.query.path)
     })
 
+    const ignoreGet = Effect.fn("FileHttpApi.ignoreGet")(function* () {
+      return yield* ignore.get()
+    })
+
+    const ignoreUpdate = Effect.fn("FileHttpApi.ignoreUpdate")(function* (ctx: { payload: { content: string } }) {
+      return yield* ignore.write(ctx.payload.content)
+    })
+
     const status = Effect.fn("FileHttpApi.status")(function* () {
       return yield* svc.status()
     })
@@ -49,6 +67,8 @@ export const fileHandlers = HttpApiBuilder.group(InstanceHttpApi, "file", (handl
       .handle("findSymbol", findSymbol)
       .handle("list", list)
       .handle("content", content)
+      .handle("ignoreGet", ignoreGet)
+      .handle("ignoreUpdate", ignoreUpdate)
       .handle("status", status)
   }),
 )

@@ -36,6 +36,10 @@ export type Event =
   | EventWorkspaceReady
   | EventWorkspaceFailed
   | EventWorkspaceStatus
+  | EventWorkflowCreated
+  | EventWorkflowUpdated
+  | EventWorkflowNodeUpdated
+  | EventWorkflowGraphUpdated
   | EventWorktreeReady
   | EventWorktreeFailed
   | EventPtyCreated
@@ -374,6 +378,144 @@ export type Project = {
     initialized?: number
   }
   sandboxes: Array<string>
+}
+
+export type Workflow = {
+  id: string
+  projectID: string
+  rootSessionID?: string
+  pmSessionID?: string
+  testerSessionID?: string
+  request: string
+  title: string
+  directory: string
+  path: string
+  xml: string
+  status:
+    | "pending"
+    | "running"
+    | "planning"
+    | "dispatching"
+    | "executing"
+    | "reviewing"
+    | "testing"
+    | "blocked"
+    | "completed"
+    | "failed"
+    | "cancelled"
+  model?: {
+    providerID: string
+    modelID: string
+    variant?: string
+  }
+  agent?: string
+  testPath?: string
+  error?: string
+  time: {
+    created: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+    updated: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+    completed?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+  }
+}
+
+export type WorkflowCreatedEvent = {
+  workflowID: string
+  info: Workflow
+}
+
+export type WorkflowUpdatedEvent = {
+  workflowID: string
+  info: Workflow
+}
+
+export type WorkflowSessionRef = {
+  role: "requester" | "main_pm" | "department_pm" | "executor" | "reviewer" | "tester"
+  sessionID: string
+  milestoneID?: string
+  attempt?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+}
+
+export type WorkflowMilestone = {
+  id: string
+  title?: string
+  department?: string
+  prompt: string
+  dependsOn: Array<string>
+  status:
+    | "pending"
+    | "planning"
+    | "executing"
+    | "reviewing"
+    | "rejected"
+    | "approved"
+    | "blocked"
+    | "testing"
+    | "done"
+    | "failed"
+    | "skipped"
+    | "running"
+    | "completed"
+    | "cancelled"
+  attempt: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+  planPath?: string
+  reviewPath?: string
+  session: Array<WorkflowSessionRef>
+}
+
+export type WorkflowNodeUpdatedEvent = {
+  workflowID: string
+  milestone: WorkflowMilestone
+}
+
+export type WorkflowGraphNode = {
+  id: string
+  type: "workflow" | "session" | "milestone" | "document"
+  title: string
+  role?: "requester" | "main_pm" | "department_pm" | "executor" | "reviewer" | "tester"
+  status?:
+    | "pending"
+    | "running"
+    | "planning"
+    | "dispatching"
+    | "executing"
+    | "reviewing"
+    | "testing"
+    | "blocked"
+    | "completed"
+    | "failed"
+    | "cancelled"
+    | "rejected"
+    | "approved"
+    | "done"
+    | "skipped"
+  sessionID?: string
+  milestoneID?: string
+  path?: string
+  summary?: string
+}
+
+export type WorkflowGraphEdge = {
+  id: string
+  from: string
+  to: string
+  kind?: "entry" | "dependency" | "session" | "tester" | "consultation" | "document"
+  label?: string
+  summary?: string
+  question?: string
+  answer?: string
+  path?: string
+}
+
+export type WorkflowGraph = {
+  workflow: Workflow
+  milestones: Array<WorkflowMilestone>
+  nodes: Array<WorkflowGraphNode>
+  edges: Array<WorkflowGraphEdge>
+}
+
+export type WorkflowGraphUpdatedEvent = {
+  workflowID: string
+  graph: WorkflowGraph
 }
 
 export type Pty = {
@@ -837,6 +979,10 @@ export type GlobalEvent = {
     | EventWorkspaceReady
     | EventWorkspaceFailed
     | EventWorkspaceStatus
+    | EventWorkflowCreated
+    | EventWorkflowUpdated
+    | EventWorkflowNodeUpdated
+    | EventWorkflowGraphUpdated
     | EventWorktreeReady
     | EventWorktreeFailed
     | EventPtyCreated
@@ -1548,6 +1694,7 @@ export type FileNode = {
   absolute: string
   type: "file" | "directory"
   ignored: boolean
+  children?: number
 }
 
 export type FileContent = {
@@ -1570,6 +1717,12 @@ export type FileContent = {
   }
   encoding?: "base64"
   mimeType?: string
+}
+
+export type IgnoreFile = {
+  path: string
+  source: "project" | "user" | "default"
+  content: string
 }
 
 export type File = {
@@ -1945,6 +2098,15 @@ export type EventTuiSessionSelect2 = {
   }
 }
 
+export type WorkflowStartInput = {
+  sessionID?: string
+  prompt?: string
+  model?: string
+  variant?: string
+  agent?: string
+  title?: string
+}
+
 export type Workspace = {
   id: string
   type: string
@@ -1965,6 +2127,78 @@ export type WorkspaceWarpError = {
 
 export type EffectHttpApiErrorForbidden = {
   _tag: "Forbidden"
+}
+
+export type Workflow5 = {
+  id: string
+  projectID: string
+  rootSessionID?: string
+  pmSessionID?: string
+  testerSessionID?: string
+  request: string
+  title: string
+  directory: string
+  path: string
+  xml: string
+  status:
+    | "pending"
+    | "running"
+    | "planning"
+    | "dispatching"
+    | "executing"
+    | "reviewing"
+    | "testing"
+    | "blocked"
+    | "completed"
+    | "failed"
+    | "cancelled"
+  model?: {
+    providerID: string
+    modelID: string
+    variant?: string
+  }
+  agent?: string
+  testPath?: string
+  error?: string
+  time: {
+    created: number | "NaN" | "Infinity" | "-Infinity"
+    updated: number | "NaN" | "Infinity" | "-Infinity"
+    completed?: number | "NaN" | "Infinity" | "-Infinity"
+  }
+}
+
+export type WorkflowSessionRef1 = {
+  role: "requester" | "main_pm" | "department_pm" | "executor" | "reviewer" | "tester"
+  sessionID: string
+  milestoneID?: string
+  attempt?: number | "NaN" | "Infinity" | "-Infinity"
+}
+
+export type WorkflowMilestone1 = {
+  id: string
+  title?: string
+  department?: string
+  prompt: string
+  dependsOn: Array<string>
+  status:
+    | "pending"
+    | "planning"
+    | "executing"
+    | "reviewing"
+    | "rejected"
+    | "approved"
+    | "blocked"
+    | "testing"
+    | "done"
+    | "failed"
+    | "skipped"
+    | "running"
+    | "completed"
+    | "cancelled"
+  attempt: number | "NaN" | "Infinity" | "-Infinity"
+  planPath?: string
+  reviewPath?: string
+  session: Array<WorkflowSessionRef1>
 }
 
 export type SyncEventMessageUpdated = {
@@ -2727,6 +2961,30 @@ export type EventWorkspaceStatus = {
     workspaceID: string
     status: "connected" | "connecting" | "disconnected" | "error"
   }
+}
+
+export type EventWorkflowCreated = {
+  id: string
+  type: "workflow.created"
+  properties: WorkflowCreatedEvent
+}
+
+export type EventWorkflowUpdated = {
+  id: string
+  type: "workflow.updated"
+  properties: WorkflowUpdatedEvent
+}
+
+export type EventWorkflowNodeUpdated = {
+  id: string
+  type: "workflow.node.updated"
+  properties: WorkflowNodeUpdatedEvent
+}
+
+export type EventWorkflowGraphUpdated = {
+  id: string
+  type: "workflow.graph.updated"
+  properties: WorkflowGraphUpdatedEvent
 }
 
 export type EventWorktreeReady = {
@@ -4689,6 +4947,64 @@ export type FileReadResponses = {
 }
 
 export type FileReadResponse = FileReadResponses[keyof FileReadResponses]
+
+export type FileIgnoreGetData = {
+  body?: never
+  path?: never
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/file/ignore"
+}
+
+export type FileIgnoreGetErrors = {
+  /**
+   * Bad request
+   */
+  400: BadRequestError
+}
+
+export type FileIgnoreGetError = FileIgnoreGetErrors[keyof FileIgnoreGetErrors]
+
+export type FileIgnoreGetResponses = {
+  /**
+   * Ignore file
+   */
+  200: IgnoreFile
+}
+
+export type FileIgnoreGetResponse = FileIgnoreGetResponses[keyof FileIgnoreGetResponses]
+
+export type FileIgnoreUpdateData = {
+  body?: {
+    content: string
+  }
+  path?: never
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/file/ignore"
+}
+
+export type FileIgnoreUpdateErrors = {
+  /**
+   * Bad request
+   */
+  400: BadRequestError
+}
+
+export type FileIgnoreUpdateError = FileIgnoreUpdateErrors[keyof FileIgnoreUpdateErrors]
+
+export type FileIgnoreUpdateResponses = {
+  /**
+   * Updated ignore file
+   */
+  200: IgnoreFile
+}
+
+export type FileIgnoreUpdateResponse = FileIgnoreUpdateResponses[keyof FileIgnoreUpdateResponses]
 
 export type FileStatusData = {
   body?: never
@@ -7957,6 +8273,235 @@ export type TuiControlResponseResponses = {
 }
 
 export type TuiControlResponseResponse = TuiControlResponseResponses[keyof TuiControlResponseResponses]
+
+export type WorkflowListData = {
+  body?: never
+  path?: never
+  query?: {
+    directory?: string
+    workspace?: string
+    sessionID?: string
+  }
+  url: "/workflow"
+}
+
+export type WorkflowListErrors = {
+  /**
+   * Bad request
+   */
+  400: BadRequestError
+}
+
+export type WorkflowListError = WorkflowListErrors[keyof WorkflowListErrors]
+
+export type WorkflowListResponses = {
+  /**
+   * List workflows
+   */
+  200: Array<Workflow>
+}
+
+export type WorkflowListResponse = WorkflowListResponses[keyof WorkflowListResponses]
+
+export type WorkflowStartData = {
+  body?: WorkflowStartInput
+  path?: never
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/workflow"
+}
+
+export type WorkflowStartErrors = {
+  /**
+   * BadRequest | InvalidRequestError
+   */
+  400: EffectHttpApiErrorBadRequest | InvalidRequestError
+}
+
+export type WorkflowStartError = WorkflowStartErrors[keyof WorkflowStartErrors]
+
+export type WorkflowStartResponses = {
+  /**
+   * Workflow started
+   */
+  200: Workflow
+}
+
+export type WorkflowStartResponse = WorkflowStartResponses[keyof WorkflowStartResponses]
+
+export type WorkflowGetData = {
+  body?: never
+  path: {
+    workflowID: string
+  }
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/workflow/{workflowID}"
+}
+
+export type WorkflowGetErrors = {
+  /**
+   * BadRequest | InvalidRequestError
+   */
+  400: EffectHttpApiErrorBadRequest | InvalidRequestError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
+}
+
+export type WorkflowGetError = WorkflowGetErrors[keyof WorkflowGetErrors]
+
+export type WorkflowGetResponses = {
+  /**
+   * Get workflow
+   */
+  200: Workflow
+}
+
+export type WorkflowGetResponse = WorkflowGetResponses[keyof WorkflowGetResponses]
+
+export type WorkflowGraphData = {
+  body?: never
+  path: {
+    workflowID: string
+  }
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/workflow/{workflowID}/graph"
+}
+
+export type WorkflowGraphErrors = {
+  /**
+   * BadRequest | InvalidRequestError
+   */
+  400: EffectHttpApiErrorBadRequest | InvalidRequestError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
+}
+
+export type WorkflowGraphError = WorkflowGraphErrors[keyof WorkflowGraphErrors]
+
+export type WorkflowGraphResponses = {
+  /**
+   * Get workflow graph
+   */
+  200: WorkflowGraph
+}
+
+export type WorkflowGraphResponse = WorkflowGraphResponses[keyof WorkflowGraphResponses]
+
+export type WorkflowUpdateXmlData = {
+  body?: {
+    xml: string
+  }
+  path: {
+    workflowID: string
+  }
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/workflow/{workflowID}/xml"
+}
+
+export type WorkflowUpdateXmlErrors = {
+  /**
+   * BadRequest | InvalidRequestError
+   */
+  400: EffectHttpApiErrorBadRequest | InvalidRequestError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
+}
+
+export type WorkflowUpdateXmlError = WorkflowUpdateXmlErrors[keyof WorkflowUpdateXmlErrors]
+
+export type WorkflowUpdateXmlResponses = {
+  /**
+   * Workflow graph updated
+   */
+  200: WorkflowGraph
+}
+
+export type WorkflowUpdateXmlResponse = WorkflowUpdateXmlResponses[keyof WorkflowUpdateXmlResponses]
+
+export type WorkflowResumeData = {
+  body?: never
+  path: {
+    workflowID: string
+  }
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/workflow/{workflowID}/resume"
+}
+
+export type WorkflowResumeErrors = {
+  /**
+   * BadRequest | InvalidRequestError
+   */
+  400: EffectHttpApiErrorBadRequest | InvalidRequestError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
+}
+
+export type WorkflowResumeError = WorkflowResumeErrors[keyof WorkflowResumeErrors]
+
+export type WorkflowResumeResponses = {
+  /**
+   * Workflow resumed
+   */
+  200: Workflow
+}
+
+export type WorkflowResumeResponse = WorkflowResumeResponses[keyof WorkflowResumeResponses]
+
+export type WorkflowCancelData = {
+  body?: never
+  path: {
+    workflowID: string
+  }
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/workflow/{workflowID}/cancel"
+}
+
+export type WorkflowCancelErrors = {
+  /**
+   * BadRequest | InvalidRequestError
+   */
+  400: EffectHttpApiErrorBadRequest | InvalidRequestError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
+}
+
+export type WorkflowCancelError = WorkflowCancelErrors[keyof WorkflowCancelErrors]
+
+export type WorkflowCancelResponses = {
+  /**
+   * Workflow cancelled
+   */
+  200: Workflow
+}
+
+export type WorkflowCancelResponse = WorkflowCancelResponses[keyof WorkflowCancelResponses]
 
 export type ExperimentalWorkspaceAdapterListData = {
   body?: never

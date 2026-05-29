@@ -1,4 +1,4 @@
-import { Component, Show, createMemo, createResource, onMount, type JSX } from "solid-js"
+import { Component, Show, createEffect, createMemo, createResource, onMount, type JSX } from "solid-js"
 import { createStore } from "solid-js/store"
 import { Button } from "@opencode-ai/ui/button"
 import { Icon } from "@opencode-ai/ui/icon"
@@ -91,8 +91,13 @@ export const SettingsGeneral: Component = () => {
 
   const [store, setStore] = createStore({
     checking: false,
+    ignoreSaving: false,
+    ignoreText: "",
+    ignoreLoaded: "",
   })
 
+  const serverSync = useServerSync()
+  const globalSdk = useServerSDK()
   const linux = createMemo(() => platform.platform === "desktop" && platform.os === "linux")
   const dir = createMemo(() => decode64(params.dir))
   const accepting = createMemo(() => {
@@ -120,6 +125,34 @@ export const SettingsGeneral: Component = () => {
     permission.disableAutoAccept(params.id, value)
   }
   const desktop = createMemo(() => platform.platform === "desktop")
+  const projectSdk = createMemo(() => {
+    const value = dir()
+    if (!value) return
+    return globalSdk.createClient({ directory: value, throwOnError: true })
+  })
+
+  const [ignoreFile, { mutate: setIgnoreFile }] = createResource(
+    () => projectSdk(),
+    (sdk) => sdk.file.ignore.get().then((res) => res.data),
+  )
+  const ignoreChanged = createMemo(() => store.ignoreText !== store.ignoreLoaded)
+  const canSaveIgnore = createMemo(() => {
+    if (!dir()) return false
+    if (store.ignoreSaving) return false
+    const info = ignoreFile()
+    if (!info) return false
+    if (ignoreChanged()) return true
+    return info.source !== "project"
+  })
+
+  createEffect(() => {
+    const info = ignoreFile()
+    if (!info) return
+    setStore({
+      ignoreText: info.content,
+      ignoreLoaded: info.content,
+    })
+  })
 
   const check = () => {
     if (!platform.checkUpdate) return
@@ -174,9 +207,6 @@ export const SettingsGeneral: Component = () => {
   }
 
   const themeOptions = createMemo<ThemeOption[]>(() => theme.ids().map((id) => ({ id, name: theme.name(id) })))
-
-  const serverSync = useServerSync()
-  const globalSdk = useServerSDK()
 
   const [shells] = createResource(
     () =>
@@ -250,6 +280,34 @@ export const SettingsGeneral: Component = () => {
     const update = platform.setPinchZoomEnabled?.(checked)
     if (!update) return
     void update.catch(() => setPinchZoom(!checked))
+  }
+
+  const saveIgnore = () => {
+    const sdk = projectSdk()
+    if (!sdk) return
+    setStore("ignoreSaving", true)
+    void sdk.file.ignore
+      .update({ content: store.ignoreText })
+      .then((res) => {
+        if (res.data) setIgnoreFile(res.data)
+        setStore("ignoreLoaded", store.ignoreText)
+        showToast({
+          variant: "success",
+          title: language.t("settings.general.row.projectIgnore.toast.saved.title"),
+          description: language.t("settings.general.row.projectIgnore.toast.saved.description"),
+        })
+      })
+      .catch((err: unknown) => {
+        const message = err instanceof Error ? err.message : String(err)
+        showToast({ title: language.t("common.requestFailed"), description: message })
+      })
+      .finally(() => setStore("ignoreSaving", false))
+  }
+
+  const resetIgnore = () => {
+    const info = ignoreFile()
+    if (!info) return
+    setStore("ignoreText", info.content)
   }
 
   const colorSchemeOptions = createMemo((): { value: ColorScheme; label: string }[] => [
@@ -350,6 +408,68 @@ export const SettingsGeneral: Component = () => {
             triggerVariant="settings"
             triggerStyle={{ "min-width": "180px" }}
           />
+        </SettingsRow>
+
+        <SettingsRow
+          title={language.t("settings.general.row.defaultPrompt.title")}
+          description={language.t("settings.general.row.defaultPrompt.description")}
+          wide
+        >
+          <TextField
+            data-action="settings-default-prompt"
+            label={language.t("settings.general.row.defaultPrompt.title")}
+            hideLabel
+            multiline
+            value={settings.general.defaultPrompt()}
+            placeholder={language.t("settings.general.row.defaultPrompt.placeholder")}
+            onChange={(value) => settings.general.setDefaultPrompt(value)}
+            variant="ghost"
+            class="min-h-[72px] w-full resize-none"
+          />
+        </SettingsRow>
+
+        <SettingsRow
+          title={language.t("settings.general.row.projectIgnore.title")}
+          description={language.t("settings.general.row.projectIgnore.description", {
+            source: language.t(`settings.general.row.projectIgnore.source.${ignoreFile()?.source ?? "default"}`),
+          })}
+          wide
+        >
+          <div class="flex flex-col gap-2">
+            <TextField
+              data-action="settings-project-ignore"
+              label={language.t("settings.general.row.projectIgnore.title")}
+              hideLabel
+              multiline
+              value={store.ignoreText}
+              placeholder={language.t("settings.general.row.projectIgnore.placeholder")}
+              onChange={(value) => setStore("ignoreText", value)}
+              variant="ghost"
+              class="min-h-[168px] w-full resize-y font-mono"
+              disabled={!dir() || ignoreFile.loading}
+            />
+            <div class="flex items-center justify-between gap-2">
+              <span class="text-12-regular text-text-weak">{ignoreFile()?.path ?? ""}</span>
+              <div class="flex shrink-0 items-center gap-2">
+                <Button
+                  type="button"
+                  size="small"
+                  variant="secondary"
+                  disabled={store.ignoreSaving || !ignoreChanged()}
+                  onClick={resetIgnore}
+                >
+                  {language.t("common.reset")}
+                </Button>
+                <Button type="button" size="small" variant="primary" disabled={!canSaveIgnore()} onClick={saveIgnore}>
+                  {store.ignoreSaving
+                    ? language.t("common.saving")
+                    : ignoreFile()?.source === "project"
+                      ? language.t("common.save")
+                      : language.t("settings.general.row.projectIgnore.action.generate")}
+                </Button>
+              </div>
+            </div>
+          </div>
         </SettingsRow>
 
         <SettingsRow
@@ -814,16 +934,23 @@ interface SettingsRowProps {
   title: string | JSX.Element
   description: string | JSX.Element
   children: JSX.Element
+  wide?: boolean
 }
 
 const SettingsRow: Component<SettingsRowProps> = (props) => {
   return (
-    <div class="flex flex-wrap items-center gap-4 py-3 border-b border-border-weak-base last:border-none sm:flex-nowrap">
+    <div
+      class={
+        props.wide
+          ? "flex flex-col gap-3 py-3 border-b border-border-weak-base last:border-none"
+          : "flex flex-wrap items-center gap-4 py-3 border-b border-border-weak-base last:border-none sm:flex-nowrap"
+      }
+    >
       <div class="flex min-w-0 flex-1 flex-col gap-0.5">
         <span class="text-14-medium text-text-strong">{props.title}</span>
         <span class="text-12-regular text-text-weak">{props.description}</span>
       </div>
-      <div class="flex w-full justify-end sm:w-auto sm:shrink-0">{props.children}</div>
+      <div class={props.wide ? "w-full" : "flex w-full justify-end sm:w-auto sm:shrink-0"}>{props.children}</div>
     </div>
   )
 }

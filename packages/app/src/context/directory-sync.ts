@@ -594,6 +594,40 @@ export const createDirSyncContext = (directory: string, serverSync: ReturnType<t
         })
       },
       more: createMemo(() => current()[0].session.length >= current()[0].limit),
+      workflow: async (sessionID?: string, opts?: { force?: boolean }) => {
+        const [store, setStore] = serverSync.child(directory)
+        if (sessionID) {
+          if (
+            store.workflow.some(
+              (workflow) =>
+                workflow.rootSessionID === sessionID ||
+                workflow.pmSessionID === sessionID ||
+                workflow.testerSessionID === sessionID ||
+                store.workflow_graph[workflow.id]?.milestones.some((milestone) =>
+                  milestone.session.some((ref) => ref.sessionID === sessionID),
+                ),
+            ) &&
+            !opts?.force
+          )
+            return
+          await client.workflow.list({ sessionID }).then((x) => {
+            setStore("workflow", reconcile(merge(store.workflow, x.data ?? []), { key: "id" }))
+          })
+          return
+        }
+        if (store.workflow.length > 0 && !opts?.force) return
+        await client.workflow.list().then((x) => {
+          setStore("workflow", reconcile(x.data ?? [], { key: "id" }))
+        })
+      },
+      workflowGraph: async (workflowID: string, opts?: { force?: boolean }) => {
+        const [store, setStore] = serverSync.child(directory)
+        if (store.workflow_graph[workflowID] !== undefined && !opts?.force) return
+        await client.workflow.graph({ workflowID }).then((x) => {
+          if (!x.data) return
+          setStore("workflow_graph", workflowID, reconcile(x.data))
+        })
+      },
       archive: async (sessionID: string) => {
         const [, setStore] = serverSync.child(directory)
         await client.session.update({ sessionID, time: { archived: Date.now() } })

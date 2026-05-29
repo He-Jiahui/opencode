@@ -112,6 +112,7 @@ export interface SearchResult {
 export interface FilesInput {
   cwd: string
   glob?: string[]
+  ignore?: string[]
   hidden?: boolean
   follow?: boolean
   maxDepth?: number
@@ -122,6 +123,7 @@ export interface SearchInput {
   cwd: string
   pattern: string
   glob?: string[]
+  ignore?: string[]
   limit?: number
   follow?: boolean
   file?: string[]
@@ -130,6 +132,7 @@ export interface SearchInput {
 
 export interface TreeInput {
   cwd: string
+  ignore?: string[]
   limit?: number
   signal?: AbortSignal
 }
@@ -197,11 +200,17 @@ function fail(queue: Queue.Queue<string, PlatformError | Error | Cause.Done>, er
 }
 
 function filesArgs(input: FilesInput) {
-  const args = ["--no-config", "--files", "--glob=!.git/*"]
+  const args = ["--no-config", "--files", "--no-ignore"]
   if (input.follow) args.push("--follow")
   if (input.hidden !== false) args.push("--hidden")
   if (input.hidden === false) args.push("--glob=!.*")
   if (input.maxDepth !== undefined) args.push(`--max-depth=${input.maxDepth}`)
+  if (input.ignore) {
+    for (const glob of input.ignore) {
+      const arg = ignoreGlob(glob)
+      if (arg) args.push(`--glob=${arg}`)
+    }
+  }
   if (input.glob) {
     for (const glob of input.glob) args.push(`--glob=${glob}`)
   }
@@ -210,14 +219,29 @@ function filesArgs(input: FilesInput) {
 }
 
 function searchArgs(input: SearchInput) {
-  const args = ["--no-config", "--json", "--hidden", "--glob=!.git/*", "--no-messages"]
+  const args = ["--no-config", "--json", "--hidden", "--no-ignore", "--no-messages"]
   if (input.follow) args.push("--follow")
+  if (input.ignore) {
+    for (const glob of input.ignore) {
+      const arg = ignoreGlob(glob)
+      if (arg) args.push(`--glob=${arg}`)
+    }
+  }
   if (input.glob) {
     for (const glob of input.glob) args.push(`--glob=${glob}`)
   }
   if (input.limit) args.push(`--max-count=${input.limit}`)
   args.push("--", input.pattern, ...(input.file ?? ["."]))
   return args
+}
+
+function ignoreGlob(pattern: string) {
+  const trimmed = pattern.trim()
+  const negated = trimmed.startsWith("!")
+  const clean = (negated ? trimmed.slice(1) : trimmed).replaceAll("\\", "/").replace(/^\//, "").replace(/\/$/, "")
+  if (!clean) return ""
+  const glob = clean.includes("/") || clean.includes("*") ? clean : `**/${clean}/**`
+  return negated ? glob : `!${glob}`
 }
 
 function raceAbort<A, E, R>(effect: Effect.Effect<A, E, R>, signal?: AbortSignal) {
@@ -418,7 +442,9 @@ export const layer: Layer.Layer<Service, never, AppFileSystem.Service | ChildPro
 
       const tree: Interface["tree"] = Effect.fn("Ripgrep.tree")(function* (input: TreeInput) {
         log.info("tree", input)
-        const list = Array.from(yield* files({ cwd: input.cwd, signal: input.signal }).pipe(Stream.runCollect))
+        const list = Array.from(
+          yield* files({ cwd: input.cwd, ignore: input.ignore, signal: input.signal }).pipe(Stream.runCollect),
+        )
 
         interface Node {
           name: string

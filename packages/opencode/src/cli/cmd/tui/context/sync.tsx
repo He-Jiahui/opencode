@@ -17,6 +17,8 @@ import type {
   ProviderListResponse,
   ProviderAuthMethod,
   VcsInfo,
+  Workflow,
+  WorkflowGraph,
 } from "@opencode-ai/sdk/v2"
 import { createStore, produce, reconcile } from "solid-js/store"
 import { useProject } from "@tui/context/project"
@@ -54,6 +56,10 @@ export const { use: useSync, provider: SyncProvider } = createSimpleContext({
       }
       config: Config
       session: Session[]
+      workflow: Workflow[]
+      workflow_graph: {
+        [workflowID: string]: WorkflowGraph
+      }
       session_status: {
         [sessionID: string]: SessionStatus
       }
@@ -95,6 +101,8 @@ export const { use: useSync, provider: SyncProvider } = createSimpleContext({
       provider: [],
       provider_default: {},
       session: [],
+      workflow: [],
+      workflow_graph: {},
       session_status: {},
       session_diff: {},
       todo: {},
@@ -247,6 +255,40 @@ export const { use: useSync, provider: SyncProvider } = createSimpleContext({
 
         case "session.status": {
           setStore("session_status", event.properties.sessionID, event.properties.status)
+          break
+        }
+
+        case "workflow.created":
+        case "workflow.updated": {
+          const info = event.properties.info
+          const result = Binary.search(store.workflow, info.id, (workflow) => workflow.id)
+          if (result.found) {
+            setStore("workflow", result.index, reconcile(info))
+            break
+          }
+          setStore(
+            "workflow",
+            produce((draft) => {
+              draft.splice(result.index, 0, info)
+            }),
+          )
+          break
+        }
+
+        case "workflow.graph.updated": {
+          const graph = event.properties.graph
+          setStore("workflow_graph", graph.workflow.id, reconcile(graph))
+          const result = Binary.search(store.workflow, graph.workflow.id, (workflow) => workflow.id)
+          if (result.found) {
+            setStore("workflow", result.index, reconcile(graph.workflow))
+            break
+          }
+          setStore(
+            "workflow",
+            produce((draft) => {
+              draft.splice(result.index, 0, graph.workflow)
+            }),
+          )
           break
         }
 
@@ -542,6 +584,14 @@ export const { use: useSync, provider: SyncProvider } = createSimpleContext({
             }),
           )
           fullSyncedSessions.add(sessionID)
+        },
+        async workflow(_sessionID?: string) {
+          const list = await sdk.client.workflow.list()
+          setStore("workflow", reconcile(list.data ?? [], { key: "id" }))
+        },
+        async workflowGraph(workflowID: string) {
+          const graph = await sdk.client.workflow.graph({ workflowID })
+          if (graph.data) setStore("workflow_graph", workflowID, reconcile(graph.data))
         },
       },
       bootstrap,

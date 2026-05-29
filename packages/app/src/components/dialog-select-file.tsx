@@ -2,8 +2,10 @@ import { useDialog } from "@opencode-ai/ui/context/dialog"
 import { Dialog } from "@opencode-ai/ui/dialog"
 import { FileIcon } from "@opencode-ai/ui/file-icon"
 import { Icon } from "@opencode-ai/ui/icon"
+import { Button } from "@opencode-ai/ui/button"
 import { Keybind } from "@opencode-ai/ui/keybind"
 import { List } from "@opencode-ai/ui/list"
+import { showToast } from "@opencode-ai/ui/toast"
 import { base64Encode } from "@opencode-ai/core/util/encode"
 import { getDirectory, getFilename } from "@opencode-ai/core/util/path"
 import { useNavigate } from "@solidjs/router"
@@ -14,6 +16,7 @@ import { useServerSync } from "@/context/server-sync"
 import { useLayout } from "@/context/layout"
 import { useFile } from "@/context/file"
 import { useLanguage } from "@/context/language"
+import { usePlatform } from "@/context/platform"
 import { useSessionLayout } from "@/pages/session/session-layout"
 import { createSessionTabs } from "@/pages/session/helpers"
 import { decode64 } from "@/utils/base64"
@@ -261,12 +264,18 @@ function createSessionEntries(props: {
   return { sessions }
 }
 
-export function DialogSelectFile(props: { mode?: DialogSelectFileMode; onOpenFile?: (path: string) => void }) {
+export function DialogSelectFile(props: {
+  mode?: DialogSelectFileMode
+  onOpenFile?: (path: string) => void
+  onSelectFile?: (path: string) => void
+  nativeFilePicker?: boolean
+}) {
   const command = useCommand()
   const language = useLanguage()
   const layout = useLayout()
   const file = useFile()
   const dialog = useDialog()
+  const platform = usePlatform()
   const navigate = useNavigate()
   const serverSDK = useServerSDK()
   const serverSync = useServerSync()
@@ -357,6 +366,36 @@ export function DialogSelectFile(props: { mode?: DialogSelectFileMode; onOpenFil
     tabs().setActive(value)
   }
 
+  const handlePath = (path: string) => {
+    if (props.onSelectFile) {
+      props.onSelectFile(path)
+      return
+    }
+    open(path)
+  }
+
+  const openNativeFilePicker = () => {
+    if (!props.nativeFilePicker || !platform.openFilePickerDialog) return
+
+    platform
+      .openFilePickerDialog({
+        title: language.t("session.plan.openFromFile"),
+        multiple: false,
+        extensions: [],
+      })
+      .then((result) => {
+        const path = Array.isArray(result) ? result[0] : result
+        if (!path) return
+        state.committed = true
+        state.cleanup = undefined
+        dialog.close()
+        handlePath(path)
+      })
+      .catch(() => {
+        showToast({ variant: "error", title: language.t("common.requestFailed") })
+      })
+  }
+
   const handleSelect = (item: Entry | undefined) => {
     if (!item) return
     state.committed = true
@@ -375,7 +414,7 @@ export function DialogSelectFile(props: { mode?: DialogSelectFileMode; onOpenFil
     }
 
     if (!item.path) return
-    open(item.path)
+    handlePath(item.path)
   }
 
   onCleanup(() => {
@@ -392,6 +431,20 @@ export function DialogSelectFile(props: { mode?: DialogSelectFileMode; onOpenFil
             : language.t("palette.search.placeholder"),
           autofocus: true,
           hideIcon: true,
+          action: (
+            <Show when={props.nativeFilePicker && platform.openFilePickerDialog}>
+              <Button
+                type="button"
+                size="small"
+                variant="ghost"
+                icon="folder"
+                class="shrink-0 whitespace-nowrap"
+                onClick={openNativeFilePicker}
+              >
+                {language.t("session.plan.openFromFile")}
+              </Button>
+            </Show>
+          ),
         }}
         emptyMessage={language.t("palette.empty")}
         loadingMessage={language.t("common.loading")}

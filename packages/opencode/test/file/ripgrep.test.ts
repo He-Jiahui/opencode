@@ -65,6 +65,23 @@ describe("file.ripgrep", () => {
     }),
   )
 
+  it.live("ignore patterns exclude files without reading gitignore", () =>
+    Effect.gen(function* () {
+      const dir = yield* tmpdir((dir) =>
+        Effect.gen(function* () {
+          yield* write(path.join(dir, ".gitignore"), "*.log\nbuild/\n")
+          yield* write(path.join(dir, "app.log"), "hidden by gitignore")
+          yield* mkdir(path.join(dir, "build"))
+          yield* write(path.join(dir, "build", "artifact.txt"), "ignored artifact")
+        }),
+      )
+
+      const files = yield* collectFiles({ cwd: dir, ignore: ["build"] })
+      expect(files.includes("app.log")).toBe(true)
+      expect(files.includes(path.join("build", "artifact.txt"))).toBe(false)
+    }),
+  )
+
   it.live("hidden false excludes hidden", () =>
     Effect.gen(function* () {
       const dir = yield* tmpdir((dir) =>
@@ -106,6 +123,23 @@ describe("file.ripgrep", () => {
       expect(result.items[0]?.path.text).toBe(path.join("src", "match.ts"))
       expect(result.items[0]?.line_number).toBe(1)
       expect(result.items[0]?.lines.text).toContain("needle")
+    }),
+  )
+
+  it.live("search uses ignore patterns without reading gitignore", () =>
+    Effect.gen(function* () {
+      const dir = yield* tmpdir((dir) =>
+        Effect.gen(function* () {
+          yield* write(path.join(dir, ".gitignore"), "*.log\nbuild/\n")
+          yield* write(path.join(dir, "app.log"), "needle in ignored log\n")
+          yield* mkdir(path.join(dir, "build"))
+          yield* write(path.join(dir, "build", "artifact.txt"), "needle in ignored artifact\n")
+        }),
+      )
+
+      const result = yield* Ripgrep.use.search({ cwd: dir, pattern: "needle", ignore: ["build"] })
+      expect(result.partial).toBe(false)
+      expect(result.items.map((item) => item.path.text)).toEqual(["app.log"])
     }),
   )
 

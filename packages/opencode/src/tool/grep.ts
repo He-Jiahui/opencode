@@ -4,6 +4,7 @@ import { Effect, Option } from "effect"
 import { InstanceState } from "@/effect/instance-state"
 import { AppFileSystem } from "@opencode-ai/core/filesystem"
 import { Ripgrep } from "../file/ripgrep"
+import { FileIgnore } from "@/file/ignore"
 import { assertExternalDirectoryEffect } from "./external-directory"
 import DESCRIPTION from "./grep.txt"
 import * as Tool from "./tool"
@@ -27,6 +28,7 @@ export const GrepTool = Tool.define(
     const fs = yield* AppFileSystem.Service
     const rg = yield* Ripgrep.Service
     const reference = yield* Reference.Service
+    const ignore = yield* FileIgnore.Service
 
     return {
       description: DESCRIPTION,
@@ -68,23 +70,35 @@ export const GrepTool = Tool.define(
           const info = yield* fs.stat(search).pipe(Effect.catch(() => Effect.succeed(undefined)))
           const cwd = info?.type === "Directory" ? search : path.dirname(search)
           const file = info?.type === "Directory" ? undefined : [path.relative(cwd, search)]
+          const ignored = yield* ignore.patterns()
 
           const result = yield* rg.search({
             cwd,
             pattern: params.pattern,
             glob: params.include ? [params.include] : undefined,
+            ignore: ignored,
             file,
             signal: ctx.abort,
           })
           if (result.items.length === 0) return empty
 
-          const rows = result.items.map((item) => ({
-            path: AppFileSystem.resolve(
-              path.isAbsolute(item.path.text) ? item.path.text : path.join(cwd, item.path.text),
-            ),
-            line: item.line_number,
-            text: item.lines.text,
-          }))
+          const rows = result.items
+            .map((item) => {
+              const file = path.isAbsolute(item.path.text) ? item.path.text : path.join(cwd, item.path.text)
+              const full = AppFileSystem.resolve(file)
+              return {
+                path: full,
+                relative: path.relative(ins.directory, full),
+                line: item.line_number,
+                text: item.lines.text,
+              }
+            })
+            .filter((row) => !FileIgnore.matchWithPatterns(row.relative, ignored))
+            .map((row) => ({
+              path: row.path,
+              line: row.line,
+              text: row.text,
+            }))
           const times = new Map(
             (yield* Effect.forEach(
               [...new Set(rows.map((row) => row.path))],

@@ -1,4 +1,4 @@
-import type { Project, UserMessage } from "@opencode-ai/sdk/v2"
+import type { AssistantMessage, Project, UserMessage, WorkflowGraph } from "@opencode-ai/sdk/v2"
 import { useDialog } from "@opencode-ai/ui/context/dialog"
 import { createQuery, skipToken, useMutation, useQueryClient } from "@tanstack/solid-query"
 import {
@@ -10,11 +10,14 @@ import {
   createMemo,
   createEffect,
   createComputed,
+  createSignal,
   on,
   onMount,
   untrack,
   createResource,
+  For,
 } from "solid-js"
+import { Portal } from "solid-js/web"
 import { makeEventListener } from "@solid-primitives/event-listener"
 import { createMediaQuery } from "@solid-primitives/media"
 import { createResizeObserver } from "@solid-primitives/resize-observer"
@@ -28,9 +31,12 @@ import { Tabs } from "@opencode-ai/ui/tabs"
 import { createAutoScroll } from "@opencode-ai/ui/hooks"
 import { previewSelectedLines } from "@opencode-ai/ui/pierre/selection-bridge"
 import { Button } from "@opencode-ai/ui/button"
+import { IconButton } from "@opencode-ai/ui/icon-button"
+import { Tooltip } from "@opencode-ai/ui/tooltip"
 import { showToast } from "@opencode-ai/ui/toast"
 import { checksum } from "@opencode-ai/core/util/encode"
-import { useLocation, useSearchParams } from "@solidjs/router"
+import { getFilename } from "@opencode-ai/core/util/path"
+import { useLocation, useNavigate, useSearchParams } from "@solidjs/router"
 import { NewSessionDesignView, NewSessionView, SessionHeader } from "@/components/session"
 import { useComments } from "@/context/comments"
 import { getSessionPrefetch, SESSION_PREFETCH_TTL } from "@/context/global-sync/session-prefetch"
@@ -60,6 +66,14 @@ import { TerminalPanel } from "@/pages/session/terminal-panel"
 import { useSessionCommands } from "@/pages/session/use-session-commands"
 import { useSessionHashScroll } from "@/pages/session/use-session-hash-scroll"
 import { shouldUseV2NewSessionPage } from "@/pages/session/new-session-layout"
+import {
+  mountWorkflowReactFlow,
+  type WorkflowReactFlowContextTarget,
+  type WorkflowReactFlowInstance,
+  type WorkflowReactFlowProps,
+  type WorkflowReactFlowSessionState,
+  type WorkflowReactFlowTarget,
+} from "@/components/workflow-react-flow"
 import { Identifier } from "@/utils/id"
 import { diffs as list } from "@/utils/diffs"
 import { Persist, persisted } from "@/utils/persist"
@@ -72,6 +86,54 @@ const emptyUserMessages: UserMessage[] = []
 type FollowupItem = FollowupDraft & { id: string }
 type FollowupEdit = Pick<FollowupItem, "id" | "prompt" | "context">
 const emptyFollowups: FollowupItem[] = []
+const PLAN_COMPLETE_MARKER = "OPENCODE_PLAN_COMPLETE"
+const PLAN_MILESTONE_TAG = "opencode-plan-milestone"
+const PLAN_MILESTONE_OPEN = `<${PLAN_MILESTONE_TAG}>`
+const PLAN_MILESTONE_CLOSE = `</${PLAN_MILESTONE_TAG}>`
+const PLAN_MILESTONE_PATTERN = /<opencode-plan-milestone>([\s\S]*?)<\/opencode-plan-milestone>/g
+const PLAN_FOLLOWUP_PREFIX = "plan:"
+const WORKFLOW_AGENT_PREFIX = "workflow-"
+const PLAN_FOLLOWUP_CONTENT = [
+  "Continue plan mode.",
+  "",
+  "Re-read the attached plan file and compare it against the work completed in this session.",
+  "At the start of every response, report the current plan milestone in this exact block:",
+  PLAN_MILESTONE_OPEN,
+  "completed: <what you completed in this response, or none>",
+  "current: <current milestone or feature task>",
+  "remaining: <what planned work remains after this response>",
+  PLAN_MILESTONE_CLOSE,
+  "Do not omit this block; the desktop app reads it to show plan progress.",
+  "Then return a concise status update, including whether any planned work remains.",
+  "If any planned work remains incomplete, continue with the next unfinished item now.",
+  `If the entire plan is complete, reply with ${PLAN_COMPLETE_MARKER} on its own line and do not start new work.`,
+].join("\n")
+
+type PlanMilestone = {
+  id: string
+  messageID: string
+  parentID: string
+  at: number
+  text: string
+}
+
+type PlanSessionState = {
+  enabled: Record<string, boolean | undefined>
+  file: Record<string, string | undefined>
+  lastAssistant: Record<string, string | undefined>
+  milestones: Record<string, PlanMilestone[] | undefined>
+}
+const emptyPlanMilestones: PlanMilestone[] = []
+
+const emptyWorkflowList: WorkflowGraph["workflow"][] = []
+
+const workflowStatusTone = (status: WorkflowGraph["workflow"]["status"] | WorkflowGraph["milestones"][number]["status"]) => {
+  if (status === "approved" || status === "completed" || status === "done") return "bg-success/10 text-success"
+  if (status === "rejected" || status === "blocked" || status === "failed" || status === "cancelled")
+    return "bg-danger/10 text-danger"
+  if (status === "pending") return "bg-surface-element text-text-weak"
+  return "bg-accent/10 text-accent"
+}
 
 type ChangeMode = "git" | "branch" | "turn"
 type VcsMode = "git" | "branch"
@@ -197,6 +259,7 @@ export default function Page() {
   const terminal = useTerminal()
   const [searchParams, setSearchParams] = useSearchParams<{ prompt?: string }>()
   const location = useLocation()
+  const navigate = useNavigate()
   const { params, sessionKey, tabs, view } = useSessionLayout()
 
   createEffect(() => {
@@ -299,6 +362,7 @@ export default function Page() {
 
   const info = createMemo(() => (params.id ? sync.session.get(params.id) : undefined))
   const isChildSession = createMemo(() => !!info()?.parentID)
+  const isWorkflowManagedSession = createMemo(() => !!info()?.agent?.startsWith(WORKFLOW_AGENT_PREFIX))
   const diffs = createMemo(() => (params.id ? list(sync.data.session_diff[params.id]) : []))
   const canReview = createMemo(() => !!sync.project)
   const reviewTab = createMemo(() => isDesktop())
@@ -345,6 +409,49 @@ export default function Page() {
     },
   )
   const lastUserMessage = createMemo(() => visibleUserMessages().at(-1))
+  const workflowReferencesSession = (workflow: WorkflowGraph["workflow"], sessionID: string) => {
+    if (workflow.rootSessionID === sessionID || workflow.pmSessionID === sessionID || workflow.testerSessionID === sessionID)
+      return true
+    return sync.data.workflow_graph[workflow.id]?.milestones.some((milestone) =>
+      milestone.session.some((ref) => ref.sessionID === sessionID),
+    )
+  }
+  const sessionWorkflows = createMemo(() => {
+    if (!params.id) return emptyWorkflowList
+    return sync.data.workflow.filter((workflow) => workflowReferencesSession(workflow, params.id!))
+  })
+  const activeWorkflow = createMemo(() => sessionWorkflows().at(-1))
+  const activeWorkflowGraph = createMemo(() => {
+    const workflow = activeWorkflow()
+    if (!workflow) return
+    return sync.data.workflow_graph[workflow.id]
+  })
+  const sessionBelongsToWorkflow = createMemo(() => {
+    const id = params.id
+    const workflow = activeWorkflow()
+    if (!id || !workflow) return false
+    return workflow.rootSessionID !== id && workflowReferencesSession(workflow, id)
+  })
+  const [workflowUi, setWorkflowUi] = createStore({
+    expanded: false,
+    fullscreen: false,
+    xml: "",
+    editingXml: false,
+  })
+  const [workflowMenu, setWorkflowMenu] = createSignal<WorkflowReactFlowContextTarget>()
+  const lastCompletedAssistant = createMemo(
+    () => messages().findLast((m) => m.role === "assistant" && m.time.completed) as AssistantMessage | undefined,
+  )
+
+  createEffect(
+    on(
+      () => activeWorkflowGraph()?.workflow.xml ?? activeWorkflow()?.xml,
+      (xml) => {
+        if (!xml || workflowUi.editingXml) return
+        setWorkflowUi("xml", xml)
+      },
+    ),
+  )
 
   createEffect(() => {
     const tab = activeFileTab()
@@ -364,6 +471,49 @@ export default function Page() {
       },
     ),
   )
+
+  createEffect(
+    on(
+      () => [sdk.directory, params.id] as const,
+      ([, id]) => {
+        if (!id) return
+        void sync.session.workflow(id).catch((error) => {
+          console.debug("[workflow] failed to load workflows", error)
+        })
+      },
+    ),
+  )
+
+  createEffect(
+    on(
+      () => activeWorkflow()?.id,
+      (workflowID) => {
+        if (!workflowID) return
+        void sync.session.workflowGraph(workflowID).catch((error) => {
+          console.debug("[workflow] failed to load graph", error)
+        })
+      },
+    ),
+  )
+
+  const stopWorkflowEvents = sdk.event.listen((event) => {
+    const type = event.details.type
+    if (
+      type !== "workflow.created" &&
+      type !== "workflow.updated" &&
+      type !== "workflow.node.updated" &&
+      type !== "workflow.graph.updated"
+    )
+      return
+    const id = params.id
+    if (!id) return
+    void sync.session.workflow(id, { force: true })
+    void sync.session.fetch(0)
+    const workflowID =
+      "workflowID" in event.details.properties ? event.details.properties.workflowID : activeWorkflow()?.id
+    if (workflowID) void sync.session.workflowGraph(workflowID, { force: true })
+  })
+  onCleanup(stopWorkflowEvents)
 
   createEffect(
     on(
@@ -397,6 +547,16 @@ export default function Page() {
       failed: {},
       paused: {},
       edit: {},
+    }),
+  )
+
+  const [planSession, setPlanSession] = persisted(
+    Persist.workspace(sdk.directory, "session-plan", ["session-plan.v1"]),
+    createStore<PlanSessionState>({
+      enabled: {},
+      file: {},
+      lastAssistant: {},
+      milestones: {},
     }),
   )
 
@@ -449,6 +609,15 @@ export default function Page() {
     return list
   })
   const mobileChanges = createMemo(() => !isDesktop() && store.mobileTab === "changes")
+  const planFile = createMemo(() => {
+    const id = params.id
+    if (!id) return
+    return planSession.file[id]
+  })
+  const planActive = createMemo(() => {
+    const id = params.id
+    return !!id && !isWorkflowManagedSession() && !!planSession.enabled[id] && !!planSession.file[id]
+  })
   const wantsReview = createMemo(() =>
     isDesktop()
       ? desktopFileTreeOpen() || (desktopReviewOpen() && activeTab() === "review")
@@ -842,7 +1011,7 @@ export default function Page() {
     }
 
     if (event.key.length === 1 && event.key !== "Unidentified" && !(event.ctrlKey || event.metaKey)) {
-      if (composer.blocked() || isChildSession()) return
+      if (composer.blocked()) return
       inputRef?.focus()
     }
   }
@@ -895,7 +1064,6 @@ export default function Page() {
   }
 
   const focusInput = () => {
-    if (isChildSession()) return
     inputRef?.focus()
   }
 
@@ -1343,6 +1511,445 @@ export default function Page() {
     })
   }
 
+  const workflowPrompt = () => {
+    const message = lastUserMessage()
+    if (message) {
+      const text = extractPromptFromParts(sync.data.part[message.id] ?? [], {
+        directory: sdk.directory,
+        attachmentName: language.t("common.attachment"),
+      })
+        .map((part) => {
+          if (part.type === "image") return `[image:${part.filename}]`
+          if (part.type === "file") return `@${part.path}`
+          if (part.type === "agent") return `@${part.name}`
+          return part.content
+        })
+        .join("")
+        .trim()
+      if (text) return text
+    }
+    return info()?.title ?? ""
+  }
+
+  const workflowModel = () => {
+    const model = local.model.current()
+    if (!model) return
+    return `${model.provider.id}/${model.id}`
+  }
+
+  const workflowVariants = () => {
+    const variants = local.model.variant.list()
+    if (variants.length === 0) return []
+    return variants.includes("default") ? variants : ["default", ...variants]
+  }
+
+  const startWorkflowMutation = useMutation(() => ({
+    mutationFn: async (input: { request: string; variant?: string }) => {
+      const sessionID = params.id
+      if (!sessionID) return
+      const result = await sdk.client.workflow.start({
+        workflowStartInput: {
+          sessionID,
+          prompt: input.request,
+          model: workflowModel(),
+          variant: input.variant,
+          agent: local.agent.current()?.name,
+        },
+      })
+      if (result.data) {
+        sync.set("workflow", (items) => [...items.filter((item) => item.id !== result.data!.id), result.data!])
+      }
+      return result.data
+    },
+    onSuccess: (workflow) => {
+      if (!workflow) return
+      setWorkflowUi("expanded", true)
+      showToast({
+        variant: "success",
+        icon: "circle-check",
+        title: language.t("session.workflow.started.title"),
+        description: workflow.id,
+      })
+      void sync.session.workflow(params.id!, { force: true })
+      void sync.session.workflowGraph(workflow.id, { force: true })
+      void sync.session.fetch(0)
+      dialog.close()
+    },
+    onError: fail,
+  }))
+
+  const openStartWorkflowDialog = () => {
+    void import("@/components/dialog-start-workflow").then((x) => {
+      dialog.show(() => (
+        <x.DialogStartWorkflow
+          initialRequest={workflowPrompt()}
+          variants={workflowVariants()}
+          initialVariant={local.model.variant.current() ?? "default"}
+          pending={startWorkflowMutation.isPending}
+          onStart={(input) => startWorkflowMutation.mutate(input)}
+        />
+      ))
+    })
+  }
+
+  const updateWorkflowXmlMutation = useMutation(() => ({
+    mutationFn: async () => {
+      const workflow = activeWorkflow()
+      if (!workflow) return
+      return sdk.client.workflow.updateXml({ workflowID: workflow.id, xml: workflowUi.xml }).then((result) => result.data)
+    },
+    onSuccess: (graph) => {
+      if (!graph) return
+      sync.set("workflow_graph", graph.workflow.id, graph)
+      setWorkflowUi("editingXml", false)
+      showToast({
+        variant: "success",
+        icon: "circle-check",
+        title: language.t("session.workflow.xmlSaved.title"),
+      })
+    },
+    onError: fail,
+  }))
+
+  const resumeWorkflowMutation = useMutation(() => ({
+    mutationFn: async () => {
+      const workflow = activeWorkflow()
+      if (!workflow) return
+      return sdk.client.workflow.resume({ workflowID: workflow.id }).then((result) => result.data)
+    },
+    onSuccess: (workflow) => {
+      if (!workflow) return
+      sync.set("workflow", (items) => [...items.filter((item) => item.id !== workflow.id), workflow])
+      void sync.session.workflow(params.id, { force: true })
+      void sync.session.workflowGraph(workflow.id, { force: true })
+      void sync.session.fetch(0)
+    },
+    onError: fail,
+  }))
+
+  const cancelWorkflowMutation = useMutation(() => ({
+    mutationFn: async () => {
+      const workflow = activeWorkflow()
+      if (!workflow) return
+      return sdk.client.workflow.cancel({ workflowID: workflow.id }).then((result) => result.data)
+    },
+    onSuccess: (workflow) => {
+      if (!workflow) return
+      void sync.session.workflow(params.id, { force: true })
+      void sync.session.workflowGraph(workflow.id, { force: true })
+      void sync.session.fetch(0)
+    },
+    onError: fail,
+  }))
+
+  const openWorkflowPath = (path: string | undefined) => {
+    if (!path) return
+    setWorkflowMenu(undefined)
+    setWorkflowUi("fullscreen", false)
+    openReviewFile(path)
+    openReviewPanel()
+  }
+
+  const openWorkflowSession = (sessionID: string | undefined) => {
+    if (!sessionID) return
+    setWorkflowMenu(undefined)
+    setWorkflowUi("fullscreen", false)
+    navigate(`/${params.dir}/session/${sessionID}`)
+  }
+
+  const workflowNodeClick = (target: WorkflowReactFlowTarget) => {
+    openWorkflowSession(target.sessionID)
+  }
+
+  const workflowNodeContextMenu = (target: WorkflowReactFlowContextTarget) => {
+    setWorkflowMenu(target)
+  }
+
+  const workflowSessionState = (graph: WorkflowGraph) =>
+    Object.fromEntries(
+      graph.nodes
+        .map((node): [string, WorkflowReactFlowSessionState] | undefined => {
+          if (!node.sessionID) return
+          if (sync.data.session_working(node.sessionID)) return [node.sessionID, "running"]
+          if (node.type === "session") return [node.sessionID, "completed"]
+          return
+        })
+        .filter((entry): entry is [string, WorkflowReactFlowSessionState] => !!entry),
+    )
+
+  makeEventListener(window, "click", () => setWorkflowMenu(undefined))
+  makeEventListener(window, "keydown", (event) => {
+    if (event.key !== "Escape") return
+    setWorkflowMenu(undefined)
+    setWorkflowUi("fullscreen", false)
+  })
+
+  const WorkflowGraphView = (props: { graph: WorkflowGraph; fullscreen?: boolean }) => {
+    const [host, setHost] = createSignal<HTMLDivElement>()
+    let flow: WorkflowReactFlowInstance | undefined
+    createEffect(() => {
+      const element = host()
+      if (!element) return
+      const next: WorkflowReactFlowProps = {
+        graph: props.graph,
+        milestoneLabel: language.t("session.workflow.milestone"),
+        viewport: props.fullscreen ? "fullscreen" : "panel",
+        currentSessionID: params.id,
+        sessionState: workflowSessionState(props.graph),
+        onNodeSelect: workflowNodeClick,
+        onNodeContextMenu: workflowNodeContextMenu,
+      }
+      if (!flow) {
+        flow = mountWorkflowReactFlow(element, next)
+        return
+      }
+      flow.update(next)
+    })
+    onCleanup(() => flow?.dispose())
+    return (
+      <div
+        ref={setHost}
+        class={
+          props.fullscreen
+            ? "h-full min-h-0 w-full overflow-hidden rounded-md border border-border-weak-base bg-surface-panel/60"
+            : "h-[280px] min-h-[220px] overflow-hidden rounded-md border border-border-weak-base bg-surface-panel/60"
+        }
+      />
+    )
+  }
+
+  const workflowContextMenu = () => (
+    <Show when={workflowMenu()}>
+      {(target) => (
+        <Portal>
+          <div
+            class="fixed z-[100] flex min-w-44 flex-col gap-1 rounded-md border border-border-weak-base bg-surface-panel p-1 shadow-lg"
+            style={{
+              left: `${Math.max(8, Math.min(target().x, window.innerWidth - 184))}px`,
+              top: `${Math.max(8, Math.min(target().y, window.innerHeight - 88))}px`,
+            }}
+            onClick={(event) => event.stopPropagation()}
+            onContextMenu={(event) => event.preventDefault()}
+          >
+            <button
+              type="button"
+              class="rounded px-2 py-1.5 text-left text-12-regular text-text-strong hover:bg-surface-hover disabled:cursor-not-allowed disabled:text-text-disabled"
+              disabled={!target().sessionID}
+              onClick={() => {
+                openWorkflowSession(target().sessionID)
+                setWorkflowMenu(undefined)
+              }}
+            >
+              {language.t("session.workflow.openSession")}
+            </button>
+            <button
+              type="button"
+              class="rounded px-2 py-1.5 text-left text-12-regular text-text-strong hover:bg-surface-hover disabled:cursor-not-allowed disabled:text-text-disabled"
+              disabled={!target().planPath}
+              onClick={() => {
+                openWorkflowPath(target().planPath)
+                setWorkflowMenu(undefined)
+              }}
+            >
+              {language.t("session.workflow.openPlan")}
+            </button>
+          </div>
+        </Portal>
+      )}
+    </Show>
+  )
+
+  const workflowFullscreenPreview = () => (
+    <Show when={workflowUi.fullscreen && activeWorkflowGraph()}>
+      {(graph) => (
+        <Portal>
+          <div class="workflow-fullscreen-preview fixed inset-0 z-[90] flex flex-col gap-3 p-4">
+            <div class="flex min-h-8 items-center gap-2">
+              <div class="min-w-0 flex-1">
+                <div class="truncate text-13-medium text-text-strong">{graph().workflow.title}</div>
+                <div class="truncate text-11-regular text-text-weaker">{graph().workflow.id}</div>
+              </div>
+              <Tooltip placement="bottom" value={language.t("session.workflow.exitFullscreen")}>
+                <IconButton
+                  type="button"
+                  size="small"
+                  variant="secondary"
+                  icon="collapse"
+                  onClick={() => setWorkflowUi("fullscreen", false)}
+                  aria-label={language.t("session.workflow.exitFullscreen")}
+                />
+              </Tooltip>
+            </div>
+            <div class="workflow-fullscreen-preview__graph min-h-0 flex-1 overflow-hidden rounded-md">
+              <WorkflowGraphView graph={graph()} fullscreen />
+            </div>
+          </div>
+        </Portal>
+      )}
+    </Show>
+  )
+
+  const workflowSessionControl = () => (
+    <>
+      <Show when={params.id && !mobileChanges()}>
+        <div class="shrink-0 px-3 pt-2 pb-1 flex max-w-full flex-col gap-2">
+        <div class="rounded-md border border-border-weak-base bg-surface-panel shadow-sm">
+          <div class="flex items-center gap-2 px-2 py-1.5">
+            <Show
+              when={sessionBelongsToWorkflow()}
+              fallback={
+                <Button
+                  type="button"
+                  size="small"
+                  variant={activeWorkflow() ? "secondary" : "primary"}
+                  icon="branch"
+                  disabled={startWorkflowMutation.isPending || !params.id}
+                  onClick={openStartWorkflowDialog}
+                >
+                  {activeWorkflow() ? language.t("session.workflow.startAnother") : language.t("session.workflow.start")}
+                </Button>
+              }
+            >
+              <span class="shrink-0 rounded border border-border-weak-base px-2 py-1 text-12-medium text-text-weak">
+                {language.t("session.workflow.belongsTo")}
+              </span>
+            </Show>
+            <Show when={activeWorkflow()} keyed>
+              {(workflow) => (
+                <>
+                  <button
+                    type="button"
+                    class="min-w-0 flex-1 text-left"
+                    onClick={() => setWorkflowUi("expanded", !workflowUi.expanded)}
+                  >
+                    <div class="flex min-w-0 items-center gap-2">
+                      <span
+                        class={`shrink-0 rounded px-1.5 py-0.5 text-[10px] leading-4 ${workflowStatusTone(
+                          workflow.status,
+                        )}`}
+                      >
+                        {workflow.status}
+                      </span>
+                      <span class="truncate text-12-medium text-text-strong">{workflow.title}</span>
+                    </div>
+                    <div class="truncate text-11-regular text-text-weaker">{workflow.id}</div>
+                  </button>
+                  <Tooltip placement="bottom" value={language.t("session.workflow.fullscreen")}>
+                    <IconButton
+                      type="button"
+                      size="small"
+                      variant="ghost"
+                      icon="expand"
+                      disabled={!activeWorkflowGraph()}
+                      onClick={() => setWorkflowUi("fullscreen", true)}
+                      aria-label={language.t("session.workflow.fullscreen")}
+                    />
+                  </Tooltip>
+                  <Tooltip placement="bottom" value={language.t("session.workflow.resume")}>
+                    <IconButton
+                      type="button"
+                      size="small"
+                      variant="ghost"
+                      icon="circle-check"
+                      disabled={resumeWorkflowMutation.isPending || workflow.status === "completed"}
+                      onClick={() => resumeWorkflowMutation.mutate()}
+                      aria-label={language.t("session.workflow.resume")}
+                    />
+                  </Tooltip>
+                  <Tooltip placement="bottom" value={language.t("session.workflow.cancel")}>
+                    <IconButton
+                      type="button"
+                      size="small"
+                      variant="ghost"
+                      icon="close-small"
+                      disabled={cancelWorkflowMutation.isPending || workflow.status === "cancelled"}
+                      onClick={() => cancelWorkflowMutation.mutate()}
+                      aria-label={language.t("session.workflow.cancel")}
+                    />
+                  </Tooltip>
+                </>
+              )}
+            </Show>
+          </div>
+          <Show when={workflowUi.expanded && activeWorkflow()}>
+            <div class="border-t border-border-weak-base p-2 flex flex-col gap-2">
+              <Show when={activeWorkflowGraph()} fallback={<div class="text-12-regular text-text-weak px-1 py-2">{language.t("common.loading")}</div>}>
+                {(graph) => (
+                  <>
+                    <WorkflowGraphView graph={graph()} />
+                    <div class="flex flex-wrap gap-1.5">
+                      <For each={graph().milestones}>
+                        {(milestone) => (
+                          <>
+                            <Show when={milestone.planPath}>
+                              {(path) => (
+                                <Button
+                                  type="button"
+                                  size="small"
+                                  variant="ghost"
+                                  icon="open-file"
+                                  onClick={() => openWorkflowPath(path())}
+                                >
+                                  {milestone.id}
+                                </Button>
+                              )}
+                            </Show>
+                          </>
+                        )}
+                      </For>
+                    </div>
+                    <details class="rounded-md border border-border-weak-base bg-background">
+                      <summary class="cursor-pointer px-2 py-1.5 text-12-medium text-text-weak">
+                        {language.t("session.workflow.xml")}
+                      </summary>
+                      <div class="border-t border-border-weak-base p-2 flex flex-col gap-2">
+                        <textarea
+                          class="min-h-40 w-full resize-y rounded-md border border-border-weak-base bg-surface-panel p-2 font-mono text-12-regular text-text-strong outline-none focus:border-border-strong"
+                          value={workflowUi.xml}
+                          onInput={(event) => {
+                            setWorkflowUi("editingXml", true)
+                            setWorkflowUi("xml", event.currentTarget.value)
+                          }}
+                          spellcheck={false}
+                        />
+                        <div class="flex justify-end gap-1.5">
+                          <Button
+                            type="button"
+                            size="small"
+                            variant="secondary"
+                            onClick={() => {
+                              setWorkflowUi("xml", graph().workflow.xml)
+                              setWorkflowUi("editingXml", false)
+                            }}
+                          >
+                            {language.t("common.cancel")}
+                          </Button>
+                          <Button
+                            type="button"
+                            size="small"
+                            variant="primary"
+                            icon="check-small"
+                            disabled={updateWorkflowXmlMutation.isPending}
+                            onClick={() => updateWorkflowXmlMutation.mutate()}
+                          >
+                            {language.t("session.workflow.saveXml")}
+                          </Button>
+                        </div>
+                      </div>
+                    </details>
+                  </>
+                )}
+              </Show>
+            </div>
+          </Show>
+        </div>
+        </div>
+      </Show>
+      {workflowContextMenu()}
+      {workflowFullscreenPreview()}
+    </>
+  )
+
   const merge = (next: NonNullable<ReturnType<typeof info>>) =>
     sync.set("session", (list) => {
       const idx = list.findIndex((item) => item.id === next.id)
@@ -1362,21 +1969,26 @@ export default function Page() {
     })
 
   const busy = (sessionID: string) => sync.data.session_working(sessionID)
+  const workflowManagedSession = (sessionID: string) =>
+    !!sync.session.get(sessionID)?.agent?.startsWith(WORKFLOW_AGENT_PREFIX)
 
   const queuedFollowups = createMemo(() => {
     const id = params.id
     if (!id) return emptyFollowups
+    if (workflowManagedSession(id)) return emptyFollowups
     return followup.items[id] ?? emptyFollowups
   })
 
   const editingFollowup = createMemo(() => {
     const id = params.id
     if (!id) return
+    if (workflowManagedSession(id)) return
     return followup.edit[id]
   })
 
   const followupMutation = useMutation(() => ({
     mutationFn: async (input: { sessionID: string; id: string; manual?: boolean }) => {
+      if (workflowManagedSession(input.sessionID)) return
       const item = (followup.items[input.sessionID] ?? []).find((entry) => entry.id === input.id)
       if (!item) return
 
@@ -1389,6 +2001,7 @@ export default function Page() {
         serverSync,
         draft: item,
         optimisticBusy: item.sessionDirectory === sdk.directory,
+        defaultPrompt: settings.general.defaultPrompt(),
       }).catch((err) => {
         setFollowup("failed", input.sessionID, input.id)
         fail(err)
@@ -1414,7 +2027,13 @@ export default function Page() {
   const queueEnabled = createMemo(() => {
     const id = params.id
     if (!id) return false
-    return settings.general.followup() === "queue" && busy(id) && !composer.blocked() && !isChildSession()
+    return (
+      settings.general.followup() === "queue" &&
+      busy(id) &&
+      !composer.blocked() &&
+      !isChildSession() &&
+      !workflowManagedSession(id)
+    )
   })
 
   const followupText = (item: FollowupDraft) => {
@@ -1434,18 +2053,322 @@ export default function Page() {
     return `[${language.t("common.attachment")}]`
   }
 
-  const queueFollowup = (draft: FollowupDraft) => {
-    setFollowup("items", draft.sessionID, (items) => [
-      ...(items ?? []),
-      { id: Identifier.ascending("message"), ...draft },
-    ])
+  const queueFollowup = (draft: FollowupDraft, id = Identifier.ascending("message")) => {
+    if (workflowManagedSession(draft.sessionID)) return
+    setFollowup("items", draft.sessionID, (items) => [...(items ?? []), { id, ...draft }])
     setFollowup("failed", draft.sessionID, undefined)
     setFollowup("paused", draft.sessionID, undefined)
   }
 
+  const clearQueuedFollowups = (sessionID: string) => {
+    setFollowup("items", sessionID, [])
+    setFollowup("failed", sessionID, undefined)
+    setFollowup("paused", sessionID, undefined)
+    setFollowup("edit", sessionID, undefined)
+  }
+
+  const removeQueuedPlanFollowups = (sessionID: string) => {
+    setFollowup("items", sessionID, (items) =>
+      (items ?? []).filter((entry) => !entry.id.startsWith(PLAN_FOLLOWUP_PREFIX)),
+    )
+    setFollowup("failed", sessionID, (value) => (value?.startsWith(PLAN_FOLLOWUP_PREFIX) ? undefined : value))
+  }
+
+  const assistantOutput = (messageID: string) => {
+    const parts = sync.data.part[messageID]
+    if (!parts) return
+    return parts
+      .filter((part) => part.type === "text")
+      .map((part) => part.text)
+      .join("\n")
+  }
+
+  const hasPlanCompleteMarker = (output: string) =>
+    output.split(/\r?\n/).some((line) => line.trim() === PLAN_COMPLETE_MARKER)
+
+  const planMilestones = createMemo(() => {
+    const id = params.id
+    if (!id) return emptyPlanMilestones
+    return planSession.milestones[id] ?? emptyPlanMilestones
+  })
+
+  const parsePlanMilestones = (output: string) => {
+    const matches = output.matchAll(PLAN_MILESTONE_PATTERN)
+    return [...matches].map((match) => match[1]?.trim()).filter((text): text is string => !!text)
+  }
+
+  const recordPlanMilestones = (sessionID: string, assistant: AssistantMessage, output: string) => {
+    const parsed = parsePlanMilestones(output)
+    if (parsed.length === 0) return
+
+    setPlanSession("milestones", sessionID, (items) => {
+      const existing = items ?? []
+      if (existing.some((item) => item.messageID === assistant.id)) return existing
+      return [
+        ...existing,
+        ...parsed.map((text, index) => ({
+          id: `${assistant.id}:${index}`,
+          messageID: assistant.id,
+          parentID: assistant.parentID,
+          at: assistant.time.completed ?? assistant.time.created,
+          text,
+        })),
+      ]
+    })
+  }
+
+  const queuePlanFollowup = (sessionID: string, path: string, opts?: { notify?: boolean }) => {
+    if (workflowManagedSession(sessionID)) return false
+    if (sync.session.get(sessionID)?.parentID) return false
+    if (followupBusy(sessionID)) return false
+    if ((followup.items[sessionID] ?? []).length > 0) return false
+    if (followup.paused[sessionID]) return false
+    if (composer.blocked()) return false
+    if (busy(sessionID)) return false
+
+    const currentModel = local.model.current()
+    const currentAgent = local.agent.current()
+    if (!currentModel || !currentAgent) {
+      if (opts?.notify) {
+        showToast({
+          title: language.t("prompt.toast.modelAgentRequired.title"),
+          description: language.t("prompt.toast.modelAgentRequired.description"),
+        })
+      }
+      return false
+    }
+
+    const content = PLAN_FOLLOWUP_CONTENT + "\n\n"
+    const fileContent = `@${path}`
+    queueFollowup(
+      {
+        sessionID,
+        sessionDirectory: sdk.directory,
+        prompt: [
+          { type: "text", content, start: 0, end: content.length },
+          {
+            type: "file",
+            path,
+            content: fileContent,
+            start: content.length,
+            end: content.length + fileContent.length,
+          },
+        ],
+        context: [],
+        agent: currentAgent.name,
+        model: { providerID: currentModel.provider.id, modelID: currentModel.id },
+        variant: local.model.variant.current(),
+      },
+      PLAN_FOLLOWUP_PREFIX + Identifier.ascending("message"),
+    )
+    return true
+  }
+
+  const enablePlanSession = (sessionID: string, path: string, opts?: { resetMilestones?: boolean }) => {
+    if (workflowManagedSession(sessionID)) return
+    batch(() => {
+      setPlanSession("file", sessionID, path)
+      setPlanSession("enabled", sessionID, true)
+      setPlanSession("lastAssistant", sessionID, undefined)
+      if (opts?.resetMilestones) setPlanSession("milestones", sessionID, [])
+      setFollowup("paused", sessionID, undefined)
+      removeQueuedPlanFollowups(sessionID)
+    })
+    void queuePlanFollowup(sessionID, path, { notify: true })
+  }
+
+  const choosePlanFile = () => {
+    const sessionID = params.id
+    if (!sessionID) return
+    void import("@/components/dialog-select-file").then((x) => {
+      dialog.show(() => (
+        <x.DialogSelectFile
+          mode="files"
+          nativeFilePicker
+          onSelectFile={(path) => {
+            const id = params.id
+            if (!id) return
+            enablePlanSession(id, path, { resetMilestones: true })
+          }}
+        />
+      ))
+    })
+  }
+
+  const pausePlanSession = () => {
+    const sessionID = params.id
+    if (!sessionID) return
+    setPlanSession("enabled", sessionID, false)
+    removeQueuedPlanFollowups(sessionID)
+  }
+
+  const clearPlanSession = () => {
+    const sessionID = params.id
+    if (!sessionID) return
+    batch(() => {
+      setPlanSession("enabled", sessionID, undefined)
+      setPlanSession("file", sessionID, undefined)
+      setPlanSession("lastAssistant", sessionID, undefined)
+      setPlanSession("milestones", sessionID, undefined)
+      removeQueuedPlanFollowups(sessionID)
+    })
+  }
+
+  const togglePlanSession = () => {
+    const sessionID = params.id
+    if (!sessionID) return
+    if (planActive()) {
+      pausePlanSession()
+      return
+    }
+    const path = planSession.file[sessionID]
+    if (!path) {
+      choosePlanFile()
+      return
+    }
+    enablePlanSession(sessionID, path)
+  }
+
+  const planSessionControl = () => (
+    <Show when={params.id && !isChildSession() && !isWorkflowManagedSession() && !mobileChanges()}>
+      <div class="shrink-0 px-3 pt-3 pb-1 flex max-w-full flex-col gap-2">
+        <div class="flex max-w-full items-center gap-1">
+          <Tooltip
+            placement="bottom"
+            value={
+              <div class="flex flex-col gap-1">
+                <span>{language.t(planFile() ? "session.plan.change" : "session.plan.choose")}</span>
+                <span class="text-text-weaker">
+                  {language.t("session.plan.marker", {
+                    marker: PLAN_COMPLETE_MARKER,
+                  })}
+                </span>
+                <span class="text-text-weaker">
+                  {language.t("session.plan.milestoneTag", {
+                    open: PLAN_MILESTONE_OPEN,
+                    close: PLAN_MILESTONE_CLOSE,
+                  })}
+                </span>
+              </div>
+            }
+          >
+            <Button
+              type="button"
+              size="small"
+              variant={planActive() ? "primary" : "secondary"}
+              icon="checklist"
+              class="max-w-[260px] justify-start border border-border-weak-base bg-surface-panel shadow-sm"
+              onClick={choosePlanFile}
+              aria-label={language.t("session.plan.choose")}
+            >
+              <span class="truncate">{planFile() ? getFilename(planFile()!) : language.t("session.plan.choose")}</span>
+            </Button>
+          </Tooltip>
+          <Show when={planFile()}>
+            <Tooltip
+              placement="bottom"
+              value={language.t(planActive() ? "session.plan.disable" : "session.plan.enable")}
+            >
+              <IconButton
+                type="button"
+                size="small"
+                variant="secondary"
+                icon={planActive() ? "circle-ban-sign" : "circle-check"}
+                class="border border-border-weak-base bg-surface-panel shadow-sm"
+                onClick={togglePlanSession}
+                aria-label={language.t(planActive() ? "session.plan.disable" : "session.plan.enable")}
+              />
+            </Tooltip>
+            <Tooltip placement="bottom" value={language.t("session.plan.clear")}>
+              <IconButton
+                type="button"
+                size="small"
+                variant="secondary"
+                icon="close-small"
+                class="border border-border-weak-base bg-surface-panel shadow-sm"
+                onClick={clearPlanSession}
+                aria-label={language.t("session.plan.clear")}
+              />
+            </Tooltip>
+          </Show>
+        </div>
+        <Show when={planMilestones().length > 0}>
+          <div class="max-w-full overflow-x-auto">
+            <div class="flex items-stretch gap-1.5">
+              <div class="shrink-0 self-center text-11-medium text-text-weaker">
+                {language.t("session.plan.milestones")}
+              </div>
+              <For each={planMilestones()}>
+                {(item, index) => (
+                  <button
+                    type="button"
+                    class="shrink-0 max-w-[280px] rounded-md border border-border-weak-base bg-surface-panel px-2 py-1 text-left shadow-sm hover:bg-surface-hover"
+                    onClick={() => {
+                      const message = visibleUserMessages().find((value) => value.id === item.parentID)
+                      if (message) scrollToMessage(message)
+                    }}
+                  >
+                    <div class="text-11-medium text-text-weaker">
+                      {language.t("session.plan.milestone", { count: index() + 1 })}
+                    </div>
+                    <div class="text-12-regular text-text-strong whitespace-pre-wrap break-words max-h-14 overflow-hidden">
+                      {item.text}
+                    </div>
+                  </button>
+                )}
+              </For>
+            </div>
+          </div>
+        </Show>
+      </div>
+    </Show>
+  )
+
+  createEffect(() => {
+    const sessionID = params.id
+    if (!sessionID || !isWorkflowManagedSession()) return
+    clearQueuedFollowups(sessionID)
+    setPlanSession("enabled", sessionID, false)
+  })
+
+  createEffect(() => {
+    const sessionID = params.id
+    const path = planSession.file[sessionID ?? ""]
+    const assistant = lastCompletedAssistant()
+    if (!sessionID || !path || !planSession.enabled[sessionID] || !assistant) return
+    if (workflowManagedSession(sessionID)) return
+    if (planSession.lastAssistant[sessionID] === assistant.id) return
+    if (assistant.error) return
+
+    const output = assistantOutput(assistant.id)
+    if (output === undefined) return
+
+    recordPlanMilestones(sessionID, assistant, output)
+
+    if (hasPlanCompleteMarker(output)) {
+      batch(() => {
+        setPlanSession("enabled", sessionID, false)
+        setPlanSession("lastAssistant", sessionID, assistant.id)
+        removeQueuedPlanFollowups(sessionID)
+      })
+      showToast({
+        variant: "success",
+        icon: "circle-check",
+        title: language.t("session.plan.complete.title"),
+        description: language.t("session.plan.complete.description"),
+      })
+      return
+    }
+
+    if (queuePlanFollowup(sessionID, path)) {
+      setPlanSession("lastAssistant", sessionID, assistant.id)
+    }
+  })
+
   const followupDock = createMemo(() => queuedFollowups().map((item) => ({ id: item.id, text: followupText(item) })))
 
   const sendFollowup = (sessionID: string, id: string, opts?: { manual?: boolean }) => {
+    if (workflowManagedSession(sessionID)) return Promise.resolve()
     if (sync.session.get(sessionID)?.parentID) return Promise.resolve()
     const item = (followup.items[sessionID] ?? []).find((entry) => entry.id === id)
     if (!item) return Promise.resolve()
@@ -1457,6 +2380,7 @@ export default function Page() {
   const editFollowup = (id: string) => {
     const sessionID = params.id
     if (!sessionID) return
+    if (workflowManagedSession(sessionID)) return
     if (followupBusy(sessionID)) return
 
     const item = queuedFollowups().find((entry) => entry.id === id)
@@ -1578,6 +2502,7 @@ export default function Page() {
     if (followup.failed[sessionID] === item.id) return
     if (followup.paused[sessionID]) return
     if (isChildSession()) return
+    if (workflowManagedSession(sessionID)) return
     if (composer.blocked()) return
     if (busy(sessionID)) return
 
@@ -1670,7 +2595,7 @@ export default function Page() {
       }}
       onResponseSubmit={resumeScroll}
       followup={
-        params.id && !isChildSession()
+        params.id && !isChildSession() && !isWorkflowManagedSession()
           ? {
               queue: queueEnabled,
               items: followupDock(),
@@ -1747,6 +2672,8 @@ export default function Page() {
             width: sessionPanelWidth(),
           }}
         >
+          {planSessionControl()}
+          {workflowSessionControl()}
           <div class="flex-1 min-h-0 overflow-hidden">
             <Switch>
               <Match when={params.id && mobileChanges()}>

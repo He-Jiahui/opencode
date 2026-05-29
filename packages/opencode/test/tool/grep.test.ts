@@ -21,6 +21,7 @@ import { Config } from "@/config/config"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { Git } from "@/git"
 import { Filesystem } from "@/util/filesystem"
+import { FileIgnore } from "@/file/ignore"
 
 const referenceLayer = (flags: Partial<RuntimeFlags.Info> = {}) =>
   Reference.layer.pipe(
@@ -37,6 +38,7 @@ const toolLayer = (flags: Partial<RuntimeFlags.Info> = {}) =>
     Truncate.defaultLayer,
     Agent.defaultLayer,
     Git.defaultLayer,
+    FileIgnore.defaultLayer,
     referenceLayer(flags),
   )
 
@@ -141,6 +143,29 @@ describe("tool.grep", () => {
         ctx,
       )
       expect(result.metadata.matches).toBeGreaterThan(0)
+    }),
+  )
+
+  it.instance("uses opencode ignore instead of gitignore", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() => Bun.write(path.join(test.directory, ".gitignore"), "*.secret\n"))
+      yield* Effect.promise(() => Bun.write(path.join(test.directory, "visible.secret"), "needle\n"))
+      yield* Effect.promise(() => Bun.write(path.join(test.directory, "ignored.tmp"), "needle\n"))
+      yield* Effect.promise(() => Bun.write(path.join(test.directory, ".opencode", ".ignore"), "*.tmp\n"))
+
+      const info = yield* GrepTool
+      const grep = yield* info.init()
+      const result = yield* grep.execute(
+        {
+          pattern: "needle",
+          path: test.directory,
+        },
+        ctx,
+      )
+
+      expect(result.output).toContain("visible.secret")
+      expect(result.output).not.toContain("ignored.tmp")
     }),
   )
 

@@ -12,6 +12,8 @@ type Model = AgentModel & {
   variants?: Record<string, unknown>
 }
 
+const OPENCODE_GPT5_FALLBACK_VARIANTS = ["none", "low", "medium", "high", "xhigh"]
+
 type VariantInput = {
   variants: string[]
   selected: string | null | undefined
@@ -26,6 +28,15 @@ export function getConfiguredAgentVariant(input: { agent: Agent | undefined; mod
   if (input.agent.model.modelID !== input.model.modelID) return undefined
   if (!(input.agent.variant in input.model.variants)) return undefined
   return input.agent.variant
+}
+
+export function listModelVariants(model: Model | undefined) {
+  const variants = Object.keys(model?.variants ?? {})
+  if (variants.length > 0) return variants
+  if (model?.providerID.startsWith("opencode") && model.modelID.toLowerCase().includes("gpt-5")) {
+    return OPENCODE_GPT5_FALLBACK_VARIANTS
+  }
+  return []
 }
 
 export function resolveModelVariant(input: VariantInput) {

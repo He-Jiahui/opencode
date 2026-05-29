@@ -18,6 +18,7 @@ import { RuntimeFlags } from "@/effect/runtime-flags"
 import { Git } from "@/git"
 import { Permission } from "../../src/permission"
 import type * as Tool from "../../src/tool/tool"
+import { FileIgnore } from "@/file/ignore"
 
 const referenceLayer = (flags: Partial<RuntimeFlags.Info> = {}) =>
   Reference.layer.pipe(
@@ -34,6 +35,7 @@ const toolLayer = (flags: Partial<RuntimeFlags.Info> = {}) =>
     Truncate.defaultLayer,
     Agent.defaultLayer,
     Git.defaultLayer,
+    FileIgnore.defaultLayer,
     referenceLayer(flags),
   )
 
@@ -115,6 +117,29 @@ describe("tool.glob", () => {
       expect(result.metadata.count).toBe(1)
       expect(result.output).toContain(path.join(test.directory, "a.ts"))
       expect(result.output).not.toContain(path.join(test.directory, "b.txt"))
+    }),
+  )
+
+  it.instance("uses opencode ignore instead of gitignore", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() => Bun.write(path.join(test.directory, ".gitignore"), "*.secret\n"))
+      yield* Effect.promise(() => Bun.write(path.join(test.directory, "visible.secret"), "visible\n"))
+      yield* Effect.promise(() => Bun.write(path.join(test.directory, "ignored.tmp"), "ignored\n"))
+      yield* Effect.promise(() => Bun.write(path.join(test.directory, ".opencode", ".ignore"), "*.tmp\n"))
+
+      const info = yield* GlobTool
+      const glob = yield* info.init()
+      const result = yield* glob.execute(
+        {
+          pattern: "*",
+          path: test.directory,
+        },
+        ctx,
+      )
+
+      expect(result.output).toContain(path.join(test.directory, "visible.secret"))
+      expect(result.output).not.toContain(path.join(test.directory, "ignored.tmp"))
     }),
   )
 

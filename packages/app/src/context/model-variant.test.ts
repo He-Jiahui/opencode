@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { cycleModelVariant, getConfiguredAgentVariant, resolveModelVariant } from "./model-variant"
+import { cycleModelVariant, getConfiguredAgentVariant, listModelVariants, resolveModelVariant } from "./model-variant"
 
 describe("model variant", () => {
   test("resolves configured agent variant when model matches", () => {
@@ -82,5 +82,24 @@ describe("model variant", () => {
     })
 
     expect(value).toBe("low")
+  })
+
+  test("provides fallback variants for opencode gpt-5 models without model metadata", () => {
+    expect(
+      listModelVariants({
+        providerID: "opencode",
+        modelID: "gpt-5.5",
+      }),
+    ).toEqual(["none", "low", "medium", "high", "xhigh"])
+  })
+
+  test("uses model metadata variants when present", () => {
+    expect(
+      listModelVariants({
+        providerID: "opencode",
+        modelID: "gpt-5.5",
+        variants: { low: {}, high: {} },
+      }),
+    ).toEqual(["low", "high"])
   })
 })

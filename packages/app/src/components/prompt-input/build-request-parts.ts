@@ -24,6 +24,7 @@ type BuildRequestPartsInput = {
   context: ContextFile[]
   images: ImageAttachmentPart[]
   text: string
+  defaultPrompt?: string
   messageID: string
   sessionID: string
   sessionDirectory: string
@@ -90,6 +91,17 @@ const toOptimisticPart = (part: PromptRequestPart, sessionID: string, messageID:
 
 export function buildRequestParts(input: BuildRequestPartsInput) {
   const requestParts: PromptRequestPart[] = [
+    ...(input.defaultPrompt?.trim()
+      ? [
+          {
+            id: Identifier.ascending("part"),
+            type: "text" as const,
+            text: input.defaultPrompt.trim(),
+            synthetic: true,
+            metadata: { opencodeDefaultPrompt: true },
+          },
+        ]
+      : []),
     {
       id: Identifier.ascending("part"),
       type: "text",

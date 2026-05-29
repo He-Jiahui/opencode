@@ -8,12 +8,14 @@ import {
 } from "./deep-links"
 import { type Session } from "@opencode-ai/sdk/v2/client"
 import {
+  childSessionCount,
   childSessionOnPath,
   displayName,
   effectiveWorkspaceOrder,
   errorMessage,
   hasProjectPermissions,
   latestRootSession,
+  sessionOnPath,
 } from "./helpers"
 import { pathKey } from "@/utils/path-key"
 
@@ -210,6 +212,29 @@ describe("layout workspace helpers", () => {
     expect(childSessionOnPath(list, "child", "leaf")?.id).toBe("leaf")
     expect(childSessionOnPath(list, "root", "root")).toBeUndefined()
     expect(childSessionOnPath(list, "root", "other")).toBeUndefined()
+  })
+
+  test("detects sessions on the active tree path", () => {
+    const list = [
+      session({ id: "root", directory: "/workspace" }),
+      session({ id: "child", directory: "/workspace", parentID: "root" }),
+      session({ id: "leaf", directory: "/workspace", parentID: "child" }),
+    ]
+
+    expect(sessionOnPath(list, "root", "root")).toBe(true)
+    expect(sessionOnPath(list, "root", "leaf")).toBe(true)
+    expect(sessionOnPath(list, "child", "leaf")).toBe(true)
+    expect(sessionOnPath(list, "leaf", "child")).toBe(false)
+  })
+
+  test("counts non-archived child sessions", () => {
+    const list = [
+      session({ id: "child", directory: "/workspace", parentID: "root" }),
+      session({ id: "archived", directory: "/workspace", parentID: "root", time: { created: 0, updated: 0, archived: 1 } }),
+      session({ id: "other", directory: "/workspace", parentID: "child" }),
+    ]
+
+    expect(childSessionCount(list, "root")).toBe(1)
   })
 
   test("formats fallback project display name", () => {

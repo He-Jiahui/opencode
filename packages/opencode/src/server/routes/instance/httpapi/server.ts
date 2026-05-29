@@ -18,6 +18,7 @@ import { Config } from "@/config/config"
 import { Command } from "@/command"
 import * as Observability from "@opencode-ai/core/effect/observability"
 import { File } from "@/file"
+import { FileIgnore } from "@/file/ignore"
 import { FileWatcher } from "@/file/watcher"
 import { Ripgrep } from "@/file/ripgrep"
 import { Format } from "@/format"
@@ -54,6 +55,7 @@ import { lazy } from "@/util/lazy"
 import { Vcs } from "@/project/vcs"
 import { Worktree } from "@/worktree"
 import { Workspace } from "@/control-plane/workspace"
+import { Workflow } from "@/workflow/workflow"
 import { CorsConfig, isAllowedCorsOrigin, type CorsOptions } from "@/server/cors"
 import { serveUIEffect } from "@/server/shared/ui"
 import { ServerAuth } from "@/server/auth"
@@ -78,6 +80,7 @@ import { sessionHandlers } from "./handlers/session"
 import { syncHandlers } from "./handlers/sync"
 import { tuiHandlers } from "./handlers/tui"
 import { v2Handlers } from "./handlers/v2"
+import { workflowHandlers } from "./handlers/workflow"
 import { workspaceHandlers } from "./handlers/workspace"
 import { instanceContextLayer, instanceRouterMiddleware } from "./middleware/instance-context"
 import { workspaceRouterMiddleware, workspaceRoutingLayer } from "./middleware/workspace-routing"
@@ -137,6 +140,7 @@ const instanceApiRoutes = HttpApiBuilder.layer(InstanceHttpApi).pipe(
     syncHandlers,
     v2Handlers,
     tuiHandlers,
+    workflowHandlers,
     workspaceHandlers,
   ]),
 )
@@ -197,6 +201,7 @@ export function createRoutes(
       Command.defaultLayer,
       Config.defaultLayer,
       File.defaultLayer,
+      FileIgnore.defaultLayer,
       FileWatcher.defaultLayer,
       Format.defaultLayer,
       LSP.defaultLayer,
@@ -230,6 +235,7 @@ export function createRoutes(
       ToolRegistry.defaultLayer,
       Vcs.defaultLayer,
       Workspace.defaultLayer,
+      Workflow.defaultLayer,
       Worktree.appLayer,
       Bus.layer,
       AppFileSystem.defaultLayer,

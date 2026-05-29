@@ -24,11 +24,42 @@ export type Retryable = {
 
 export const RETRY_INITIAL_DELAY = 2000
 export const RETRY_BACKOFF_FACTOR = 2
-export const RETRY_MAX_DELAY_NO_HEADERS = 30_000 // 30 seconds
+export const RETRY_MAX_DELAY_NO_HINTS = 60_000 // 1 minute
 export const RETRY_MAX_DELAY = 2_147_483_647 // max 32-bit signed integer for setTimeout
+export const RETRY_MAX_DELAY_NO_HEADERS = RETRY_MAX_DELAY_NO_HINTS
 
 function cap(ms: number) {
   return Math.min(ms, RETRY_MAX_DELAY)
+}
+
+function backoff(attempt: number) {
+  return Math.min(RETRY_INITIAL_DELAY * Math.pow(RETRY_BACKOFF_FACTOR, attempt - 1), RETRY_MAX_DELAY_NO_HINTS)
+}
+
+function networkErrorMessage(value: unknown) {
+  if (typeof value !== "string") return false
+  const lower = value.toLowerCase()
+  return [
+    "load failed",
+    "network connection was lost",
+    "network request failed",
+    "failed to fetch",
+    "fetch failed",
+    "econnreset",
+    "econnrefused",
+    "etimedout",
+    "socket hang up",
+    "socket connection",
+    "connection reset",
+    "connection refused",
+    "http transport failed",
+  ].some((message) => lower.includes(message))
+}
+
+function networkError(error: Err) {
+  if (isRecord(error.data) && networkErrorMessage(error.data.message)) return true
+  if (!MessageV2.APIError.isInstance(error)) return false
+  return networkErrorMessage(error.data.metadata?.code) || networkErrorMessage(error.data.metadata?.message)
 }
 
 export function delay(attempt: number, error?: MessageV2.APIError) {
@@ -57,21 +88,22 @@ export function delay(attempt: number, error?: MessageV2.APIError) {
         }
       }
 
-      return cap(RETRY_INITIAL_DELAY * Math.pow(RETRY_BACKOFF_FACTOR, attempt - 1))
+      return backoff(attempt)
     }
   }
 
-  return cap(Math.min(RETRY_INITIAL_DELAY * Math.pow(RETRY_BACKOFF_FACTOR, attempt - 1), RETRY_MAX_DELAY_NO_HEADERS))
+  return backoff(attempt)
 }
 
 export function retryable(error: Err, provider: string) {
   // context overflow errors should not be retried
   if (MessageV2.ContextOverflowError.isInstance(error)) return undefined
+  const isNetworkError = networkError(error)
   if (MessageV2.APIError.isInstance(error)) {
     const status = error.data.statusCode
     // 5xx errors are transient server failures and should always be retried,
     // even when the provider SDK doesn't explicitly mark them as retryable.
-    if (!error.data.isRetryable && !(status !== undefined && status >= 500)) return undefined
+    if (!isNetworkError && !error.data.isRetryable && !(status !== undefined && status >= 500)) return undefined
     if (error.data.responseBody?.includes("FreeUsageLimitError")) {
       return {
         message: GO_UPSELL_MESSAGE,
@@ -125,6 +157,7 @@ export function retryable(error: Err, provider: string) {
   const msg = isRecord(error.data) ? error.data.message : undefined
   if (typeof msg === "string") {
     const lower = msg.toLowerCase()
+    if (isNetworkError) return { message: msg }
     if (
       lower.includes("rate increased too quickly") ||
       lower.includes("rate limit") ||

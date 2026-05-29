@@ -1,12 +1,10 @@
 import { Show, createEffect, createMemo, onCleanup } from "solid-js"
 import { createStore } from "solid-js/store"
-import { useNavigate } from "@solidjs/router"
 import { useSpring } from "@opencode-ai/ui/motion-spring"
 import { useLayout } from "@/context/layout"
 import { PromptInput } from "@/components/prompt-input"
 import { useLanguage } from "@/context/language"
 import { usePrompt } from "@/context/prompt"
-import { useSync } from "@/context/sync"
 import { getSessionHandoff, setSessionHandoff } from "@/pages/session/handoff"
 import { useSessionKey } from "@/pages/session/session-layout"
 import { SessionPermissionDock } from "@/pages/session/composer/session-permission-dock"
@@ -47,19 +45,14 @@ export function SessionComposerRegion(props: {
   }
   setPromptDockRef: (el: HTMLDivElement) => void
 }) {
-  const navigate = useNavigate()
   const layout = useLayout()
   const prompt = usePrompt()
   const language = useLanguage()
   const route = useSessionKey()
-  const sync = useSync()
   const view = layout.view(route.sessionKey)
 
   const handoffPrompt = createMemo(() => getSessionHandoff(route.sessionKey())?.prompt)
-  const info = createMemo(() => (route.params.id ? sync.session.get(route.params.id) : undefined))
-  const parentID = createMemo(() => info()?.parentID)
-  const child = createMemo(() => !!parentID())
-  const showComposer = createMemo(() => !props.state.blocked() || child())
+  const showComposer = createMemo(() => !props.state.blocked())
 
   const previewPrompt = () =>
     prompt
@@ -124,12 +117,6 @@ export function SessionComposerRegion(props: {
   const rolled = createMemo(() => (props.revert?.items.length ? props.revert : undefined))
   const lift = createMemo(() => (rolled() ? 18 : 36 * value()))
   const full = createMemo(() => Math.max(78, store.height))
-
-  const openParent = () => {
-    const id = parentID()
-    if (!id) return
-    navigate(`/${route.params.dir}/session/${id}`)
-  }
 
   createEffect(() => {
     const el = store.body
@@ -256,41 +243,18 @@ export function SessionComposerRegion(props: {
                   onEdit={props.followup!.onEdit}
                 />
               </Show>
-              <Show
-                when={child()}
-                fallback={
-                  <Show when={!props.state.blocked()}>
-                    <PromptInput
-                      variant={props.placement === "inline" ? "new-session" : undefined}
-                      ref={props.inputRef}
-                      newSessionWorktree={props.newSessionWorktree}
-                      onNewSessionWorktreeReset={props.onNewSessionWorktreeReset}
-                      edit={props.followup?.edit}
-                      onEditLoaded={props.followup?.onEditLoaded}
-                      shouldQueue={props.followup?.queue}
-                      onQueue={props.followup?.onQueue}
-                      onAbort={props.followup?.onAbort}
-                      onSubmit={props.onSubmit}
-                    />
-                  </Show>
-                }
-              >
-                <div
-                  ref={props.inputRef}
-                  class="w-full rounded-[12px] border border-border-weak-base bg-background-base p-3 text-16-regular text-text-weak"
-                >
-                  <span>{language.t("session.child.promptDisabled")} </span>
-                  <Show when={parentID()}>
-                    <button
-                      type="button"
-                      class="text-text-base transition-colors hover:text-text-strong"
-                      onClick={openParent}
-                    >
-                      {language.t("session.child.backToParent")}
-                    </button>
-                  </Show>
-                </div>
-              </Show>
+              <PromptInput
+                variant={props.placement === "inline" ? "new-session" : undefined}
+                ref={props.inputRef}
+                newSessionWorktree={props.newSessionWorktree}
+                onNewSessionWorktreeReset={props.onNewSessionWorktreeReset}
+                edit={props.followup?.edit}
+                onEditLoaded={props.followup?.onEditLoaded}
+                shouldQueue={props.followup?.queue}
+                onQueue={props.followup?.onQueue}
+                onAbort={props.followup?.onAbort}
+                onSubmit={props.onSubmit}
+              />
             </div>
           </Show>
         </Show>

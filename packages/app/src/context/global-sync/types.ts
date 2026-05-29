@@ -14,6 +14,8 @@ import type {
   SnapshotFileDiff,
   Todo,
   VcsInfo,
+  Workflow,
+  WorkflowGraph,
 } from "@opencode-ai/sdk/v2/client"
 import { NormalizedProviderListResponse } from "@opencode-ai/ui/context"
 import type { Accessor } from "solid-js"
@@ -43,6 +45,10 @@ export type State = {
   path: Path
   session: Session[]
   sessionTotal: number
+  workflow: Workflow[]
+  workflow_graph: {
+    [workflowID: string]: WorkflowGraph
+  }
   session_status: {
     [sessionID: string]: SessionStatus
   }

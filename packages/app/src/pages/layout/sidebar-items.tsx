@@ -6,7 +6,8 @@ import { Spinner } from "@opencode-ai/ui/spinner"
 import { Tooltip } from "@opencode-ai/ui/tooltip"
 import { getFilename } from "@opencode-ai/core/util/path"
 import { A, useParams } from "@solidjs/router"
-import { type Accessor, createMemo, For, type JSX, Match, Show, Switch } from "solid-js"
+import { type Accessor, createEffect, createMemo, For, type JSX, Match, Show, Switch } from "solid-js"
+import { createStore } from "solid-js/store"
 import { useServerSync } from "@/context/server-sync"
 import { useLanguage } from "@/context/language"
 import { getAvatarColors, type LocalProject, useLayout } from "@/context/layout"
@@ -15,7 +16,13 @@ import { usePermission } from "@/context/permission"
 import { messageAgentColor } from "@/utils/agent"
 import { sessionTitle } from "@/utils/session-title"
 import { sessionPermissionRequest } from "../session/composer/session-request-tree"
-import { childSessionOnPath, getProjectAvatarSource, hasProjectPermissions } from "./helpers"
+import {
+  childSessionCount,
+  getProjectAvatarSource,
+  hasProjectPermissions,
+  sessionOnPath,
+  sortedChildSessions,
+} from "./helpers"
 
 export const ProjectIcon = (props: {
   project: LocalProject
@@ -147,6 +154,7 @@ export const SessionItem = (props: SessionItemProps): JSX.Element => {
   const notification = useNotification()
   const permission = usePermission()
   const serverSync = useServerSync()
+  const [expanded, setExpanded] = createStore<Record<string, boolean>>({})
   const unseenCount = createMemo(() => notification.session.unseenCount(props.session.id))
   const hasError = createMemo(() => notification.session.unseenHasError(props.session.id))
   const [sessionStore] = serverSync.child(props.session.directory)
@@ -162,9 +170,17 @@ export const SessionItem = (props: SessionItemProps): JSX.Element => {
 
   const tint = createMemo(() => messageAgentColor(sessionStore.message[props.session.id], sessionStore.agent))
   const tooltip = createMemo(() => props.showTooltip ?? (props.mobile || !props.sidebarExpanded()))
-  const currentChild = createMemo(() => {
-    if (!props.showChild) return
-    return childSessionOnPath(sessionStore.session, props.session.id, params.id)
+  const expandable = createMemo(() => props.showChild && childSessionCount(sessionStore.session, props.session.id) > 0)
+  const autoExpanded = createMemo(() => !!props.showChild && sessionOnPath(sessionStore.session, props.session.id, params.id))
+  const open = createMemo(() => autoExpanded() || expanded[props.session.id])
+  const childSessions = createMemo(() => {
+    if (!open()) return []
+    return sortedChildSessions(sessionStore.session, props.session.id, Date.now())
+  })
+
+  createEffect(() => {
+    if (!autoExpanded()) return
+    setExpanded(props.session.id, true)
   })
 
   const warm = (span: number, priority: "high" | "low") => {
@@ -213,6 +229,23 @@ export const SessionItem = (props: SessionItemProps): JSX.Element => {
         style={{ "padding-left": `${8 + (props.level ?? 0) * 16}px` }}
       >
         <div class="flex min-w-0 items-center gap-1">
+          <Show when={props.showChild}>
+            <button
+              type="button"
+              class="shrink-0 size-5 flex items-center justify-center rounded text-icon-weak hover:text-icon-base hover:bg-surface-base-active disabled:opacity-0 disabled:pointer-events-none"
+              disabled={!expandable()}
+              aria-label={open() ? language.t("common.close") : language.t("common.open")}
+              aria-expanded={open()}
+              onClick={(event) => {
+                event.preventDefault()
+                event.stopPropagation()
+                if (!expandable()) return
+                setExpanded(props.session.id, !open())
+              }}
+            >
+              <Icon name={open() ? "chevron-down" : "chevron-right"} size="small" />
+            </button>
+          </Show>
           <div class="min-w-0 flex-1">
             <Show
               when={!tooltip()}
@@ -258,13 +291,13 @@ export const SessionItem = (props: SessionItemProps): JSX.Element => {
           </Show>
         </div>
       </div>
-      <Show when={currentChild()} keyed>
+      <For each={childSessions()}>
         {(child) => (
           <div class="w-full">
             <SessionItem {...props} session={child} level={(props.level ?? 0) + 1} />
           </div>
         )}
-      </Show>
+      </For>
     </>
   )
 }

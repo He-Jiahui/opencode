@@ -2439,6 +2439,28 @@ describe("ProviderTransform.variants", () => {
     expect(result).toEqual({})
   })
 
+  test("opencode gpt-5.5 returns reasoning effort variants", () => {
+    const result = ProviderTransform.variants(
+      createMockModel({
+        id: "gpt-5.5",
+        providerID: "opencode",
+        api: {
+          id: "gpt-5.5",
+          url: "https://api.opencode.ai",
+          npm: "opencode",
+        },
+        release_date: "2026-04-23",
+      }),
+    )
+
+    expect(Object.keys(result)).toEqual(["none", "low", "medium", "high", "xhigh"])
+    expect(result.high).toMatchObject({
+      reasoningEffort: "high",
+      reasoningSummary: "auto",
+      include: ["reasoning.encrypted_content"],
+    })
+  })
+
   test("mistral models with reasoning support return variants", () => {
     const model = createMockModel({
       id: "mistral/mistral-small-latest",

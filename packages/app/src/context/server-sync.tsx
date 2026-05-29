@@ -58,6 +58,18 @@ export const loadLspQuery = (directory: string, sdk: OpencodeClient) =>
     queryFn: () => sdk.lsp.status().then((r) => r.data ?? []),
   })
 
+export const loadWorkflowsQuery = (directory: string, sdk: OpencodeClient) =>
+  queryOptions({
+    queryKey: [directory, "workflow"] as const,
+    queryFn: () => sdk.workflow.list().then((r) => r.data ?? []),
+  })
+
+export const loadWorkflowGraphQuery = (directory: string, workflowID: string, sdk: OpencodeClient) =>
+  queryOptions({
+    queryKey: [directory, "workflow-graph", workflowID] as const,
+    queryFn: () => sdk.workflow.graph({ workflowID }).then((r) => r.data),
+  })
+
 function makeQueryOptionsApi(serverSDK: () => OpencodeClient, sdkFor: (dir: PathKey) => OpencodeClient) {
   return {
     globalConfig: () => loadGlobalConfigQuery(serverSDK()),
@@ -69,6 +81,8 @@ function makeQueryOptionsApi(serverSDK: () => OpencodeClient, sdkFor: (dir: Path
     mcp: (directory: PathKey) => loadMcpQuery(directory, sdkFor(directory)),
     lsp: (directory: PathKey) => loadLspQuery(directory, sdkFor(directory)),
     sessions: (directory: PathKey) => ({ queryKey: [directory, "loadSessions"] as const }),
+    workflows: (directory: PathKey) => loadWorkflowsQuery(directory, sdkFor(directory)),
+    workflowGraph: (directory: PathKey, workflowID: string) => loadWorkflowGraphQuery(directory, workflowID, sdkFor(directory)),
   }
 }
 export type QueryOptionsApi = ReturnType<typeof makeQueryOptionsApi>

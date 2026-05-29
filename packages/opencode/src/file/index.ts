@@ -8,13 +8,13 @@ import { Effect, Layer, Context, Schema, Scope } from "effect"
 import * as Stream from "effect/Stream"
 import { formatPatch, structuredPatch } from "diff"
 import fuzzysort from "fuzzysort"
-import ignore from "ignore"
 import path from "path"
 import { Global } from "@opencode-ai/core/global"
 import { containsPath } from "../project/instance-context"
 import * as Log from "@opencode-ai/core/util/log"
 import { Protected } from "./protected"
 import { Ripgrep } from "./ripgrep"
+import { FileIgnore } from "./ignore"
 import { NonNegativeInt, type DeepMutable } from "@opencode-ai/core/schema"
 
 export const Info = Schema.Struct({
@@ -31,6 +31,7 @@ export const Node = Schema.Struct({
   absolute: Schema.String,
   type: Schema.Literals(["file", "directory"]),
   ignored: Schema.Boolean,
+  children: Schema.optional(NonNegativeInt),
 }).annotate({ identifier: "FileNode" })
 export type Node = DeepMutable<Schema.Schema.Type<typeof Node>>
 
@@ -335,6 +336,7 @@ export const layer = Layer.effect(
     const appFs = yield* AppFileSystem.Service
     const rg = yield* Ripgrep.Service
     const git = yield* Git.Service
+    const ignore = yield* FileIgnore.Service
     const scope = yield* Scope.Scope
 
     const state = yield* InstanceState.make<State>(
@@ -375,9 +377,11 @@ export const layer = Layer.effect(
 
         next.dirs = Array.from(dirs).toSorted()
       } else {
-        const files = yield* rg.files({ cwd: ctx.directory }).pipe(
+        const ignored = yield* ignore.patterns()
+        const files = yield* rg.files({ cwd: ctx.directory, ignore: ignored }).pipe(
           Stream.runCollect,
           Effect.map((chunk) => [...chunk]),
+          Effect.map((files) => files.filter((file) => !FileIgnore.matchWithPatterns(file, ignored))),
         )
         const seen = new Set<string>()
         for (const file of files) {
@@ -569,18 +573,8 @@ export const layer = Layer.effect(
 
     const list = Effect.fn("File.list")(function* (dir?: string) {
       const ctx = yield* InstanceState.context
-      const exclude = [".git", ".DS_Store"]
-      let ignored = (_: string) => false
-      if (ctx.project.vcs === "git") {
-        const ig = ignore()
-        const gitignore = path.join(ctx.worktree, ".gitignore")
-        const gitignoreText = yield* appFs.readFileString(gitignore).pipe(Effect.catch(() => Effect.succeed("")))
-        if (gitignoreText) ig.add(gitignoreText)
-        const ignoreFile = path.join(ctx.worktree, ".ignore")
-        const ignoreText = yield* appFs.readFileString(ignoreFile).pipe(Effect.catch(() => Effect.succeed("")))
-        if (ignoreText) ig.add(ignoreText)
-        ignored = ig.ignores.bind(ig)
-      }
+      const exclude = [".DS_Store"]
+      const ignored = yield* ignore.patterns()
 
       const resolved = dir ? path.join(ctx.directory, dir) : ctx.directory
       if (!containsPath(resolved, ctx)) {
@@ -591,22 +585,34 @@ export const layer = Layer.effect(
 
       const nodes: Node[] = []
       for (const entry of entries) {
-        if (exclude.includes(entry.name)) continue
         const absolute = path.join(resolved, entry.name)
         const file = path.relative(ctx.directory, absolute)
+        if (exclude.includes(entry.name) || FileIgnore.matchWithPatterns(file, ignored)) continue
         const type = entry.type === "directory" ? "directory" : "file"
         nodes.push({
           name: entry.name,
           path: file,
           absolute,
           type,
-          ignored: ignored(type === "directory" ? file + "/" : file),
+          ignored: false,
+          children:
+            type === "directory"
+              ? (yield* countChildren(absolute, ignored, ctx.directory).pipe(Effect.orElseSucceed(() => undefined)))
+              : undefined,
         })
       }
       return nodes.sort((a, b) => {
         if (a.type !== b.type) return a.type === "directory" ? -1 : 1
         return a.name.localeCompare(b.name)
       })
+    })
+
+    const countChildren = Effect.fn("File.countChildren")(function* (dir: string, ignored: string[], root: string) {
+      const entries = yield* appFs.readDirectoryEntries(dir)
+      return entries.filter((entry) => {
+        if (entry.name === ".DS_Store") return false
+        return !FileIgnore.matchWithPatterns(path.relative(root, path.join(dir, entry.name)), ignored)
+      }).length
     })
 
     const search = Effect.fn("File.search")(function* (input: {
@@ -646,6 +652,7 @@ export const layer = Layer.effect(
 )
 
 export const defaultLayer = layer.pipe(
+  Layer.provide(FileIgnore.defaultLayer),
   Layer.provide(Ripgrep.defaultLayer),
   Layer.provide(AppFileSystem.defaultLayer),
   Layer.provide(Git.defaultLayer),

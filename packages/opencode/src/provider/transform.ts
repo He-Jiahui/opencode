@@ -655,6 +655,19 @@ export function variants(model: Provider.Model): Record<string, Record<string, a
   }
   if (id.includes("grok")) return {}
 
+  if (model.providerID.startsWith("opencode") && model.api.id.toLowerCase().includes("gpt-5")) {
+    return Object.fromEntries(
+      openaiCompatibleReasoningEfforts(model.api.id).map((effort) => [
+        effort,
+        {
+          reasoningEffort: effort,
+          reasoningSummary: "auto",
+          include: INCLUDE_ENCRYPTED_REASONING,
+        },
+      ]),
+    )
+  }
+
   switch (model.api.npm) {
     case "@openrouter/ai-sdk-provider":
       if (!id.includes("gpt") && !id.includes("gemini-3") && !id.includes("claude")) return {}

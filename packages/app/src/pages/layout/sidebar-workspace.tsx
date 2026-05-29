@@ -440,6 +440,55 @@ export const SortableWorkspace = (props: {
   )
 }
 
+export const WorkspaceSessionPanel = (props: {
+  ctx: WorkspaceSidebarContext
+  directory: Accessor<string>
+  sortNow: Accessor<number>
+  mobile?: boolean
+}): JSX.Element => {
+  const serverSync = useServerSync()
+  const queryOptions = useQueryOptions()
+  const language = useLanguage()
+  const workspace = createMemo(() => {
+    const [store, setStore] = serverSync.child(props.directory())
+    return { store, setStore }
+  })
+  const slug = createMemo(() => base64Encode(props.directory()))
+  const sessions = createMemo(() => sortedRootSessions(workspace().store, props.sortNow()))
+  const count = createMemo(() => sessions()?.length ?? 0)
+  const fetching = useIsFetching(() => queryOptions.sessions(pathKey(props.directory())))
+  const hasMore = createMemo(() => workspace().store.sessionTotal > count())
+  const loading = () => fetching() > 0 && count() === 0
+  const loadMore = async () => {
+    workspace().setStore("limit", (limit) => (limit ?? 0) + 5)
+    await serverSync.project.loadSessions(props.directory())
+  }
+
+  createEffect(() => {
+    if (!props.directory()) return
+    serverSync.child(props.directory(), { bootstrap: true })
+  })
+
+  return (
+    <div
+      ref={(el) => props.ctx.setScrollContainerRef(el, props.mobile)}
+      class="size-full flex flex-col py-2 overflow-y-auto no-scrollbar [overflow-anchor:none]"
+    >
+      <WorkspaceSessionList
+        slug={slug}
+        mobile={props.mobile}
+        ctx={props.ctx}
+        showNew={() => !loading()}
+        loading={loading}
+        sessions={sessions}
+        hasMore={hasMore}
+        loadMore={loadMore}
+        language={language}
+      />
+    </div>
+  )
+}
+
 export const LocalWorkspace = (props: {
   ctx: WorkspaceSidebarContext
   project: LocalProject

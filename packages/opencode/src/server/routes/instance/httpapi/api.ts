@@ -18,6 +18,7 @@ import { QuestionApi } from "./groups/question"
 import { SessionApi } from "./groups/session"
 import { SyncApi } from "./groups/sync"
 import { TuiApi } from "./groups/tui"
+import { WorkflowApi } from "./groups/workflow"
 import { WorkspaceApi } from "./groups/workspace"
 import { V2Api } from "./groups/v2"
 import { Authorization } from "./middleware/authorization"
@@ -48,6 +49,7 @@ export const InstanceHttpApi = HttpApi.make("opencode-instance")
   .addHttpApi(SyncApi)
   .addHttpApi(V2Api)
   .addHttpApi(TuiApi)
+  .addHttpApi(WorkflowApi)
   .addHttpApi(WorkspaceApi)
   .middleware(SchemaErrorMiddleware)
 

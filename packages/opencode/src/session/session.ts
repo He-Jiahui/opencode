@@ -462,6 +462,7 @@ export interface Interface {
   readonly touch: (sessionID: SessionID) => Effect.Effect<void>
   readonly get: (id: SessionID) => Effect.Effect<Info, NotFound>
   readonly setTitle: (input: { sessionID: SessionID; title: string }) => Effect.Effect<void>
+  readonly setParent: (input: { sessionID: SessionID; parentID: SessionID }) => Effect.Effect<void>
   readonly setArchived: (input: { sessionID: SessionID; time?: number }) => Effect.Effect<void>
   readonly setPermission: (input: { sessionID: SessionID; permission: Permission.Ruleset }) => Effect.Effect<void>
   readonly setRevert: (input: {
@@ -728,6 +729,10 @@ export const layer: Layer.Layer<
       yield* patch(input.sessionID, { title: input.title })
     })
 
+    const setParent = Effect.fn("Session.setParent")(function* (input: { sessionID: SessionID; parentID: SessionID }) {
+      yield* patch(input.sessionID, { parentID: input.parentID })
+    })
+
     const setArchived = Effect.fn("Session.setArchived")(function* (input: { sessionID: SessionID; time?: number }) {
       yield* patch(input.sessionID, { time: { archived: input.time } })
     })
@@ -843,6 +848,7 @@ export const layer: Layer.Layer<
       touch,
       get,
       setTitle,
+      setParent,
       setArchived,
       setPermission,
       setRevert,

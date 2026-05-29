@@ -34,6 +34,7 @@ export interface Settings {
     showSessionProgressBar: boolean
     showCustomAgents: boolean
     defaultPrompt: string
+    newLayoutDesigns?: boolean
   }
   updates: {
     startup: boolean
@@ -55,6 +56,7 @@ export interface Settings {
 export const monoDefault = "System Mono"
 export const sansDefault = "System Sans"
 export const terminalDefault = "JetBrainsMono Nerd Font Mono"
+export const newLayoutDesignsDefault = import.meta.env.VITE_OPENCODE_CHANNEL !== "prod"
 
 const monoFallback =
   'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace'
@@ -247,6 +249,10 @@ export const { use: useSettings, provider: SettingsProvider } = createSimpleCont
         defaultPrompt: withFallback(() => store.general?.defaultPrompt, defaultSettings.general.defaultPrompt),
         setDefaultPrompt(value: string) {
           setStore("general", "defaultPrompt", value)
+        },
+        newLayoutDesigns: withFallback(() => store.general?.newLayoutDesigns, newLayoutDesignsDefault),
+        setNewLayoutDesigns(value: boolean) {
+          setStore("general", "newLayoutDesigns", value)
         },
       },
       updates: {

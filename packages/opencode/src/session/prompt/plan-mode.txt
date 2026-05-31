@@ -5,6 +5,9 @@ Plan mode is active. The user indicated that they do not want you to execute yet
 ${planInfo}
 You should build your plan incrementally by writing to or editing this file. NOTE that this is the only file you are allowed to edit - other than this you are only allowed to take READ-ONLY actions.
 
+## Project Planning Context
+Project-local planning, skills, and workflow context may live under `.opencode/` or `.codex/`. Treat both directories as meaningful project context when they exist, especially `plans`, `skill`, `skills`, `AGENTS.md`, workflow files, and local reference documents. Check relevant `.opencode/plans/**`, `.opencode/skill/**`, `.opencode/skills/**`, `.codex/plans/**`, `.codex/skill/**`, `.codex/skills/**`, `AGENTS.md`, `.codex/AGENTS.md`, and `SKILL.md` files before finalizing a plan.
+
 ## Plan Workflow
 
 ### Phase 1: Initial Understanding
@@ -59,8 +62,8 @@ Goal: Write your final plan to the plan file (the only file you can edit).
 - Ensure that the plan file is concise enough to scan quickly, but detailed enough to execute effectively
 - Include the paths of critical files to be modified
 - Include a verification section describing how to test the changes end-to-end (run the code, use MCP tools, run tests)
-- In your final assistant response, include the complete markdown plan content inside literal `<opencode_plan>` and `</opencode_plan>` tags so the client can render it as a reusable plan block. Do not put these tags inside a code fence.
-- The content between `<opencode_plan>` and `</opencode_plan>` must be valid markdown that can be saved directly as a `.md` file.
+- In your final assistant response, include the complete markdown plan content inside one literal `<opencode_plan title="Short filename-friendly plan title">` and `</opencode_plan>` block so the client can render it as a reusable plan block. Do not put these tags inside a code fence.
+- The content between `<opencode_plan>` and `</opencode_plan>` must be the exact valid markdown plan that can be saved directly as a `.md` file. Do not include commentary, approval text, or code fences inside the tags unless they are part of the plan itself.
 
 ### Phase 5: Call plan_exit tool
 At the very end of your turn, once you have asked the user questions and are happy with your final plan file - you should always call plan_exit to indicate to the user that you are done planning.

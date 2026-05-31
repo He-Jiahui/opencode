@@ -1,8 +1,10 @@
 import { Agent } from "@/agent/agent"
 import { Bus } from "@/bus"
 import { Command } from "@/command"
+import * as InstanceState from "@/effect/instance-state"
 import { Permission } from "@/permission"
 import { PermissionID } from "@/permission/schema"
+import { Provider } from "@/provider/provider"
 import { SessionShare } from "@/share/session"
 import { Session } from "@/session/session"
 import { SessionCompaction } from "@/session/compaction"
@@ -13,6 +15,7 @@ import { SessionRunState } from "@/session/run-state"
 import { SessionStatus } from "@/session/status"
 import { SessionSummary } from "@/session/summary"
 import { Todo } from "@/session/todo"
+import { Workflow } from "@/workflow/workflow"
 import { MessageID, PartID, SessionID } from "@/session/schema"
 import { NamedError } from "@opencode-ai/core/util/error"
 import { Cause, Effect, Option, Schema, Scope } from "effect"
@@ -52,10 +55,12 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
     const compactSvc = yield* SessionCompaction.Service
     const runState = yield* SessionRunState.Service
     const agentSvc = yield* Agent.Service
+    const providerSvc = yield* Provider.Service
     const permissionSvc = yield* Permission.Service
     const statusSvc = yield* SessionStatus.Service
     const todoSvc = yield* Todo.Service
     const summary = yield* SessionSummary.Service
+    const workflowSvc = yield* Workflow.Service
     const bus = yield* Bus.Service
     const scope = yield* Scope.Scope
 
@@ -321,11 +326,105 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       return HttpApiSchema.NoContent.make()
     })
 
+    const commandModel = Effect.fn("SessionHttpApi.commandModel")(function* (
+      sessionID: SessionID,
+      model: string | undefined,
+    ) {
+      if (model) return Provider.parseModel(model)
+      const latest = (yield* session.messages({ sessionID }).pipe(Effect.orDie)).findLast(
+        (item) => item.info.role === "user" && item.info.model,
+      )
+      if (latest?.info.role === "user") return latest.info.model
+      return yield* providerSvc.defaultModel().pipe(Effect.mapError(() => new HttpApiError.BadRequest({})))
+    })
+
+    const workflowContinueCommand = Effect.fn("SessionHttpApi.workflowContinueCommand")(function* (ctx: {
+      params: { sessionID: SessionID }
+      payload: typeof CommandPayload.Type
+    }) {
+      const instance = yield* InstanceState.context
+      const model = yield* commandModel(ctx.params.sessionID, ctx.payload.model)
+      const agent = ctx.payload.agent ?? (yield* agentSvc.defaultAgent())
+      yield* statusSvc.set(ctx.params.sessionID, { type: "busy" }).pipe(Effect.ignore)
+      const user = yield* session.updateMessage({
+        id: ctx.payload.messageID ?? MessageID.ascending(),
+        role: "user",
+        sessionID: ctx.params.sessionID,
+        time: { created: Date.now() },
+        agent,
+        model,
+      })
+      yield* session.updatePart({
+        id: PartID.ascending(),
+        messageID: user.id,
+        sessionID: user.sessionID,
+        type: "text",
+        text: `/${Command.Default.WORKFLOW_CONTINUE}${ctx.payload.arguments.trim() ? ` ${ctx.payload.arguments.trim()}` : ""}`,
+        time: { start: Date.now(), end: Date.now() },
+      })
+      for (const part of ctx.payload.parts ?? []) {
+        yield* session.updatePart({
+          ...part,
+          id: part.id ?? PartID.ascending(),
+          messageID: user.id,
+          sessionID: user.sessionID,
+        })
+      }
+      const result = yield* workflowSvc
+        .continueFromSession({
+          sessionID: ctx.params.sessionID,
+          message: ctx.payload.arguments.trim() || "/workflow-continue",
+        })
+        .pipe(
+          Effect.map((workflow) =>
+            `Workflow ${workflow.id} continue requested.\n\nStatus: ${workflow.status}${workflow.error ? `\n\nCurrent blocker: ${workflow.error}` : ""}`,
+          ),
+          Effect.catch((error: Workflow.Error) =>
+            Effect.succeed(`Workflow continue could not start.\n\nReason: ${error.message}`),
+          ),
+        )
+      const assistant = yield* session.updateMessage({
+        id: MessageID.ascending(),
+        parentID: user.id,
+        role: "assistant",
+        sessionID: ctx.params.sessionID,
+        mode: agent,
+        agent,
+        variant: ctx.payload.variant,
+        path: { cwd: instance.directory, root: instance.worktree },
+        cost: 0,
+        tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+        modelID: model.modelID,
+        providerID: model.providerID,
+        time: { created: Date.now(), completed: Date.now() },
+        finish: "stop" as const,
+      })
+      const assistantPart = yield* session.updatePart({
+        id: PartID.ascending(),
+        messageID: assistant.id,
+        sessionID: assistant.sessionID,
+        type: "text",
+        text: result,
+        time: { start: assistant.time.created, end: assistant.time.completed ?? Date.now() },
+      })
+      yield* statusSvc.set(ctx.params.sessionID, { type: "idle" }).pipe(Effect.ignore)
+      yield* bus.publish(Command.Event.Executed, {
+        name: Command.Default.WORKFLOW_CONTINUE,
+        sessionID: ctx.params.sessionID,
+        arguments: ctx.payload.arguments,
+        messageID: assistant.id,
+      })
+      return { info: assistant, parts: [assistantPart] }
+    })
+
     const command = Effect.fn("SessionHttpApi.command")(function* (ctx: {
       params: { sessionID: SessionID }
       payload: typeof CommandPayload.Type
     }) {
       yield* requireSession(ctx.params.sessionID)
+      if (ctx.payload.command === Command.Default.WORKFLOW_CONTINUE) {
+        return yield* workflowContinueCommand(ctx).pipe(Effect.mapError(() => new HttpApiError.BadRequest({})))
+      }
       return yield* promptSvc
         .command({ ...ctx.payload, sessionID: ctx.params.sessionID })
         .pipe(Effect.mapError(() => new HttpApiError.BadRequest({})))

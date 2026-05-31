@@ -4,7 +4,7 @@ import { Effect } from "effect"
 import { HttpApiBuilder, HttpApiError } from "effect/unstable/httpapi"
 import { InstanceHttpApi } from "../api"
 import { InvalidRequestError, notFound } from "../errors"
-import { ListQuery, UpdateXmlPayload } from "../groups/workflow"
+import { IntervenePayload, ListQuery, UpdateStaffingPayload, UpdateXmlPayload } from "../groups/workflow"
 
 const mapWorkflowError = (error: Workflow.Error) =>
   error.message.toLowerCase().includes("not found")
@@ -44,6 +44,30 @@ export const workflowHandlers = HttpApiBuilder.group(InstanceHttpApi, "workflow"
         .pipe(Effect.mapError(mapWorkflowError))
     })
 
+    const updateStaffing = Effect.fn("WorkflowHttpApi.updateStaffing")(function* (ctx: {
+      params: { workflowID: WorkflowID }
+      payload: typeof UpdateStaffingPayload.Type
+    }) {
+      return yield* workflow
+        .updateStaffing({ workflowID: ctx.params.workflowID, staffing: ctx.payload.staffing })
+        .pipe(Effect.mapError(mapWorkflowError))
+    })
+
+    const intervene = Effect.fn("WorkflowHttpApi.intervene")(function* (ctx: {
+      params: { workflowID: WorkflowID }
+      payload: typeof IntervenePayload.Type
+    }) {
+      return yield* workflow
+        .intervene({
+          workflowID: ctx.params.workflowID,
+          message: ctx.payload.message,
+          timing: ctx.payload.timing,
+          targetRole: ctx.payload.targetRole,
+          targetSessionID: ctx.payload.targetSessionID,
+        })
+        .pipe(Effect.mapError(mapWorkflowError))
+    })
+
     const resume = Effect.fn("WorkflowHttpApi.resume")(function* (ctx: { params: { workflowID: WorkflowID } }) {
       return yield* workflow.resume(ctx.params.workflowID).pipe(Effect.mapError(mapWorkflowError))
     })
@@ -58,6 +82,8 @@ export const workflowHandlers = HttpApiBuilder.group(InstanceHttpApi, "workflow"
       .handle("get", get)
       .handle("graph", graph)
       .handle("updateXml", updateXml)
+      .handle("updateStaffing", updateStaffing)
+      .handle("intervene", intervene)
       .handle("resume", resume)
       .handle("cancel", cancel)
   }),

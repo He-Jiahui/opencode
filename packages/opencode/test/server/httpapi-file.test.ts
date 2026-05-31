@@ -116,6 +116,24 @@ describe("file HttpApi", () => {
     expect(await next.json()).toMatchObject({ source: "project", content: "*.tmp\n" })
   })
 
+  test("saves reusable plan blocks under workspace .opencode/plans", async () => {
+    await using tmp = await tmpdir({ git: true })
+
+    const response = await request(FilePaths.plan, tmp.path, undefined, {
+      method: "POST",
+      body: JSON.stringify({ title: 'Particle/Plan:*?', content: "# Particle Plan\n- Build it\n" }),
+    })
+
+    expect(response.status).toBe(200)
+    expect(await response.json()).toEqual({
+      title: "Particle/Plan:*?",
+      path: path.join(".opencode", "plans", "Particle Plan.md"),
+    })
+    expect(await Bun.file(path.join(tmp.path, ".opencode", "plans", "Particle Plan.md")).text()).toBe(
+      "# Particle Plan\n- Build it\n",
+    )
+  })
+
   test("search endpoints use opencode ignore instead of gitignore", async () => {
     await using tmp = await tmpdir({ git: true })
     await Bun.write(path.join(tmp.path, ".gitignore"), "*.secret\n")

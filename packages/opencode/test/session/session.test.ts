@@ -175,7 +175,7 @@ describe("step-finish token propagation via Bus event", () => {
 })
 
 describe("Session", () => {
-  it.live("uses .codex/plans when the project has a .codex directory", () =>
+  it.live("uses .opencode/plans even when the project has a .codex directory", () =>
     Effect.gen(function* () {
       const dir = yield* tmpdirScoped()
       yield* AppFileSystem.use.ensureDir(path.join(dir, ".codex"))
@@ -195,7 +195,7 @@ describe("Session", () => {
         },
       )
 
-      expect(plan).toBe(path.join(dir, ".codex", "plans", "123-codex-plan.md"))
+      expect(plan).toBe(path.join(dir, ".opencode", "plans", "123-codex-plan.md"))
     }),
   )
 

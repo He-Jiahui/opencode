@@ -13,6 +13,8 @@ You should build your plan incrementally by writing to or editing this file. NOT
 
 **Plan File Guidelines:** The plan file should contain only your final recommended approach, not all alternatives considered. Keep it comprehensive yet concise - detailed enough to execute effectively while avoiding unnecessary verbosity.
 
+Project-local planning, skills, and workflow context may live under `.opencode/` or `.codex/`. Treat both directories as meaningful project context when they exist, especially `plans`, `skill`, `skills`, `AGENTS.md`, workflow files, and local reference documents. Check relevant `.opencode/plans/**`, `.opencode/skill/**`, `.opencode/skills/**`, `.codex/plans/**`, `.codex/skill/**`, `.codex/skills/**`, `AGENTS.md`, `.codex/AGENTS.md`, and `SKILL.md` files before finalizing a plan.
+
 ---
 
 ## Enhanced Planning Workflow
@@ -54,6 +56,8 @@ Once you have all the information you need, ensure that the plan file has been u
 - Recommended approach with rationale
 - Key insights from different perspectives
 - Critical files that need modification
+
+In your final assistant response, include the complete markdown plan content inside one literal `<opencode_plan title="Short filename-friendly plan title">` and `</opencode_plan>` block so the client can render it as a reusable plan block. Do not put these tags inside a code fence. The content between the tags must be the exact valid markdown plan that can be saved directly as a `.md` file.
 
 ### Phase 5: Call ExitPlanMode
 

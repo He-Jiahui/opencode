@@ -8,6 +8,8 @@ import type {
   WorkflowConsultationInfo,
   WorkflowGraphEdge,
   WorkflowInfo,
+  WorkflowInterventionInfo,
+  WorkflowMemberInfo,
   WorkflowMilestoneInfo,
   WorkflowSessionRef,
 } from "./schema"
@@ -33,6 +35,7 @@ export const WorkflowTable = sqliteTable(
     path: text().notNull(),
     xml: text().notNull(),
     status: text().$type<WorkflowInfo["status"]>().notNull(),
+    staffing: text({ mode: "json" }).$type<WorkflowInfo["staffing"]>(),
     model: text({ mode: "json" }).$type<WorkflowInfo["model"]>(),
     agent: text(),
     test_path: text(),
@@ -44,6 +47,32 @@ export const WorkflowTable = sqliteTable(
     index("workflow_project_idx").on(table.project_id),
     index("workflow_root_session_idx").on(table.root_session_id),
     index("workflow_status_idx").on(table.status),
+  ],
+)
+
+export const WorkflowMemberTable = sqliteTable(
+  "workflow_member",
+  {
+    workflow_id: text()
+      .$type<WorkflowID>()
+      .notNull()
+      .references(() => WorkflowTable.id, { onDelete: "cascade" }),
+    id: text().notNull(),
+    role: text().$type<WorkflowMemberInfo["role"]>().notNull(),
+    specialty: text().notNull(),
+    title: text().notNull(),
+    session_id: text()
+      .$type<SessionID>()
+      .notNull()
+      .references(() => SessionTable.id, { onDelete: "cascade" }),
+    capacity: integer().notNull().default(1),
+    status: text().$type<WorkflowMemberInfo["status"]>().notNull(),
+    ...Timestamps,
+  },
+  (table) => [
+    primaryKey({ columns: [table.workflow_id, table.id] }),
+    index("workflow_member_workflow_role_idx").on(table.workflow_id, table.role),
+    index("workflow_member_session_idx").on(table.session_id),
   ],
 )
 
@@ -108,6 +137,8 @@ export const WorkflowConsultationTable = sqliteTable(
     from_role: text().$type<WorkflowSessionRef["role"]>().notNull(),
     to_role: text().$type<WorkflowSessionRef["role"]>().notNull(),
     milestone_id: text().$type<WorkflowMilestoneID>(),
+    reason: text(),
+    timing: text().$type<WorkflowConsultationInfo["timing"]>(),
     question: text().notNull(),
     answer: text().notNull(),
     status: text().$type<WorkflowConsultationInfo["status"]>().notNull(),
@@ -118,5 +149,34 @@ export const WorkflowConsultationTable = sqliteTable(
     index("workflow_consultation_workflow_idx").on(table.workflow_id),
     index("workflow_consultation_from_session_idx").on(table.from_session_id),
     index("workflow_consultation_to_session_idx").on(table.to_session_id),
+  ],
+)
+
+export const WorkflowInterventionTable = sqliteTable(
+  "workflow_intervention",
+  {
+    workflow_id: text()
+      .$type<WorkflowID>()
+      .notNull()
+      .references(() => WorkflowTable.id, { onDelete: "cascade" }),
+    id: text().notNull(),
+    from_session_id: text()
+      .$type<SessionID>()
+      .references(() => SessionTable.id, { onDelete: "set null" }),
+    target_session_id: text()
+      .$type<SessionID>()
+      .references(() => SessionTable.id, { onDelete: "set null" }),
+    target_role: text().$type<WorkflowInterventionInfo["targetRole"]>().notNull(),
+    timing: text().$type<WorkflowInterventionInfo["timing"]>().notNull(),
+    message: text().notNull(),
+    response: text(),
+    path: text().notNull(),
+    status: text().$type<WorkflowInterventionInfo["status"]>().notNull(),
+    ...Timestamps,
+  },
+  (table) => [
+    primaryKey({ columns: [table.workflow_id, table.id] }),
+    index("workflow_intervention_workflow_idx").on(table.workflow_id),
+    index("workflow_intervention_target_session_idx").on(table.target_session_id),
   ],
 )

@@ -121,11 +121,19 @@ export const layer = Layer.effect(
 
           const cfg = yield* config.get()
           const cfgIgnores = cfg.watcher?.ignore ?? []
+          const projectWatcherEnabled = yield* Flag.OPENCODE_EXPERIMENTAL_FILEWATCHER
 
-          if (yield* Flag.OPENCODE_EXPERIMENTAL_FILEWATCHER) {
+          if (projectWatcherEnabled) {
             yield* Effect.forkScoped(
               subscribe(ctx.directory, [...FileIgnore.PATTERNS, ...cfgIgnores, ...protecteds(ctx.directory)]),
             )
+          }
+          if (!projectWatcherEnabled) {
+            for (const dir of [path.join(ctx.directory, ".opencode"), path.join(ctx.directory, ".codex")]) {
+              if ((yield* Effect.promise(() => readdir(dir).then(() => true).catch(() => false)))) {
+                yield* Effect.forkScoped(subscribe(dir, [...FileIgnore.PATTERNS, ...cfgIgnores, ...protecteds(dir)]))
+              }
+            }
           }
 
           if (ctx.project.vcs === "git") {

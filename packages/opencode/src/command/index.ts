@@ -53,6 +53,7 @@ export function hints(template: string) {
 export const Default = {
   INIT: "init",
   REVIEW: "review",
+  WORKFLOW_CONTINUE: "workflow-continue",
 } as const
 
 export interface Interface {
@@ -92,6 +93,14 @@ export const layer = Layer.effect(
         },
         subtask: true,
         hints: hints(PROMPT_REVIEW),
+      }
+      commands[Default.WORKFLOW_CONTINUE] = {
+        name: Default.WORKFLOW_CONTINUE,
+        description: "continue the workflow linked to the current session",
+        source: "command",
+        template:
+          "Continue the workflow linked to the current session. This command is handled directly by opencode.",
+        hints: [],
       }
 
       for (const [name, command] of Object.entries(cfg.command ?? {})) {

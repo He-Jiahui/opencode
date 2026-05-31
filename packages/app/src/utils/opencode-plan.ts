@@ -14,6 +14,8 @@ export type OpencodePlanSegment =
     } & OpencodePlanBlock)
 
 const planBlock = /<opencode_plan(?:\s+[^>]*)?>([\s\S]*?)<\/opencode_plan>/gi
+const planStartTag = /^<opencode_plan(?:\s+[^>]*)?>/i
+const planBlockStart = /<opencode_plan\b/i
 const titleAttribute = /\stitle\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))/i
 
 export function parseOpencodePlanBlocks(text: string) {
@@ -23,6 +25,7 @@ export function parseOpencodePlanBlocks(text: string) {
 }
 
 export function parseOpencodePlanSegments(text: string): OpencodePlanSegment[] {
+  if (!planBlockStart.test(text)) return [{ type: "text", text }]
   const segments: OpencodePlanSegment[] = []
   let index = 0
   let count = 0
@@ -37,7 +40,7 @@ export function parseOpencodePlanSegments(text: string): OpencodePlanSegment[] {
       segments.push({
         type: "plan",
         id: String(count++),
-        title: extractTitle(content, match[0]),
+        title: extractTitle(content, match[0].match(planStartTag)?.[0] ?? ""),
         content,
       })
     }

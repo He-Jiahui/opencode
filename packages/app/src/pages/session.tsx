@@ -32,6 +32,7 @@ import { createAutoScroll } from "@opencode-ai/ui/hooks"
 import { previewSelectedLines } from "@opencode-ai/ui/pierre/selection-bridge"
 import { Button } from "@opencode-ai/ui/button"
 import { IconButton } from "@opencode-ai/ui/icon-button"
+import { TextField } from "@opencode-ai/ui/text-field"
 import { Tooltip } from "@opencode-ai/ui/tooltip"
 import { showToast } from "@opencode-ai/ui/toast"
 import { checksum } from "@opencode-ai/core/util/encode"
@@ -93,7 +94,6 @@ const PLAN_MILESTONE_OPEN = `<${PLAN_MILESTONE_TAG}>`
 const PLAN_MILESTONE_CLOSE = `</${PLAN_MILESTONE_TAG}>`
 const PLAN_MILESTONE_PATTERN = /<opencode-plan-milestone>([\s\S]*?)<\/opencode-plan-milestone>/g
 const PLAN_FOLLOWUP_PREFIX = "plan:"
-const WORKFLOW_AGENT_PREFIX = "workflow-"
 const PLAN_FOLLOWUP_CONTENT = [
   "Continue plan mode.",
   "",
@@ -127,6 +127,48 @@ type PlanSessionState = {
 const emptyPlanMilestones: PlanMilestone[] = []
 
 const emptyWorkflowList: WorkflowGraph["workflow"][] = []
+type WorkflowStaffing = NonNullable<WorkflowGraph["workflow"]["staffing"]>
+const defaultWorkflowStaffing: Required<WorkflowStaffing> = {
+  mainPM: 1,
+  departmentPM: 2,
+  executor: 4,
+  reviewer: 2,
+  tester: 1,
+  expert: 1,
+}
+const workflowStaffingFields = [
+  ["mainPM", "session.workflow.staffing.mainPM"],
+  ["departmentPM", "session.workflow.staffing.departmentPM"],
+  ["executor", "session.workflow.staffing.executor"],
+  ["reviewer", "session.workflow.staffing.reviewer"],
+  ["tester", "session.workflow.staffing.tester"],
+  ["expert", "session.workflow.staffing.expert"],
+] as const
+const workflowStaffingValue = (value: number | undefined, fallback: number) =>
+  Number.isFinite(value) ? Math.max(1, Math.min(12, Math.trunc(value!))) : fallback
+const normalizeWorkflowStaffing = (input?: WorkflowStaffing): Required<WorkflowStaffing> => ({
+  mainPM: workflowStaffingValue(input?.mainPM, defaultWorkflowStaffing.mainPM),
+  departmentPM: workflowStaffingValue(input?.departmentPM, defaultWorkflowStaffing.departmentPM),
+  executor: workflowStaffingValue(input?.executor, defaultWorkflowStaffing.executor),
+  reviewer: workflowStaffingValue(input?.reviewer, defaultWorkflowStaffing.reviewer),
+  tester: workflowStaffingValue(input?.tester, defaultWorkflowStaffing.tester),
+  expert: workflowStaffingValue(input?.expert, defaultWorkflowStaffing.expert),
+})
+type WorkflowInterventionTiming = "after-task" | "temporary-interrupt" | "interrupt"
+const workflowInterventionTimingOptions: WorkflowInterventionTiming[] = [
+  "temporary-interrupt",
+  "after-task",
+  "interrupt",
+]
+type WorkflowInterventionTargetRole = "main_pm" | "department_pm" | "executor" | "reviewer" | "tester" | "expert"
+const workflowInterventionTargetRoleOptions: WorkflowInterventionTargetRole[] = [
+  "main_pm",
+  "department_pm",
+  "executor",
+  "reviewer",
+  "tester",
+  "expert",
+]
 
 const workflowStatusTone = (status: WorkflowGraph["workflow"]["status"] | WorkflowGraph["milestones"][number]["status"]) => {
   if (status === "approved" || status === "completed" || status === "done") return "bg-success/10 text-success"
@@ -362,8 +404,6 @@ export default function Page() {
   }
 
   const info = createMemo(() => (params.id ? sync.session.get(params.id) : undefined))
-  const isChildSession = createMemo(() => !!info()?.parentID)
-  const isWorkflowManagedSession = createMemo(() => !!info()?.agent?.startsWith(WORKFLOW_AGENT_PREFIX))
   const diffs = createMemo(() => (params.id ? list(sync.data.session_diff[params.id]) : []))
   const canReview = createMemo(() => !!sync.project)
   const reviewTab = createMemo(() => isDesktop())
@@ -413,8 +453,11 @@ export default function Page() {
   const workflowReferencesSession = (workflow: WorkflowGraph["workflow"], sessionID: string) => {
     if (workflow.rootSessionID === sessionID || workflow.pmSessionID === sessionID || workflow.testerSessionID === sessionID)
       return true
-    return sync.data.workflow_graph[workflow.id]?.milestones.some((milestone) =>
-      milestone.session.some((ref) => ref.sessionID === sessionID),
+    const graph = sync.data.workflow_graph[workflow.id]
+    return (
+      graph?.members?.some((member) => member.sessionID === sessionID) ||
+      graph?.milestones?.some((milestone) => milestone.session?.some((ref) => ref.sessionID === sessionID)) ||
+      false
     )
   }
   const sessionWorkflows = createMemo(() => {
@@ -438,7 +481,11 @@ export default function Page() {
     fullscreen: false,
     xml: "",
     editingXml: false,
+    interventionMessage: "",
+    interventionTargetRole: "main_pm" as WorkflowInterventionTargetRole,
+    interventionTiming: "temporary-interrupt" as WorkflowInterventionTiming,
   })
+  const [workflowStaffing, setWorkflowStaffing] = createStore(normalizeWorkflowStaffing())
   const [workflowMenu, setWorkflowMenu] = createSignal<WorkflowReactFlowContextTarget>()
   const lastCompletedAssistant = createMemo(
     () => messages().findLast((m) => m.role === "assistant" && m.time.completed) as AssistantMessage | undefined,
@@ -450,6 +497,15 @@ export default function Page() {
       (xml) => {
         if (!xml || workflowUi.editingXml) return
         setWorkflowUi("xml", xml)
+      },
+    ),
+  )
+
+  createEffect(
+    on(
+      () => activeWorkflowGraph()?.workflow.staffing ?? activeWorkflow()?.staffing,
+      (staffing) => {
+        setWorkflowStaffing(normalizeWorkflowStaffing(staffing))
       },
     ),
   )
@@ -617,7 +673,7 @@ export default function Page() {
   })
   const planActive = createMemo(() => {
     const id = params.id
-    return !!id && !isWorkflowManagedSession() && !!planSession.enabled[id] && !!planSession.file[id]
+    return !!id && !!planSession.enabled[id] && !!planSession.file[id]
   })
   const wantsReview = createMemo(() =>
     isDesktop()
@@ -1545,7 +1601,7 @@ export default function Page() {
   }
 
   const startWorkflowMutation = useMutation(() => ({
-    mutationFn: async (input: { request: string; variant?: string }) => {
+    mutationFn: async (input: { request: string; variant?: string; staffing: WorkflowStaffing }) => {
       const sessionID = params.id
       if (!sessionID) return
       const result = await sdk.client.workflow.start({
@@ -1555,6 +1611,7 @@ export default function Page() {
           model: workflowModel(),
           variant: input.variant,
           agent: local.agent.current()?.name,
+          staffing: input.staffing,
         },
       })
       if (result.data) {
@@ -1607,6 +1664,59 @@ export default function Page() {
         variant: "success",
         icon: "circle-check",
         title: language.t("session.workflow.xmlSaved.title"),
+      })
+    },
+    onError: fail,
+  }))
+
+  const updateWorkflowStaffingMutation = useMutation(() => ({
+    mutationFn: async () => {
+      const workflow = activeWorkflow()
+      if (!workflow) return
+      return sdk.client.workflow
+        .updateStaffing({ workflowID: workflow.id, staffing: { ...workflowStaffing } })
+        .then((result) => result.data)
+    },
+    onSuccess: (workflow) => {
+      if (!workflow) return
+      sync.set("workflow", (items) => [...items.filter((item) => item.id !== workflow.id), workflow])
+      void sync.session.workflow(params.id, { force: true })
+      void sync.session.workflowGraph(workflow.id, { force: true })
+      void sync.session.fetch(0)
+      showToast({
+        variant: "success",
+        icon: "circle-check",
+        title: language.t("session.workflow.staffing.saved"),
+      })
+    },
+    onError: fail,
+  }))
+
+  const workflowInterventionMutation = useMutation(() => ({
+    mutationFn: async () => {
+      const workflow = activeWorkflow()
+      const message = workflowUi.interventionMessage.trim()
+      if (!workflow || !message) return
+      return sdk.client.workflow
+        .intervene({
+          workflowID: workflow.id,
+          message,
+          timing: workflowUi.interventionTiming,
+          targetRole: workflowUi.interventionTargetRole,
+        })
+        .then((result) => result.data)
+    },
+    onSuccess: (workflow) => {
+      if (!workflow) return
+      sync.set("workflow", (items) => [...items.filter((item) => item.id !== workflow.id), workflow])
+      setWorkflowUi("interventionMessage", "")
+      void sync.session.workflow(params.id, { force: true })
+      void sync.session.workflowGraph(workflow.id, { force: true })
+      void sync.session.fetch(0)
+      showToast({
+        variant: "success",
+        icon: "circle-check",
+        title: language.t("session.workflow.intervention.sent"),
       })
     },
     onError: fail,
@@ -1901,6 +2011,91 @@ export default function Page() {
                     </div>
                     <details class="rounded-md border border-border-weak-base bg-background">
                       <summary class="cursor-pointer px-2 py-1.5 text-12-medium text-text-weak">
+                        {language.t("session.workflow.intervention.title")}
+                      </summary>
+                      <div class="border-t border-border-weak-base p-2 flex flex-col gap-2">
+                        <textarea
+                          class="min-h-24 w-full resize-y rounded-md border border-border-weak-base bg-surface-panel p-2 text-12-regular text-text-strong outline-none focus:border-border-strong"
+                          value={workflowUi.interventionMessage}
+                          placeholder={language.t("session.workflow.intervention.placeholder")}
+                          onInput={(event) => setWorkflowUi("interventionMessage", event.currentTarget.value)}
+                          spellcheck={false}
+                        />
+                        <div class="flex flex-wrap items-center justify-end gap-1.5">
+                          <Select
+                            options={workflowInterventionTargetRoleOptions}
+                            current={workflowUi.interventionTargetRole}
+                            label={(option) => language.t(`session.workflow.intervention.target.${option}`)}
+                            onSelect={(option) => option && setWorkflowUi("interventionTargetRole", option)}
+                            variant="secondary"
+                            size="small"
+                            aria-label={language.t("session.workflow.intervention.target")}
+                          />
+                          <Select
+                            options={workflowInterventionTimingOptions}
+                            current={workflowUi.interventionTiming}
+                            label={(option) => language.t(`session.workflow.intervention.timing.${option}`)}
+                            onSelect={(option) => option && setWorkflowUi("interventionTiming", option)}
+                            variant="secondary"
+                            size="small"
+                            aria-label={language.t("session.workflow.intervention.timing")}
+                          />
+                          <Button
+                            type="button"
+                            size="small"
+                            variant="primary"
+                            icon="arrow-up"
+                            disabled={
+                              workflowInterventionMutation.isPending || workflowUi.interventionMessage.trim().length === 0
+                            }
+                            onClick={() => workflowInterventionMutation.mutate()}
+                          >
+                            {language.t("session.workflow.intervention.send")}
+                          </Button>
+                        </div>
+                      </div>
+                    </details>
+                    <details class="rounded-md border border-border-weak-base bg-background">
+                      <summary class="cursor-pointer px-2 py-1.5 text-12-medium text-text-weak">
+                        {language.t("session.workflow.staffing.title")}
+                      </summary>
+                      <div class="border-t border-border-weak-base p-2 flex flex-col gap-2">
+                        <div class="grid grid-cols-2 gap-2 md:grid-cols-3">
+                          <For each={workflowStaffingFields}>
+                            {([key, label]) => (
+                              <TextField
+                                type="number"
+                                min="1"
+                                max="12"
+                                step="1"
+                                label={language.t(label)}
+                                value={String(workflowStaffing[key])}
+                                onChange={(value) =>
+                                  setWorkflowStaffing(
+                                    key,
+                                    workflowStaffingValue(Number(value), defaultWorkflowStaffing[key]),
+                                  )
+                                }
+                              />
+                            )}
+                          </For>
+                        </div>
+                        <div class="flex justify-end">
+                          <Button
+                            type="button"
+                            size="small"
+                            variant="primary"
+                            icon="check-small"
+                            disabled={updateWorkflowStaffingMutation.isPending}
+                            onClick={() => updateWorkflowStaffingMutation.mutate()}
+                          >
+                            {language.t("session.workflow.staffing.save")}
+                          </Button>
+                        </div>
+                      </div>
+                    </details>
+                    <details class="rounded-md border border-border-weak-base bg-background">
+                      <summary class="cursor-pointer px-2 py-1.5 text-12-medium text-text-weak">
                         {language.t("session.workflow.xml")}
                       </summary>
                       <div class="border-t border-border-weak-base p-2 flex flex-col gap-2">
@@ -1970,26 +2165,21 @@ export default function Page() {
     })
 
   const busy = (sessionID: string) => sync.data.session_working(sessionID)
-  const workflowManagedSession = (sessionID: string) =>
-    !!sync.session.get(sessionID)?.agent?.startsWith(WORKFLOW_AGENT_PREFIX)
 
   const queuedFollowups = createMemo(() => {
     const id = params.id
     if (!id) return emptyFollowups
-    if (workflowManagedSession(id)) return emptyFollowups
     return followup.items[id] ?? emptyFollowups
   })
 
   const editingFollowup = createMemo(() => {
     const id = params.id
     if (!id) return
-    if (workflowManagedSession(id)) return
     return followup.edit[id]
   })
 
   const followupMutation = useMutation(() => ({
     mutationFn: async (input: { sessionID: string; id: string; manual?: boolean }) => {
-      if (workflowManagedSession(input.sessionID)) return
       const item = (followup.items[input.sessionID] ?? []).find((entry) => entry.id === input.id)
       if (!item) return
 
@@ -2031,9 +2221,7 @@ export default function Page() {
     return (
       settings.general.followup() === "queue" &&
       busy(id) &&
-      !composer.blocked() &&
-      !isChildSession() &&
-      !workflowManagedSession(id)
+      !composer.blocked()
     )
   })
 
@@ -2055,17 +2243,9 @@ export default function Page() {
   }
 
   const queueFollowup = (draft: FollowupDraft, id = Identifier.ascending("message")) => {
-    if (workflowManagedSession(draft.sessionID)) return
     setFollowup("items", draft.sessionID, (items) => [...(items ?? []), { id, ...draft }])
     setFollowup("failed", draft.sessionID, undefined)
     setFollowup("paused", draft.sessionID, undefined)
-  }
-
-  const clearQueuedFollowups = (sessionID: string) => {
-    setFollowup("items", sessionID, [])
-    setFollowup("failed", sessionID, undefined)
-    setFollowup("paused", sessionID, undefined)
-    setFollowup("edit", sessionID, undefined)
   }
 
   const removeQueuedPlanFollowups = (sessionID: string) => {
@@ -2136,8 +2316,6 @@ export default function Page() {
   }
 
   const queuePlanFollowup = (sessionID: string, path: string, opts?: { notify?: boolean }) => {
-    if (workflowManagedSession(sessionID)) return false
-    if (sync.session.get(sessionID)?.parentID) return false
     if (followupBusy(sessionID)) return false
     if ((followup.items[sessionID] ?? []).length > 0) return false
     if (followup.paused[sessionID]) return false
@@ -2189,13 +2367,16 @@ export default function Page() {
     if (!path) return
     batch(() => {
       setPlanSession("file", sessionID, path)
-      setPlanSession("enabled", sessionID, true)
+      setPlanSession("enabled", sessionID, false)
       setPlanSession("lastAssistant", sessionID, undefined)
       setPlanSession("milestones", sessionID, [])
       setFollowup("paused", sessionID, undefined)
       removeQueuedPlanFollowups(sessionID)
     })
-    if (queuePlanFollowup(sessionID, path, { notify: true })) return
+    if (queuePlanFollowup(sessionID, path, { notify: true })) {
+      setPlanSession("enabled", sessionID, true)
+      return
+    }
     showToast({
       variant: "success",
       icon: "circle-check",
@@ -2205,16 +2386,17 @@ export default function Page() {
   }
 
   const enablePlanSession = (sessionID: string, path: string, opts?: { resetMilestones?: boolean }) => {
-    if (workflowManagedSession(sessionID)) return
     batch(() => {
       setPlanSession("file", sessionID, path)
-      setPlanSession("enabled", sessionID, true)
+      setPlanSession("enabled", sessionID, false)
       setPlanSession("lastAssistant", sessionID, undefined)
       if (opts?.resetMilestones) setPlanSession("milestones", sessionID, [])
       setFollowup("paused", sessionID, undefined)
       removeQueuedPlanFollowups(sessionID)
     })
-    void queuePlanFollowup(sessionID, path, { notify: true })
+    if (queuePlanFollowup(sessionID, path, { notify: true })) {
+      setPlanSession("enabled", sessionID, true)
+    }
   }
 
   const choosePlanFile = () => {
@@ -2270,7 +2452,7 @@ export default function Page() {
   }
 
   const planSessionControl = () => (
-    <Show when={params.id && !isChildSession() && !isWorkflowManagedSession() && !mobileChanges()}>
+    <Show when={params.id && !mobileChanges()}>
       <div class="shrink-0 px-3 pt-3 pb-1 flex max-w-full flex-col gap-2">
         <div class="flex max-w-full items-center gap-1">
           <Tooltip
@@ -2296,27 +2478,36 @@ export default function Page() {
               type="button"
               size="small"
               variant={planActive() ? "primary" : "secondary"}
-              icon="checklist"
+              icon={planFile() ? (planActive() ? "circle-ban-sign" : "arrow-up") : "checklist"}
               class="max-w-[260px] justify-start border border-border-weak-base bg-surface-panel shadow-sm"
-              onClick={choosePlanFile}
-              aria-label={language.t("session.plan.choose")}
+              onClick={() => (planFile() ? togglePlanSession() : choosePlanFile())}
+              aria-label={language.t(
+                planFile()
+                  ? planActive()
+                    ? "session.plan.disable"
+                    : "session.plan.enable"
+                  : "session.plan.choose",
+              )}
             >
-              <span class="truncate">{planFile() ? getFilename(planFile()!) : language.t("session.plan.choose")}</span>
+              <span class="truncate">
+                {planFile()
+                  ? planActive()
+                    ? getFilename(planFile()!)
+                    : language.t("session.plan.enable")
+                  : language.t("session.plan.choose")}
+              </span>
             </Button>
           </Tooltip>
           <Show when={planFile()}>
-            <Tooltip
-              placement="bottom"
-              value={language.t(planActive() ? "session.plan.disable" : "session.plan.enable")}
-            >
+            <Tooltip placement="bottom" value={language.t("session.plan.change")}>
               <IconButton
                 type="button"
                 size="small"
                 variant="secondary"
-                icon={planActive() ? "circle-ban-sign" : "circle-check"}
+                icon="folder"
                 class="border border-border-weak-base bg-surface-panel shadow-sm"
-                onClick={togglePlanSession}
-                aria-label={language.t(planActive() ? "session.plan.disable" : "session.plan.enable")}
+                onClick={choosePlanFile}
+                aria-label={language.t("session.plan.change")}
               />
             </Tooltip>
             <Tooltip placement="bottom" value={language.t("session.plan.clear")}>
@@ -2366,17 +2557,9 @@ export default function Page() {
 
   createEffect(() => {
     const sessionID = params.id
-    if (!sessionID || !isWorkflowManagedSession()) return
-    clearQueuedFollowups(sessionID)
-    setPlanSession("enabled", sessionID, false)
-  })
-
-  createEffect(() => {
-    const sessionID = params.id
     const path = planSession.file[sessionID ?? ""]
     const assistant = lastCompletedAssistant()
     if (!sessionID || !path || !planSession.enabled[sessionID] || !assistant) return
-    if (workflowManagedSession(sessionID)) return
     if (planSession.lastAssistant[sessionID] === assistant.id) return
     if (assistant.error) return
 
@@ -2408,8 +2591,6 @@ export default function Page() {
   const followupDock = createMemo(() => queuedFollowups().map((item) => ({ id: item.id, text: followupText(item) })))
 
   const sendFollowup = (sessionID: string, id: string, opts?: { manual?: boolean }) => {
-    if (workflowManagedSession(sessionID)) return Promise.resolve()
-    if (sync.session.get(sessionID)?.parentID) return Promise.resolve()
     const item = (followup.items[sessionID] ?? []).find((entry) => entry.id === id)
     if (!item) return Promise.resolve()
     if (followupBusy(sessionID)) return Promise.resolve()
@@ -2420,7 +2601,6 @@ export default function Page() {
   const editFollowup = (id: string) => {
     const sessionID = params.id
     if (!sessionID) return
-    if (workflowManagedSession(sessionID)) return
     if (followupBusy(sessionID)) return
 
     const item = queuedFollowups().find((entry) => entry.id === id)
@@ -2541,8 +2721,6 @@ export default function Page() {
     if (followupBusy(sessionID)) return
     if (followup.failed[sessionID] === item.id) return
     if (followup.paused[sessionID]) return
-    if (isChildSession()) return
-    if (workflowManagedSession(sessionID)) return
     if (composer.blocked()) return
     if (busy(sessionID)) return
 
@@ -2635,7 +2813,7 @@ export default function Page() {
       }}
       onResponseSubmit={resumeScroll}
       followup={
-        params.id && !isChildSession() && !isWorkflowManagedSession()
+        params.id
           ? {
               queue: queueEnabled,
               items: followupDock(),

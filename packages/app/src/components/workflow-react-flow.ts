@@ -49,6 +49,9 @@ export type WorkflowReactFlowInstance = {
 
 type WorkflowFlowNodeData = {
   kind: "workflow" | "milestone" | "session" | "document"
+  documentKind?: "reference" | "intervention" | "standup" | "summary" | "document"
+  role?: string
+  department?: string
   title: string
   label: string
   status?: string
@@ -88,6 +91,7 @@ const roleTitles = {
   executor: "Executor",
   reviewer: "Reviewer",
   tester: "Tester",
+  expert: "Technical Advisor",
 }
 
 const nodeTypes: NodeTypes = {
@@ -98,9 +102,15 @@ const edgeTypes = {
   workflowEdge: WorkflowFlowEdgeView,
 }
 
-const fitViewOptions = {
+const panelFitViewOptions = {
   padding: 0.18,
-  minZoom: 0.55,
+  minZoom: 0.3,
+  maxZoom: 1.15,
+}
+
+const fullscreenFitViewOptions = {
+  padding: 0.24,
+  minZoom: 0.14,
   maxZoom: 1.15,
 }
 
@@ -118,9 +128,10 @@ function renderWorkflow(root: Root, props: WorkflowReactFlowProps) {
 }
 
 function WorkflowReactFlow(props: WorkflowReactFlowProps) {
+  const fullscreen = props.viewport === "fullscreen"
   const model = React.useMemo(
-    () => workflowModel(props.graph, props.milestoneLabel, props.currentSessionID, props.sessionState ?? {}),
-    [props.graph, props.milestoneLabel, props.currentSessionID, props.sessionState],
+    () => workflowModel(props.graph, props.milestoneLabel, props.currentSessionID, props.sessionState ?? {}, props.viewport ?? "panel"),
+    [props.graph, props.milestoneLabel, props.currentSessionID, props.sessionState, props.viewport],
   )
   return React.createElement(ReactFlow, {
     key: `${props.graph.workflow.id}:${props.graph.workflow.time.updated}:${props.viewport ?? "panel"}:${props.currentSessionID ?? ""}:${model.nodes.length}:${model.edges.length}:${model.stateKey}`,
@@ -130,8 +141,8 @@ function WorkflowReactFlow(props: WorkflowReactFlowProps) {
     nodeTypes,
     edgeTypes,
     fitView: true,
-    fitViewOptions,
-    minZoom: 0.35,
+    fitViewOptions: fullscreen ? fullscreenFitViewOptions : panelFitViewOptions,
+    minZoom: fullscreen ? 0.12 : 0.25,
     maxZoom: 1.6,
     nodesDraggable: true,
     nodesConnectable: false,
@@ -172,6 +183,7 @@ function workflowModel(
   milestoneLabel: string,
   currentSessionID: string | undefined,
   sessionState: Record<string, WorkflowReactFlowSessionState | undefined>,
+  viewport: WorkflowReactFlowProps["viewport"],
 ) {
   const milestones = new Map(graph.milestones.map((milestone) => [milestone.id, milestone]))
   const sessions = new Map(
@@ -187,35 +199,33 @@ function workflowModel(
   )
   const displayEdges = workflowDisplayEdges(graph)
   const currentNodeIDs = workflowCurrentNodeIDs(graph, currentSessionID)
-  const nodes = layoutNodes(
-    graph.nodes.map((node, index) => {
-      const milestone = node.milestoneID ? milestones.get(node.milestoneID) : undefined
-      const session = sessions.get(node.id)
-      const data = workflowNodeData(
-        node,
-        milestone,
-        session,
-        graph.workflow.status,
-        graph.workflow.request,
-        milestoneLabel,
-        sessionState,
-        currentNodeIDs.has(node.id),
-      )
-      return {
-        id: node.id,
-        type: "workflowNode",
-        data,
-        position: { x: index * 220, y: 0 },
-        sourcePosition: Position.Right,
-        targetPosition: Position.Left,
-        style: {
-          width: data.width,
-          height: data.height,
-        },
-      } satisfies WorkflowFlowNode
-    }),
-    displayEdges,
-  )
+  const rawNodes = graph.nodes.map((node, index) => {
+    const milestone = (node.milestoneID ? milestones.get(node.milestoneID) : undefined) ?? workflowMilestoneFromPath(node.path, milestones)
+    const session = sessions.get(node.id)
+    const data = workflowNodeData(
+      node,
+      milestone,
+      session,
+      graph.workflow.status,
+      graph.workflow.request,
+      milestoneLabel,
+      sessionState,
+      currentNodeIDs.has(node.id),
+    )
+    return {
+      id: node.id,
+      type: "workflowNode",
+      data,
+      position: { x: index * 220, y: 0 },
+      sourcePosition: Position.Right,
+      targetPosition: Position.Left,
+      style: {
+        width: data.width,
+        height: data.height,
+      },
+    } satisfies WorkflowFlowNode
+  })
+  const nodes = layoutNodes(rawNodes, displayEdges, viewport ?? "panel", workflowFunctionColumns(rawNodes))
   const nodeIDs = new Set(nodes.map((node) => node.id))
   return {
     nodes,
@@ -253,39 +263,17 @@ function workflowModel(
 
 function workflowDisplayEdges(graph: WorkflowGraph) {
   const nodeIDs = new Set(graph.nodes.map((node) => node.id))
-  const mainPMID = `${graph.workflow.id}:main_pm`
-  const testerID = `${graph.workflow.id}:tester`
-  const startID = nodeIDs.has(mainPMID) ? mainPMID : graph.workflow.id
   return uniqueEdges(
-    [
-      ...(nodeIDs.has(mainPMID)
-        ? [
-            displayEdge("entry", graph.workflow.id, mainPMID),
-          ]
-        : []),
-      ...graph.milestones.flatMap((milestone) => [
-        ...(milestone.dependsOn.length === 0
-          ? [displayEdge("entry", startID, String(milestone.id))]
-          : milestone.dependsOn.map((dependency) => displayEdge("dependency", String(dependency), String(milestone.id)))),
-        ...milestoneSessionEdges(milestone),
-      ]),
-      ...(nodeIDs.has(testerID)
-        ? terminalMilestones(graph.milestones).map((milestone) => displayEdge("tester", String(milestone.id), testerID))
-        : []),
-      ...graph.edges
-        .filter(
-          (edge): edge is WorkflowGraph["edges"][number] & { kind: "consultation" | "document" } =>
-            edge.kind === "consultation" || edge.kind === "document",
-        )
-        .map((edge) => ({
-          id: edge.id,
-          from: edge.from,
-          to: edge.to,
-          kind: edge.kind,
-          label: edge.label,
-          tooltip: edgeTooltip(edge),
-        })),
-    ].filter((edge) => nodeIDs.has(edge.from) && nodeIDs.has(edge.to) && edge.from !== edge.to),
+    graph.edges
+      .map((edge) => ({
+        id: edge.id,
+        from: edge.from,
+        to: edge.to,
+        kind: edge.kind ?? ("dependency" as const),
+        label: edge.label,
+        tooltip: edgeTooltip(edge),
+      }))
+      .filter((edge) => nodeIDs.has(edge.from) && nodeIDs.has(edge.to) && edge.from !== edge.to),
   )
 }
 
@@ -355,6 +343,14 @@ function workflowCurrentNodeIDs(graph: WorkflowGraph, currentSessionID: string |
   return new Set((exact.length > 0 ? exact : matches).map((node) => node.id))
 }
 
+function workflowMilestoneFromPath(filePath: string | undefined, milestones: Map<string, WorkflowMilestone>) {
+  if (!filePath) return undefined
+  return filePath
+    .split(/[\\/]+/)
+    .map((part) => milestones.get(part))
+    .find((milestone): milestone is WorkflowMilestone => Boolean(milestone))
+}
+
 function workflowNodeData(
   node: WorkflowGraph["nodes"][number],
   milestone: WorkflowGraph["milestones"][number] | undefined,
@@ -369,6 +365,8 @@ function workflowNodeData(
   if (node.type === "milestone") {
     return {
       kind: "milestone",
+      role: node.role,
+      department: milestone?.department ?? milestoneLabel,
       title: milestone?.title ?? node.title,
       label: milestone?.department ?? milestoneLabel,
       status: milestone?.status ?? node.status,
@@ -378,13 +376,14 @@ function workflowNodeData(
       sessionState: state,
       currentSession,
       planPath: milestone?.planPath ?? node.path,
-      width: 214,
-      height: 92,
+      width: 236,
+      height: 104,
     }
   }
   if (node.type === "workflow") {
     return {
       kind: "workflow",
+      role: node.role,
       title: node.title,
       label: roleLabel(node.role ?? "requester"),
       status: node.status ?? workflowStatus,
@@ -392,37 +391,42 @@ function workflowNodeData(
       sessionID: node.sessionID,
       sessionState: state,
       currentSession,
-      width: 178,
-      height: 58,
+      width: 206,
+      height: 68,
     }
   }
   if (node.type === "document") {
+    const documentKind = workflowDocumentKind(node)
     return {
       kind: "document",
       title: node.title,
-      label: "Document",
+      documentKind,
+      department: milestone?.department ?? session?.milestone.department,
+      label: workflowDocumentLabel(documentKind),
       summary: node.role ? roleLabel(node.role) : undefined,
       prompt: [node.summary, node.path].filter(Boolean).join("\n\n"),
       sessionID: node.sessionID,
       sessionState: state,
       currentSession,
       planPath: node.path,
-      width: 184,
-      height: 56,
+      width: 196,
+      height: 62,
     }
   }
   return {
     kind: "session",
+    role: node.role ?? session?.session.role,
+    department: session?.milestone.department ?? milestone?.department,
     title: session?.milestone.title ?? node.title,
     label: roleLabel(node.role ?? session?.session.role ?? "main_pm"),
-    summary: session?.session.attempt ? `#${session.session.attempt}` : undefined,
-    prompt: session?.milestone.prompt ?? workflowRequest,
+    summary: node.summary ?? (session?.session.attempt ? `#${session.session.attempt}` : undefined),
+    prompt: node.summary ?? session?.milestone.prompt ?? workflowRequest,
     sessionID: node.sessionID,
     sessionState: state,
     currentSession,
     planPath: node.path,
-    width: 170,
-    height: 50,
+    width: 198,
+    height: 58,
   }
 }
 
@@ -465,16 +469,22 @@ function WorkflowFlowEdgeView(props: EdgeProps<WorkflowFlowEdge>) {
   ])
 }
 
-function layoutNodes(nodes: WorkflowFlowNode[], edges: WorkflowDisplayEdge[]) {
+function layoutNodes(
+  nodes: WorkflowFlowNode[],
+  edges: WorkflowDisplayEdge[],
+  viewport: "panel" | "fullscreen",
+  functionColumns: Map<string, number>,
+) {
   const graph = new dagre.graphlib.Graph()
   graph.setDefaultEdgeLabel(() => ({}))
   graph.setGraph({
     rankdir: "LR",
     ranker: "network-simplex",
-    nodesep: 46,
-    ranksep: 86,
-    marginx: 28,
-    marginy: 24,
+    nodesep: viewport === "fullscreen" ? 170 : 110,
+    ranksep: viewport === "fullscreen" ? 320 : 220,
+    edgesep: viewport === "fullscreen" ? 62 : 42,
+    marginx: viewport === "fullscreen" ? 120 : 64,
+    marginy: viewport === "fullscreen" ? 80 : 42,
   })
   nodes.forEach((node) => {
     graph.setNode(node.id, {
@@ -487,16 +497,98 @@ function layoutNodes(nodes: WorkflowFlowNode[], edges: WorkflowDisplayEdge[]) {
     .filter((edge) => nodeIDs.has(edge.from) && nodeIDs.has(edge.to))
     .forEach((edge) => graph.setEdge(edge.from, edge.to))
   dagre.layout(graph)
-  return nodes.map((node) => {
+  const positioned = nodes.map((node, index) => {
     const position = graph.node(node.id)
     return {
-      ...node,
-      position: {
-        x: position.x - node.data.width / 2,
-        y: position.y - node.data.height / 2,
-      },
+      node,
+      index,
+      column: workflowNodeColumn(node.data, functionColumns),
+      order: position?.y ?? index,
     }
   })
+  const columnGap = viewport === "fullscreen" ? 340 : 250
+  const rowGap = viewport === "fullscreen" ? 150 : 108
+  const marginX = viewport === "fullscreen" ? 120 : 64
+  const marginY = viewport === "fullscreen" ? 80 : 42
+  const columns = new Map<number, typeof positioned>()
+  positioned.forEach((item) => {
+    columns.set(item.column, [...(columns.get(item.column) ?? []), item])
+  })
+  const maxRows = Math.max(1, ...Array.from(columns.values()).map((items) => items.length))
+  const output = new Map<string, WorkflowFlowNode>()
+  Array.from(columns.entries()).forEach(([column, items]) => {
+    const sorted = items.toSorted((a, b) => a.order - b.order || a.index - b.index || a.node.id.localeCompare(b.node.id))
+    const yStart = marginY + ((maxRows - sorted.length) * rowGap) / 2
+    sorted.forEach((item, index) => {
+      output.set(item.node.id, {
+        ...item.node,
+        position: {
+          x: marginX + column * columnGap,
+          y: yStart + index * rowGap,
+        },
+      })
+    })
+  })
+  return nodes.map((node) => output.get(node.id) ?? node)
+}
+
+function workflowFunctionColumns(nodes: WorkflowFlowNode[]) {
+  const firstSeen = new Map<string, number>()
+  nodes
+    .map((node) => workflowFunctionKeyForData(node.data))
+    .filter((key): key is string => Boolean(key))
+    .forEach((key, index) => {
+      if (!firstSeen.has(key)) firstSeen.set(key, index)
+    })
+  return new Map(
+    Array.from(firstSeen.keys())
+      .toSorted((a, b) => workflowFunctionGroup(a) - workflowFunctionGroup(b) || (firstSeen.get(a) ?? 0) - (firstSeen.get(b) ?? 0))
+      .map((key, index) => [key, index]),
+  )
+}
+
+function workflowNodeColumn(data: WorkflowFlowNodeData, functionColumns: Map<string, number>) {
+  if (data.role === "requester") return 0
+  if (data.role === "main_pm" || data.kind === "workflow") return 1
+  const functionKey = workflowFunctionKeyForData(data)
+  const functionIndex = functionKey ? functionColumns.get(functionKey) ?? functionColumns.size : functionColumns.size
+  return 2 + functionIndex * 5 + workflowFunctionStage(data)
+}
+
+function workflowFunctionStage(data: WorkflowFlowNodeData) {
+  if (data.kind === "milestone") return 0
+  if (data.role === "department_pm" || data.role === "expert") return 1
+  if (data.role === "executor") return 2
+  if (data.role === "reviewer" || data.role === "tester") return 3
+  if (data.kind === "document") return 4
+  if (data.kind === "session") return 2
+  return 0
+}
+
+function workflowFunctionKeyForData(data: WorkflowFlowNodeData) {
+  if (data.role === "requester" || data.role === "main_pm" || data.kind === "workflow") return undefined
+  if (data.department) return workflowFunctionKey(data.department)
+  if (data.kind === "document") return "documentation"
+  if (data.role === "reviewer" || data.role === "tester") return "quality"
+  if (data.role === "executor") return "engineering"
+  return data.role ? workflowFunctionKey(data.role) : "general"
+}
+
+function workflowFunctionKey(value: string) {
+  return value
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}]+/gu, "-")
+    .replace(/^-+|-+$/g, "")
+    .trim() || "general"
+}
+
+function workflowFunctionGroup(key: string) {
+  if (/(product|requirement|requirements|request|scope)/.test(key)) return 0
+  if (/(architecture|design|system|contract|profile|composition)/.test(key)) return 1
+  if (/(integration|release|build|ci|staged)/.test(key)) return 3
+  if (/(quality|test|tests|verify|verification|acceptance|review)/.test(key)) return 4
+  if (/(doc|docs|document|reference|summary)/.test(key)) return 5
+  return 2
 }
 
 function WorkflowFlowNodeView(props: NodeProps<WorkflowFlowNode>) {
@@ -506,9 +598,10 @@ function WorkflowFlowNodeView(props: NodeProps<WorkflowFlowNode>) {
     {
       className: `workflow-rf-node workflow-rf-node--${data.kind} workflow-rf-node--${statusTone(data.status)} workflow-rf-node--${
         data.sessionID ? "linked" : "unlinked"
-      }${data.sessionState ? ` workflow-rf-node--session-${data.sessionState}` : ""}${
-        data.currentSession ? " workflow-rf-node--current-session" : ""
-      }`,
+      }${data.role ? ` workflow-rf-node--role workflow-rf-node--role-${roleClass(data.role)}` : ""}${
+        data.documentKind ? ` workflow-rf-node--doc-${data.documentKind}` : ""}${
+        data.sessionState ? ` workflow-rf-node--session-${data.sessionState}` : ""
+      }${data.currentSession ? " workflow-rf-node--current-session" : ""}`,
       title: data.prompt,
     },
     [
@@ -532,6 +625,13 @@ function WorkflowFlowNodeView(props: NodeProps<WorkflowFlowNode>) {
               className: "workflow-rf-node__meta",
             },
             [
+              data.role
+                ? React.createElement("span", {
+                    key: "role-icon",
+                    className: "workflow-rf-node__role-icon",
+                    "aria-hidden": true,
+                  })
+                : null,
               React.createElement(
                 "span",
                 {
@@ -636,6 +736,33 @@ function roleLabel(role: string) {
     .filter(Boolean)
     .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
     .join(" ")
+}
+
+function roleClass(role: string) {
+  return role.replace(/[^a-z0-9]+/gi, "-").toLowerCase()
+}
+
+function workflowDocumentKind(node: WorkflowGraph["nodes"][number]): WorkflowFlowNodeData["documentKind"] {
+  if (node.path?.includes("/standups/") || node.path?.includes("\\standups\\") || node.title.toLowerCase().includes("standup"))
+    return "standup"
+  if (
+    node.path?.includes("/interventions/") ||
+    node.path?.includes("\\interventions\\") ||
+    node.title.toLowerCase().includes("intervention")
+  )
+    return "intervention"
+  if (node.title.toLowerCase().includes("summary") || node.path?.toLowerCase().includes("-summary.md")) return "summary"
+  if (node.path?.includes("/reference/") || node.path?.includes("\\reference\\") || node.title.toLowerCase().includes("reference"))
+    return "reference"
+  return "document"
+}
+
+function workflowDocumentLabel(kind: WorkflowFlowNodeData["documentKind"]) {
+  if (kind === "reference") return "Reference"
+  if (kind === "intervention") return "Intervention"
+  if (kind === "standup") return "Standup"
+  if (kind === "summary") return "Summary"
+  return "Document"
 }
 
 function statusTone(status: string | undefined) {

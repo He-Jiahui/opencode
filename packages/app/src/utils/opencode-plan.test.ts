@@ -29,4 +29,21 @@ describe("opencode plan parsing", () => {
       parseOpencodePlanBlocks("<opencode_plan>\n## Hub Completion Plan\n- task\n</opencode_plan>")[0]?.title,
     ).toBe("Hub Completion Plan")
   })
+
+  test("detects plan tags case-insensitively", () => {
+    expect(parseOpencodePlanBlocks("<OPENCODE_PLAN>\n# Plan\n- task\n</OPENCODE_PLAN>")[0]?.content).toBe(
+      "# Plan\n- task",
+    )
+  })
+
+  test("only reads title attributes from the opening plan tag", () => {
+    expect(
+      parseOpencodePlanBlocks([
+        "<opencode_plan>",
+        "# Real Plan",
+        '<span title="not the plan title">inline metadata</span>',
+        "</opencode_plan>",
+      ].join("\n"))[0]?.title,
+    ).toBe("Real Plan")
+  })
 })

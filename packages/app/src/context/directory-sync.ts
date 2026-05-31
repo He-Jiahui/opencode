@@ -603,8 +603,9 @@ export const createDirSyncContext = (directory: string, serverSync: ReturnType<t
                 workflow.rootSessionID === sessionID ||
                 workflow.pmSessionID === sessionID ||
                 workflow.testerSessionID === sessionID ||
-                store.workflow_graph[workflow.id]?.milestones.some((milestone) =>
-                  milestone.session.some((ref) => ref.sessionID === sessionID),
+                store.workflow_graph[workflow.id]?.members?.some((member) => member.sessionID === sessionID) ||
+                store.workflow_graph[workflow.id]?.milestones?.some((milestone) =>
+                  milestone.session?.some((ref) => ref.sessionID === sessionID),
                 ),
             ) &&
             !opts?.force

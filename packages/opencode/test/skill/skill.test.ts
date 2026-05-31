@@ -131,7 +131,18 @@ Instructions here.
           expect(item).toBeDefined()
           expect(item!.description).toBe("A project skill in the .codex/skills directory.")
           expect(item!.location).toContain(path.join(".codex", "skills", "codex-skill", "SKILL.md"))
-        }),
+      }),
+    ),
+  )
+
+  it.live("documents .codex project skill locations in the built-in customization skill", () =>
+    provideTmpdirInstance(() =>
+      Effect.gen(function* () {
+        const skill = yield* Skill.Service
+        const item = yield* skill.require("customize-opencode")
+        expect(item.content).toContain(".codex/skill(s)/<name>/SKILL.md")
+        expect(item.content).toContain(".codex/skills/my-skill/SKILL.md")
+      }),
     ),
   )
 

@@ -20,6 +20,8 @@ export const ListQuery = Schema.Struct({
 })
 export const StartPayload = Workflow.StartInput
 export const UpdateXmlPayload = Schema.Struct(Struct.omit(Workflow.UpdateXmlInput.fields, ["workflowID"]))
+export const UpdateStaffingPayload = Schema.Struct(Struct.omit(Workflow.UpdateStaffingInput.fields, ["workflowID"]))
+export const IntervenePayload = Schema.Struct(Struct.omit(Workflow.InterveneInput.fields, ["workflowID"]))
 
 export const WorkflowPaths = {
   list: root,
@@ -27,6 +29,8 @@ export const WorkflowPaths = {
   get: `${root}/:workflowID`,
   graph: `${root}/:workflowID/graph`,
   updateXml: `${root}/:workflowID/xml`,
+  updateStaffing: `${root}/:workflowID/staffing`,
+  intervene: `${root}/:workflowID/intervention`,
   resume: `${root}/:workflowID/resume`,
   cancel: `${root}/:workflowID/cancel`,
 } as const
@@ -92,6 +96,32 @@ export const WorkflowApi = HttpApi.make("workflow")
             identifier: "workflow.updateXml",
             summary: "Update workflow XML",
             description: "Replace the canonical workflow XML and rebuild the dependency graph.",
+          }),
+        ),
+        HttpApiEndpoint.patch("updateStaffing", WorkflowPaths.updateStaffing, {
+          params: { workflowID: WorkflowID },
+          query: WorkspaceRoutingQuery,
+          payload: UpdateStaffingPayload,
+          success: described(WorkflowInfo, "Workflow staffing updated"),
+          error: [HttpApiError.BadRequest, InvalidRequestError, ApiNotFoundError],
+        }).annotateMerge(
+          OpenApi.annotations({
+            identifier: "workflow.updateStaffing",
+            summary: "Update workflow staffing",
+            description: "Update the long-lived workflow company staffing limits and ensure matching staff sessions exist.",
+          }),
+        ),
+        HttpApiEndpoint.post("intervene", WorkflowPaths.intervene, {
+          params: { workflowID: WorkflowID },
+          query: WorkspaceRoutingQuery,
+          payload: IntervenePayload,
+          success: described(WorkflowInfo, "Workflow intervention recorded"),
+          error: [HttpApiError.BadRequest, InvalidRequestError, ApiNotFoundError],
+        }).annotateMerge(
+          OpenApi.annotations({
+            identifier: "workflow.intervene",
+            summary: "Record requester intervention",
+            description: "Record requester direction change and asynchronously notify the target workflow company session.",
           }),
         ),
         HttpApiEndpoint.post("resume", WorkflowPaths.resume, {

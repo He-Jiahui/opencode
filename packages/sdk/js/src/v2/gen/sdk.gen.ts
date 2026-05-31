@@ -286,13 +286,18 @@ import type {
   WorkflowGetResponses,
   WorkflowGraphErrors,
   WorkflowGraphResponses,
+  WorkflowInterveneErrors,
+  WorkflowInterveneResponses,
   WorkflowListErrors,
   WorkflowListResponses,
   WorkflowResumeErrors,
   WorkflowResumeResponses,
+  WorkflowStaffingConfig,
   WorkflowStartErrors,
   WorkflowStartInput,
   WorkflowStartResponses,
+  WorkflowUpdateStaffingErrors,
+  WorkflowUpdateStaffingResponses,
   WorkflowUpdateXmlErrors,
   WorkflowUpdateXmlResponses,
   WorktreeCreateErrors,
@@ -5317,6 +5322,94 @@ export class Workflow extends HeyApiClient {
     )
     return (options?.client ?? this.client).patch<WorkflowUpdateXmlResponses, WorkflowUpdateXmlErrors, ThrowOnError>({
       url: "/workflow/{workflowID}/xml",
+      ...options,
+      ...params,
+      headers: {
+        "Content-Type": "application/json",
+        ...options?.headers,
+        ...params.headers,
+      },
+    })
+  }
+
+  /**
+   * Update workflow staffing
+   *
+   * Update the long-lived workflow company staffing limits and ensure matching staff sessions exist.
+   */
+  public updateStaffing<ThrowOnError extends boolean = false>(
+    parameters: {
+      workflowID: string
+      directory?: string
+      workspace?: string
+      staffing?: WorkflowStaffingConfig
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "workflowID" },
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+            { in: "body", key: "staffing" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).patch<
+      WorkflowUpdateStaffingResponses,
+      WorkflowUpdateStaffingErrors,
+      ThrowOnError
+    >({
+      url: "/workflow/{workflowID}/staffing",
+      ...options,
+      ...params,
+      headers: {
+        "Content-Type": "application/json",
+        ...options?.headers,
+        ...params.headers,
+      },
+    })
+  }
+
+  /**
+   * Record requester intervention
+   *
+   * Record requester direction change and asynchronously notify the target workflow company session.
+   */
+  public intervene<ThrowOnError extends boolean = false>(
+    parameters: {
+      workflowID: string
+      directory?: string
+      workspace?: string
+      message?: string
+      timing?: "after-task" | "interrupt" | "temporary-interrupt"
+      targetRole?: "requester" | "main_pm" | "department_pm" | "executor" | "reviewer" | "tester" | "expert"
+      targetSessionID?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "workflowID" },
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+            { in: "body", key: "message" },
+            { in: "body", key: "timing" },
+            { in: "body", key: "targetRole" },
+            { in: "body", key: "targetSessionID" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).post<WorkflowInterveneResponses, WorkflowInterveneErrors, ThrowOnError>({
+      url: "/workflow/{workflowID}/intervention",
       ...options,
       ...params,
       headers: {

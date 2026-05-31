@@ -22,6 +22,7 @@ import { Plugin } from "../plugin"
 import { Provider } from "@/provider/provider"
 import { ProviderID, type ModelID } from "../provider/schema"
 import { WebSearchTool } from "./websearch"
+import { WorkflowTool } from "./workflow"
 import { RepoCloneTool } from "./repo_clone"
 import { RepoOverviewTool } from "./repo_overview"
 import { RepositoryCache } from "@/reference/repository-cache"
@@ -127,6 +128,7 @@ export const layer: Layer.Layer<
     const websearch = yield* WebSearchTool
     const repoClone = yield* RepoCloneTool
     const repoOverview = yield* RepoOverviewTool
+    const workflowtool = yield* WorkflowTool
     const shell = yield* ShellTool
     const globtool = yield* GlobTool
     const writetool = yield* WriteTool
@@ -238,6 +240,7 @@ export const layer: Layer.Layer<
           search: Tool.init(websearch),
           repo_clone: Tool.init(repoClone),
           repo_overview: Tool.init(repoOverview),
+          workflow: Tool.init(workflowtool),
           skill: Tool.init(skilltool),
           patch: Tool.init(patchtool),
           question: Tool.init(question),
@@ -260,6 +263,7 @@ export const layer: Layer.Layer<
             tool.fetch,
             tool.todo,
             tool.search,
+            tool.workflow,
             ...(flags.experimentalScout ? [tool.repo_clone, tool.repo_overview] : []),
             tool.skill,
             tool.patch,

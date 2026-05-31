@@ -1057,7 +1057,7 @@ export function MessageTimeline(props: {
       const item = part()
       if (!item || item.type !== "text") return
       const text = (sync.data.part_text_accum_delta[item.id] ?? item.text)?.trim()
-      if (!text?.includes("<opencode_plan")) return
+      if (!/<opencode_plan\b/i.test(text ?? "")) return
       return parseOpencodePlanSegments(text)
     })
 
@@ -1076,7 +1076,7 @@ export function MessageTimeline(props: {
                         if (item.type === "plan") {
                           return (
                             <OpencodePlanBlock
-                              plan={item}
+                              plan={{ ...item, id: `${part().id}:${item.id}` }}
                               onSave={(plan) => props.onPlanSave?.(plan) ?? Promise.resolve(undefined)}
                               onContinue={(plan) => props.onPlanContinue?.(plan)}
                             />

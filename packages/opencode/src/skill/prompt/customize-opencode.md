@@ -43,7 +43,7 @@ already-loaded config until then.
 | Global config                 | `~/.config/opencode/opencode.json` (NOT `~/.opencode/`)                                                                   |
 | Project agents                | `.opencode/agent/<name>.md` or `.opencode/agents/<name>.md`                                                               |
 | Global agents                 | `~/.config/opencode/agent(s)/<name>.md`                                                                                   |
-| Project skills                | `.opencode/skill(s)/<name>/SKILL.md`                                                                                      |
+| Project skills                | `.opencode/skill(s)/<name>/SKILL.md` or `.codex/skill(s)/<name>/SKILL.md`                                                  |
 | Global skills                 | `~/.config/opencode/skill(s)/<name>/SKILL.md`                                                                             |
 | External skills (auto-loaded) | `~/.claude/skills/<name>/SKILL.md`, `~/.agents/skills/<name>/SKILL.md`                                                    |
 
@@ -149,6 +149,7 @@ skill:
 
 ```
 .opencode/skills/my-skill/SKILL.md
+.codex/skills/my-skill/SKILL.md
 ```
 
 Frontmatter:

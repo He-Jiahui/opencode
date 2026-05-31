@@ -391,6 +391,34 @@ export const layer = Layer.effect(
               "You are a tester in an automated opencode workflow. Add targeted tests and run relevant checks after all milestones are approved.",
             options: {},
           },
+          "workflow-expert": {
+            name: "workflow-expert",
+            description: "Technical advisor for workflow architecture, technology choices, performance, and optimization.",
+            mode: "all",
+            native: true,
+            hidden: true,
+            permission: Permission.merge(
+              defaults,
+              Permission.fromConfig({
+                read: "allow",
+                list: "allow",
+                glob: "allow",
+                grep: "allow",
+                bash: "allow",
+                task: "deny",
+                edit: {
+                  "*": "deny",
+                  [path.join(".opencode", "workflows", "**")]: "allow",
+                },
+                todowrite: "allow",
+                question: "allow",
+              }),
+              user,
+            ),
+            prompt:
+              "You are a long-lived technical advisor in an automated opencode workflow company. Guide architecture, technical selection, performance, optimization, integration risk, and reusable engineering knowledge.",
+            options: {},
+          },
         }
 
         for (const [key, value] of Object.entries(cfg.agent ?? {})) {

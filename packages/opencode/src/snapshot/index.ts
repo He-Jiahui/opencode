@@ -146,14 +146,34 @@ export const layer: Layer.Layer<Service, never, AppFileSystem.Service | AppProce
 
           const stage = Effect.fnUntraced(function* (files: string[]) {
             if (!files.length) return
-            const result = yield* git(
-              [...cfg, ...args(["add", "--all", "--sparse", "--pathspec-from-file=-", "--pathspec-file-nul"])],
-              {
-                cwd: state.directory,
-                stdin: feed(files),
-              },
-            )
+            const add = (sparse: boolean) =>
+              git(
+                [
+                  ...cfg,
+                  ...args([
+                    "add",
+                    "--all",
+                    ...(sparse ? ["--sparse"] : []),
+                    "--pathspec-from-file=-",
+                    "--pathspec-file-nul",
+                  ]),
+                ],
+                {
+                  cwd: state.directory,
+                  stdin: feed(files),
+                },
+              )
+            const result = yield* add(true)
             if (result.code === 0) return
+            if (result.stderr.includes("unknown option") && result.stderr.includes("sparse")) {
+              const retry = yield* add(false)
+              if (retry.code === 0) return
+              log.warn("failed to add snapshot files", {
+                exitCode: retry.code,
+                stderr: retry.stderr,
+              })
+              return
+            }
             log.warn("failed to add snapshot files", {
               exitCode: result.code,
               stderr: result.stderr,

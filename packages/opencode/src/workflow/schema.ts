@@ -28,8 +28,40 @@ export const WorkflowRole = Schema.Literals([
   "executor",
   "reviewer",
   "tester",
+  "expert",
 ])
 export type WorkflowRole = typeof WorkflowRole.Type
+
+const WorkflowStaffLimit = Schema.Int.check(Schema.isGreaterThanOrEqualTo(0), Schema.isLessThanOrEqualTo(12))
+
+export const WorkflowStaffingConfig = Schema.Struct({
+  mainPM: Schema.optional(WorkflowStaffLimit),
+  departmentPM: Schema.optional(WorkflowStaffLimit),
+  executor: Schema.optional(WorkflowStaffLimit),
+  reviewer: Schema.optional(WorkflowStaffLimit),
+  tester: Schema.optional(WorkflowStaffLimit),
+  expert: Schema.optional(WorkflowStaffLimit),
+}).annotate({ identifier: "WorkflowStaffingConfig" })
+export type WorkflowStaffingConfig = typeof WorkflowStaffingConfig.Type
+
+export const WorkflowMemberStatus = Schema.Literals(["active", "paused"])
+export type WorkflowMemberStatus = typeof WorkflowMemberStatus.Type
+
+export const WorkflowMember = Schema.Struct({
+  id: Schema.String,
+  workflowID: WorkflowID,
+  role: WorkflowRole,
+  specialty: Schema.String,
+  title: Schema.String,
+  sessionID: SessionID,
+  capacity: Schema.Number,
+  status: WorkflowMemberStatus,
+  time: Schema.Struct({
+    created: Schema.Number,
+    updated: Schema.Number,
+  }),
+}).annotate({ identifier: "WorkflowMember" })
+export type WorkflowMemberInfo = typeof WorkflowMember.Type
 
 export const WorkflowMilestoneStatus = Schema.Literals([
   "pending",
@@ -57,6 +89,7 @@ export const WorkflowStatus = Schema.Literals([
   "executing",
   "reviewing",
   "testing",
+  "accepting",
   "blocked",
   "completed",
   "failed",
@@ -72,8 +105,11 @@ export const WorkflowSessionRef = Schema.Struct({
 }).annotate({ identifier: "WorkflowSessionRef" })
 export type WorkflowSessionRef = typeof WorkflowSessionRef.Type
 
-export const WorkflowConsultationStatus = Schema.Literals(["answered", "failed"])
+export const WorkflowConsultationStatus = Schema.Literals(["pending", "answered", "failed"])
 export type WorkflowConsultationStatus = typeof WorkflowConsultationStatus.Type
+
+export const WorkflowCommunicationTiming = Schema.Literals(["after-task", "interrupt", "temporary-interrupt"])
+export type WorkflowCommunicationTiming = typeof WorkflowCommunicationTiming.Type
 
 export const WorkflowConsultation = Schema.Struct({
   id: Schema.String,
@@ -83,6 +119,8 @@ export const WorkflowConsultation = Schema.Struct({
   fromRole: WorkflowRole,
   toRole: WorkflowRole,
   milestoneID: Schema.optional(WorkflowMilestoneID),
+  reason: Schema.optional(Schema.String),
+  timing: Schema.optional(WorkflowCommunicationTiming),
   question: Schema.String,
   answer: Schema.String,
   status: WorkflowConsultationStatus,
@@ -92,6 +130,27 @@ export const WorkflowConsultation = Schema.Struct({
   }),
 }).annotate({ identifier: "WorkflowConsultation" })
 export type WorkflowConsultationInfo = typeof WorkflowConsultation.Type
+
+export const WorkflowInterventionStatus = Schema.Literals(["queued", "delivered", "blocked", "failed"])
+export type WorkflowInterventionStatus = typeof WorkflowInterventionStatus.Type
+
+export const WorkflowIntervention = Schema.Struct({
+  id: Schema.String,
+  workflowID: WorkflowID,
+  fromSessionID: Schema.optional(SessionID),
+  targetSessionID: Schema.optional(SessionID),
+  targetRole: WorkflowRole,
+  timing: WorkflowCommunicationTiming,
+  message: Schema.String,
+  response: Schema.optional(Schema.String),
+  path: Schema.String,
+  status: WorkflowInterventionStatus,
+  time: Schema.Struct({
+    created: Schema.Number,
+    updated: Schema.Number,
+  }),
+}).annotate({ identifier: "WorkflowIntervention" })
+export type WorkflowInterventionInfo = typeof WorkflowIntervention.Type
 
 export type WorkflowStep =
   | {
@@ -146,6 +205,7 @@ export const WorkflowInfo = Schema.Struct({
   path: Schema.String,
   xml: Schema.String,
   status: WorkflowStatus,
+  staffing: Schema.optional(WorkflowStaffingConfig),
   model: Schema.optional(WorkflowModel),
   agent: Schema.optional(Schema.String),
   testPath: Schema.optional(Schema.String),
@@ -197,6 +257,9 @@ export type WorkflowGraphEdge = typeof WorkflowGraphEdge.Type
 export const WorkflowGraph = Schema.Struct({
   workflow: WorkflowInfo,
   milestones: Schema.Array(WorkflowMilestone),
+  members: Schema.Array(WorkflowMember),
+  consultations: Schema.Array(WorkflowConsultation),
+  interventions: Schema.Array(WorkflowIntervention),
   nodes: Schema.Array(WorkflowGraphNode),
   edges: Schema.Array(WorkflowGraphEdge),
 }).annotate({ identifier: "WorkflowGraph" })

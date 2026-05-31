@@ -380,6 +380,15 @@ export type Project = {
   sandboxes: Array<string>
 }
 
+export type WorkflowStaffingConfig = {
+  mainPM?: number
+  departmentPM?: number
+  executor?: number
+  reviewer?: number
+  tester?: number
+  expert?: number
+}
+
 export type Workflow = {
   id: string
   projectID: string
@@ -399,10 +408,12 @@ export type Workflow = {
     | "executing"
     | "reviewing"
     | "testing"
+    | "accepting"
     | "blocked"
     | "completed"
     | "failed"
     | "cancelled"
+  staffing?: WorkflowStaffingConfig
   model?: {
     providerID: string
     modelID: string
@@ -429,7 +440,7 @@ export type WorkflowUpdatedEvent = {
 }
 
 export type WorkflowSessionRef = {
-  role: "requester" | "main_pm" | "department_pm" | "executor" | "reviewer" | "tester"
+  role: "requester" | "main_pm" | "department_pm" | "executor" | "reviewer" | "tester" | "expert"
   sessionID: string
   milestoneID?: string
   attempt?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
@@ -467,11 +478,62 @@ export type WorkflowNodeUpdatedEvent = {
   milestone: WorkflowMilestone
 }
 
+export type WorkflowMember = {
+  id: string
+  workflowID: string
+  role: "requester" | "main_pm" | "department_pm" | "executor" | "reviewer" | "tester" | "expert"
+  specialty: string
+  title: string
+  sessionID: string
+  capacity: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+  status: "active" | "paused"
+  time: {
+    created: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+    updated: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+  }
+}
+
+export type WorkflowConsultation = {
+  id: string
+  workflowID: string
+  fromSessionID: string
+  toSessionID: string
+  fromRole: "requester" | "main_pm" | "department_pm" | "executor" | "reviewer" | "tester" | "expert"
+  toRole: "requester" | "main_pm" | "department_pm" | "executor" | "reviewer" | "tester" | "expert"
+  milestoneID?: string
+  reason?: string
+  timing?: "after-task" | "interrupt" | "temporary-interrupt"
+  question: string
+  answer: string
+  status: "pending" | "answered" | "failed"
+  time: {
+    created: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+    updated: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+  }
+}
+
+export type WorkflowIntervention = {
+  id: string
+  workflowID: string
+  fromSessionID?: string
+  targetSessionID?: string
+  targetRole: "requester" | "main_pm" | "department_pm" | "executor" | "reviewer" | "tester" | "expert"
+  timing: "after-task" | "interrupt" | "temporary-interrupt"
+  message: string
+  response?: string
+  path: string
+  status: "queued" | "delivered" | "blocked" | "failed"
+  time: {
+    created: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+    updated: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+  }
+}
+
 export type WorkflowGraphNode = {
   id: string
   type: "workflow" | "session" | "milestone" | "document"
   title: string
-  role?: "requester" | "main_pm" | "department_pm" | "executor" | "reviewer" | "tester"
+  role?: "requester" | "main_pm" | "department_pm" | "executor" | "reviewer" | "tester" | "expert"
   status?:
     | "pending"
     | "running"
@@ -480,6 +542,7 @@ export type WorkflowGraphNode = {
     | "executing"
     | "reviewing"
     | "testing"
+    | "accepting"
     | "blocked"
     | "completed"
     | "failed"
@@ -509,6 +572,9 @@ export type WorkflowGraphEdge = {
 export type WorkflowGraph = {
   workflow: Workflow
   milestones: Array<WorkflowMilestone>
+  members: Array<WorkflowMember>
+  consultations: Array<WorkflowConsultation>
+  interventions: Array<WorkflowIntervention>
   nodes: Array<WorkflowGraphNode>
   edges: Array<WorkflowGraphEdge>
 }
@@ -2109,6 +2175,7 @@ export type WorkflowStartInput = {
   variant?: string
   agent?: string
   title?: string
+  staffing?: WorkflowStaffingConfig
 }
 
 export type Workspace = {
@@ -2133,7 +2200,7 @@ export type EffectHttpApiErrorForbidden = {
   _tag: "Forbidden"
 }
 
-export type Workflow5 = {
+export type Workflow7 = {
   id: string
   projectID: string
   rootSessionID?: string
@@ -2152,10 +2219,12 @@ export type Workflow5 = {
     | "executing"
     | "reviewing"
     | "testing"
+    | "accepting"
     | "blocked"
     | "completed"
     | "failed"
     | "cancelled"
+  staffing?: WorkflowStaffingConfig
   model?: {
     providerID: string
     modelID: string
@@ -2172,7 +2241,7 @@ export type Workflow5 = {
 }
 
 export type WorkflowSessionRef1 = {
-  role: "requester" | "main_pm" | "department_pm" | "executor" | "reviewer" | "tester"
+  role: "requester" | "main_pm" | "department_pm" | "executor" | "reviewer" | "tester" | "expert"
   sessionID: string
   milestoneID?: string
   attempt?: number | "NaN" | "Infinity" | "-Infinity"
@@ -2203,6 +2272,57 @@ export type WorkflowMilestone1 = {
   planPath?: string
   reviewPath?: string
   session: Array<WorkflowSessionRef1>
+}
+
+export type WorkflowMember1 = {
+  id: string
+  workflowID: string
+  role: "requester" | "main_pm" | "department_pm" | "executor" | "reviewer" | "tester" | "expert"
+  specialty: string
+  title: string
+  sessionID: string
+  capacity: number | "NaN" | "Infinity" | "-Infinity"
+  status: "active" | "paused"
+  time: {
+    created: number | "NaN" | "Infinity" | "-Infinity"
+    updated: number | "NaN" | "Infinity" | "-Infinity"
+  }
+}
+
+export type WorkflowConsultation1 = {
+  id: string
+  workflowID: string
+  fromSessionID: string
+  toSessionID: string
+  fromRole: "requester" | "main_pm" | "department_pm" | "executor" | "reviewer" | "tester" | "expert"
+  toRole: "requester" | "main_pm" | "department_pm" | "executor" | "reviewer" | "tester" | "expert"
+  milestoneID?: string
+  reason?: string
+  timing?: "after-task" | "interrupt" | "temporary-interrupt"
+  question: string
+  answer: string
+  status: "pending" | "answered" | "failed"
+  time: {
+    created: number | "NaN" | "Infinity" | "-Infinity"
+    updated: number | "NaN" | "Infinity" | "-Infinity"
+  }
+}
+
+export type WorkflowIntervention1 = {
+  id: string
+  workflowID: string
+  fromSessionID?: string
+  targetSessionID?: string
+  targetRole: "requester" | "main_pm" | "department_pm" | "executor" | "reviewer" | "tester" | "expert"
+  timing: "after-task" | "interrupt" | "temporary-interrupt"
+  message: string
+  response?: string
+  path: string
+  status: "queued" | "delivered" | "blocked" | "failed"
+  time: {
+    created: number | "NaN" | "Infinity" | "-Infinity"
+    updated: number | "NaN" | "Infinity" | "-Infinity"
+  }
 }
 
 export type SyncEventMessageUpdated = {
@@ -8472,6 +8592,81 @@ export type WorkflowUpdateXmlResponses = {
 }
 
 export type WorkflowUpdateXmlResponse = WorkflowUpdateXmlResponses[keyof WorkflowUpdateXmlResponses]
+
+export type WorkflowUpdateStaffingData = {
+  body?: {
+    staffing: WorkflowStaffingConfig
+  }
+  path: {
+    workflowID: string
+  }
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/workflow/{workflowID}/staffing"
+}
+
+export type WorkflowUpdateStaffingErrors = {
+  /**
+   * BadRequest | InvalidRequestError
+   */
+  400: EffectHttpApiErrorBadRequest | InvalidRequestError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
+}
+
+export type WorkflowUpdateStaffingError = WorkflowUpdateStaffingErrors[keyof WorkflowUpdateStaffingErrors]
+
+export type WorkflowUpdateStaffingResponses = {
+  /**
+   * Workflow staffing updated
+   */
+  200: Workflow
+}
+
+export type WorkflowUpdateStaffingResponse = WorkflowUpdateStaffingResponses[keyof WorkflowUpdateStaffingResponses]
+
+export type WorkflowInterveneData = {
+  body?: {
+    message: string
+    timing?: "after-task" | "interrupt" | "temporary-interrupt"
+    targetRole?: "requester" | "main_pm" | "department_pm" | "executor" | "reviewer" | "tester" | "expert"
+    targetSessionID?: string
+  }
+  path: {
+    workflowID: string
+  }
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/workflow/{workflowID}/intervention"
+}
+
+export type WorkflowInterveneErrors = {
+  /**
+   * BadRequest | InvalidRequestError
+   */
+  400: EffectHttpApiErrorBadRequest | InvalidRequestError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
+}
+
+export type WorkflowInterveneError = WorkflowInterveneErrors[keyof WorkflowInterveneErrors]
+
+export type WorkflowInterveneResponses = {
+  /**
+   * Workflow intervention recorded
+   */
+  200: Workflow
+}
+
+export type WorkflowInterveneResponse = WorkflowInterveneResponses[keyof WorkflowInterveneResponses]
 
 export type WorkflowResumeData = {
   body?: never

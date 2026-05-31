@@ -102,15 +102,18 @@ const edgeTypes = {
   workflowEdge: WorkflowFlowEdgeView,
 }
 
+const workflowFunctionColumnSpan = 4.15
+const workflowDocumentColumnSpan = 1.18
+
 const panelFitViewOptions = {
-  padding: 0.18,
+  padding: 0.12,
   minZoom: 0.3,
   maxZoom: 1.15,
 }
 
 const fullscreenFitViewOptions = {
-  padding: 0.24,
-  minZoom: 0.14,
+  padding: 0.09,
+  minZoom: 0.18,
   maxZoom: 1.15,
 }
 
@@ -363,6 +366,7 @@ function workflowNodeData(
 ): WorkflowFlowNodeData {
   const state = nodeSessionState(node, milestone, session, workflowStatus, sessionState)
   if (node.type === "milestone") {
+    const emphasized = currentSession || state === "running" || milestone?.status === "planning" || milestone?.status === "executing"
     return {
       kind: "milestone",
       role: node.role,
@@ -376,11 +380,12 @@ function workflowNodeData(
       sessionState: state,
       currentSession,
       planPath: milestone?.planPath ?? node.path,
-      width: 236,
-      height: 104,
+      width: emphasized ? 360 : 322,
+      height: emphasized ? 148 : 132,
     }
   }
   if (node.type === "workflow") {
+    const emphasized = currentSession || node.role === "requester" || node.role === "main_pm" || state === "running"
     return {
       kind: "workflow",
       role: node.role,
@@ -391,12 +396,13 @@ function workflowNodeData(
       sessionID: node.sessionID,
       sessionState: state,
       currentSession,
-      width: 206,
-      height: 68,
+      width: emphasized ? 308 : 254,
+      height: emphasized ? 98 : 82,
     }
   }
   if (node.type === "document") {
     const documentKind = workflowDocumentKind(node)
+    const emphasized = currentSession || state === "running"
     return {
       kind: "document",
       title: node.title,
@@ -409,24 +415,26 @@ function workflowNodeData(
       sessionState: state,
       currentSession,
       planPath: node.path,
-      width: 196,
-      height: 62,
+      width: emphasized ? 268 : 228,
+      height: emphasized ? 88 : 74,
     }
   }
+  const role = node.role ?? session?.session.role
+  const emphasized = currentSession || state === "running"
   return {
     kind: "session",
-    role: node.role ?? session?.session.role,
+    role,
     department: session?.milestone.department ?? milestone?.department,
     title: session?.milestone.title ?? node.title,
-    label: roleLabel(node.role ?? session?.session.role ?? "main_pm"),
+    label: roleLabel(role ?? "main_pm"),
     summary: node.summary ?? (session?.session.attempt ? `#${session.session.attempt}` : undefined),
     prompt: node.summary ?? session?.milestone.prompt ?? workflowRequest,
     sessionID: node.sessionID,
     sessionState: state,
     currentSession,
     planPath: node.path,
-    width: 198,
-    height: 58,
+    width: emphasized ? 284 : 230,
+    height: emphasized ? 86 : 68,
   }
 }
 
@@ -506,28 +514,42 @@ function layoutNodes(
       order: position?.y ?? index,
     }
   })
-  const columnGap = viewport === "fullscreen" ? 340 : 250
-  const rowGap = viewport === "fullscreen" ? 150 : 108
+  const columnGap = viewport === "fullscreen" ? 370 : 340
+  const verticalGap = viewport === "fullscreen" ? 46 : 34
   const marginX = viewport === "fullscreen" ? 120 : 64
   const marginY = viewport === "fullscreen" ? 80 : 42
+  const maxNodeWidth = Math.max(1, ...nodes.map((node) => node.data.width))
   const columns = new Map<number, typeof positioned>()
   positioned.forEach((item) => {
     columns.set(item.column, [...(columns.get(item.column) ?? []), item])
   })
-  const maxRows = Math.max(1, ...Array.from(columns.values()).map((items) => items.length))
+  const columnLayouts = new Map(
+    Array.from(columns.entries()).map(([column, items]) => {
+      const sorted = items.toSorted((a, b) => a.order - b.order || a.index - b.index || a.node.id.localeCompare(b.node.id))
+      return [
+        column,
+        {
+          sorted,
+          height:
+            sorted.reduce((total, item) => total + item.node.data.height, 0) + Math.max(0, sorted.length - 1) * verticalGap,
+        },
+      ] as const
+    }),
+  )
+  const maxColumnHeight = Math.max(1, ...Array.from(columnLayouts.values()).map((items) => items.height))
   const output = new Map<string, WorkflowFlowNode>()
-  Array.from(columns.entries()).forEach(([column, items]) => {
-    const sorted = items.toSorted((a, b) => a.order - b.order || a.index - b.index || a.node.id.localeCompare(b.node.id))
-    const yStart = marginY + ((maxRows - sorted.length) * rowGap) / 2
-    sorted.forEach((item, index) => {
+  Array.from(columnLayouts.entries()).forEach(([column, layout]) => {
+    const yStart = marginY + (maxColumnHeight - layout.height) / 2
+    layout.sorted.reduce((cursor, item) => {
       output.set(item.node.id, {
         ...item.node,
         position: {
-          x: marginX + column * columnGap,
-          y: yStart + index * rowGap,
+          x: marginX + maxNodeWidth / 2 + column * columnGap - item.node.data.width / 2,
+          y: cursor,
         },
       })
-    })
+      return cursor + item.node.data.height + verticalGap
+    }, yStart)
   })
   return nodes.map((node) => output.get(node.id) ?? node)
 }
@@ -543,7 +565,16 @@ function workflowFunctionColumns(nodes: WorkflowFlowNode[]) {
   return new Map(
     Array.from(firstSeen.keys())
       .toSorted((a, b) => workflowFunctionGroup(a) - workflowFunctionGroup(b) || (firstSeen.get(a) ?? 0) - (firstSeen.get(b) ?? 0))
-      .map((key, index) => [key, index]),
+      .reduce(
+        (acc, key) => {
+          acc.columns.set(key, acc.next)
+          return {
+            columns: acc.columns,
+            next: acc.next + workflowFunctionColumnSpanForKey(key),
+          }
+        },
+        { columns: new Map<string, number>(), next: 0 },
+      ).columns,
   )
 }
 
@@ -551,24 +582,29 @@ function workflowNodeColumn(data: WorkflowFlowNodeData, functionColumns: Map<str
   if (data.role === "requester") return 0
   if (data.role === "main_pm" || data.kind === "workflow") return 1
   const functionKey = workflowFunctionKeyForData(data)
-  const functionIndex = functionKey ? functionColumns.get(functionKey) ?? functionColumns.size : functionColumns.size
-  return 2 + functionIndex * 5 + workflowFunctionStage(data)
+  const functionColumn = functionKey ? functionColumns.get(functionKey) ?? functionColumns.size : functionColumns.size
+  return 2 + functionColumn + workflowFunctionStage(data)
+}
+
+function workflowFunctionColumnSpanForKey(key: string) {
+  if (key.startsWith("documentation:")) return workflowDocumentColumnSpan
+  return workflowFunctionColumnSpan
 }
 
 function workflowFunctionStage(data: WorkflowFlowNodeData) {
+  if (data.kind === "document") return 0
   if (data.kind === "milestone") return 0
   if (data.role === "department_pm" || data.role === "expert") return 1
   if (data.role === "executor") return 2
   if (data.role === "reviewer" || data.role === "tester") return 3
-  if (data.kind === "document") return 4
   if (data.kind === "session") return 2
   return 0
 }
 
 function workflowFunctionKeyForData(data: WorkflowFlowNodeData) {
   if (data.role === "requester" || data.role === "main_pm" || data.kind === "workflow") return undefined
+  if (data.kind === "document") return `documentation:${data.documentKind ?? "document"}`
   if (data.department) return workflowFunctionKey(data.department)
-  if (data.kind === "document") return "documentation"
   if (data.role === "reviewer" || data.role === "tester") return "quality"
   if (data.role === "executor") return "engineering"
   return data.role ? workflowFunctionKey(data.role) : "general"
@@ -583,11 +619,15 @@ function workflowFunctionKey(value: string) {
 }
 
 function workflowFunctionGroup(key: string) {
+  if (key === "documentation:reference") return 5
+  if (key === "documentation:summary") return 6
+  if (key === "documentation:standup") return 7
+  if (key === "documentation:intervention") return 8
+  if (key.startsWith("documentation:")) return 9
   if (/(product|requirement|requirements|request|scope)/.test(key)) return 0
   if (/(architecture|design|system|contract|profile|composition)/.test(key)) return 1
   if (/(integration|release|build|ci|staged)/.test(key)) return 3
   if (/(quality|test|tests|verify|verification|acceptance|review)/.test(key)) return 4
-  if (/(doc|docs|document|reference|summary)/.test(key)) return 5
   return 2
 }
 

@@ -342,15 +342,15 @@
   overflow: hidden;
   flex-direction: column;
   justify-content: center;
-  gap: 4px;
-  padding: 8px 10px;
+  gap: 5px;
+  padding: 10px 12px;
 }
 
   .workflow-rf-node--session .workflow-rf-node__body,
   .workflow-rf-node--document .workflow-rf-node__body,
   .workflow-rf-node--workflow .workflow-rf-node__body {
-    gap: 2px;
-    padding: 7px 9px;
+    gap: 3px;
+    padding: 8px 11px;
   }
 
 .workflow-rf-node__meta {
@@ -363,9 +363,9 @@
 
 .workflow-rf-node__role-icon {
     position: relative;
-    width: 14px;
-    height: 14px;
-    flex: 0 0 14px;
+    width: 15px;
+    height: 15px;
+    flex: 0 0 15px;
     color: var(--workflow-role-color, var(--text-text-muted));
   }
 
@@ -395,8 +395,8 @@
 .workflow-rf-node__label,
 .workflow-rf-node__summary {
     overflow: hidden;
-  font-size: 10px;
-  line-height: 14px;
+  font-size: 11px;
+  line-height: 15px;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -420,12 +420,31 @@
 
 .workflow-rf-node__title {
   overflow: hidden;
-  font-size: 12px;
+  font-size: 13px;
   font-weight: 500;
-  line-height: 16px;
+  line-height: 18px;
   color: var(--text-text-base);
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.workflow-rf-node--milestone .workflow-rf-node__title {
+  font-size: 15px;
+  font-weight: 600;
+  line-height: 20px;
+}
+
+.workflow-rf-node--workflow.workflow-rf-node--role .workflow-rf-node__title {
+  font-size: 14px;
+  font-weight: 600;
+  line-height: 19px;
+}
+
+.workflow-rf-node--current-session .workflow-rf-node__title,
+.workflow-rf-node--session-running .workflow-rf-node__title {
+  font-size: 15px;
+  font-weight: 600;
+  line-height: 20px;
 }
 
 .workflow-rf-node--unlinked .workflow-rf-node__title {
@@ -437,11 +456,18 @@
   max-width: 100%;
   overflow: hidden;
   border-radius: 4px;
-  padding: 1px 6px;
-  font-size: 10px;
-  line-height: 14px;
+  padding: 1px 7px;
+  font-size: 11px;
+  line-height: 15px;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.workflow-rf-node--milestone .workflow-rf-node__status,
+.workflow-rf-node--current-session .workflow-rf-node__status,
+.workflow-rf-node--session-running .workflow-rf-node__status {
+  font-size: 12px;
+  line-height: 16px;
 }
 
 .workflow-rf-node--success .workflow-rf-node__status {

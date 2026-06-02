@@ -271,9 +271,13 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       payload: typeof SummarizePayload.Type
     }) {
       yield* revertSvc.cleanup(yield* requireSession(ctx.params.sessionID))
-      const messages = yield* SessionError.mapStorageNotFound(session.messages({ sessionID: ctx.params.sessionID }))
       const defaultAgent = yield* agentSvc.defaultAgent()
-      const currentAgent = messages.findLast((message) => message.info.role === "user")?.info.agent ?? defaultAgent
+      const latestUser = Option.getOrUndefined(
+        yield* SessionError.mapStorageNotFound(
+          session.findMessage(ctx.params.sessionID, (message) => message.info.role === "user"),
+        ),
+      )
+      const currentAgent = latestUser?.info.agent ?? defaultAgent
 
       yield* compactSvc.create({
         sessionID: ctx.params.sessionID,
@@ -331,8 +335,8 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       model: string | undefined,
     ) {
       if (model) return Provider.parseModel(model)
-      const latest = (yield* session.messages({ sessionID }).pipe(Effect.orDie)).findLast(
-        (item) => item.info.role === "user" && item.info.model,
+      const latest = Option.getOrUndefined(
+        yield* session.findMessage(sessionID, (item) => item.info.role === "user" && !!item.info.model),
       )
       if (latest?.info.role === "user") return latest.info.model
       return yield* providerSvc.defaultModel().pipe(Effect.mapError(() => new HttpApiError.BadRequest({})))

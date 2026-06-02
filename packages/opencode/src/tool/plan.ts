@@ -1,5 +1,5 @@
 import path from "path"
-import { Effect, Schema } from "effect"
+import { Effect, Option, Schema } from "effect"
 import * as Tool from "./tool"
 import { Question } from "../question"
 import { Session } from "@/session/session"
@@ -44,8 +44,9 @@ export const PlanExitTool = Tool.define(
 
           if (answers[0]?.[0] === "No") yield* new Question.RejectedError()
 
-          const messages = yield* session.messages({ sessionID: ctx.sessionID }).pipe(Effect.orDie)
-          const lastUser = messages.findLast((item) => item.info.role === "user" && item.info.model)
+          const lastUser = Option.getOrUndefined(
+            yield* session.findMessage(ctx.sessionID, (item) => item.info.role === "user" && !!item.info.model).pipe(Effect.orDie),
+          )
           const model =
             lastUser?.info.role === "user" && lastUser.info.model ? lastUser.info.model : yield* provider.defaultModel()
 

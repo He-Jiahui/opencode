@@ -617,6 +617,13 @@ export const dict = {
   "session.workflow.intervention.timing.after-task": "任務後處理",
   "session.workflow.intervention.timing.temporary-interrupt": "臨時打斷",
   "session.workflow.intervention.timing.interrupt": "打斷並暫停",
+  "file.context.openDefault": "預設方式開啟",
+  "file.context.openFolder": "開啟所在資料夾",
+  "session.context.pin": "置頂",
+  "session.context.unpin": "取消置頂",
+  "session.context.saveLocal": "保存會話記錄到本機",
+  "session.context.exported": "會話記錄已保存",
+  "session.context.exportFailed": "保存會話記錄失敗",
 
   "status.popover.trigger": "狀態",
   "status.popover.ariaLabel": "伺服器設定",

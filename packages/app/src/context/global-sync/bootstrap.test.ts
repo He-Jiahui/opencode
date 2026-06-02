@@ -25,6 +25,7 @@ describe("bootstrapDirectory", () => {
       session: [],
       sessionTotal: 0,
       workflow: [],
+      workflow_session: {},
       workflow_graph: {},
       session_status: {},
       session_working(id: string) {

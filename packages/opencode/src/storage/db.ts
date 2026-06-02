@@ -8,7 +8,7 @@ import { Global } from "@opencode-ai/core/global"
 import * as Log from "@opencode-ai/core/util/log"
 import { NamedError } from "@opencode-ai/core/util/error"
 import path from "path"
-import { readFileSync, readdirSync, existsSync } from "fs"
+import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "fs"
 import { Flag } from "@opencode-ai/core/flag/flag"
 import { InstallationChannel } from "@opencode-ai/core/installation/version"
 import { EffectBridge } from "@/effect/bridge"
@@ -22,6 +22,8 @@ export const NotFoundError = NamedError.create("NotFoundError", {
 })
 
 const log = Log.create({ service: "db" })
+const backupInterval = 6 * 60 * 60 * 1000
+const backupKeep = 12
 
 type DatabaseFlags = Pick<RuntimeFlags.Info, "disableChannelDb" | "skipMigrations">
 
@@ -89,6 +91,94 @@ function migrations(dir: string): Journal {
   return sql.sort((a, b) => a.timestamp - b.timestamp)
 }
 
+function databaseBackupsEnabled() {
+  const value = process.env.OPENCODE_DB_BACKUPS?.toLowerCase()
+  return value !== "0" && value !== "false"
+}
+
+function backupRoot(dbPath: string) {
+  return path.join(path.dirname(dbPath), "backups", path.basename(dbPath).replace(/[^a-zA-Z0-9._-]/g, "-"))
+}
+
+function backupStamp() {
+  return new Date()
+    .toISOString()
+    .replace(/[-:]/g, "")
+    .replace(/\.\d+Z$/, "")
+}
+
+function sqlString(value: string) {
+  return `'${value.replaceAll("'", "''")}'`
+}
+
+function latestBackupAt(dir: string) {
+  if (!existsSync(dir)) return 0
+  return readdirSync(dir, { withFileTypes: true })
+    .filter((entry) => entry.isFile() && entry.name.endsWith(".db"))
+    .map((entry) => statSync(path.join(dir, entry.name)).mtimeMs)
+    .reduce((latest, time) => Math.max(latest, time), 0)
+}
+
+function pruneBackups(dir: string) {
+  if (!existsSync(dir)) return
+  readdirSync(dir, { withFileTypes: true })
+    .filter((entry) => entry.isFile())
+    .map((entry) => ({ name: entry.name, path: path.join(dir, entry.name), time: statSync(path.join(dir, entry.name)).mtimeMs }))
+    .filter((entry) => entry.name.endsWith(".db") || entry.name.endsWith(".json") || entry.name.endsWith(".db-wal") || entry.name.endsWith(".db-shm"))
+    .toSorted((a, b) => b.time - a.time)
+    .slice(backupKeep * 4)
+    .forEach((entry) => rmSync(entry.path, { force: true }))
+}
+
+function rawBackup(dbPath: string, dir: string, stamp: string, reason: string, error: unknown) {
+  const prefix = path.join(dir, `${stamp}-${reason}`)
+  ;[dbPath, `${dbPath}-wal`, `${dbPath}-shm`]
+    .filter((file) => existsSync(file))
+    .forEach((file) => copyFileSync(file, `${prefix}${file === dbPath ? ".db" : path.extname(file)}`))
+  writeFileSync(
+    `${prefix}.json`,
+    `${JSON.stringify(
+      {
+        created: new Date().toISOString(),
+        reason,
+        source: dbPath,
+        mode: "raw-copy",
+        error: error instanceof Error ? { message: error.message, stack: error.stack } : { message: String(error) },
+      },
+      null,
+      2,
+    )}\n`,
+  )
+}
+
+function ensureBackup(db: Client, dbPath: string, reason: string, existing: boolean) {
+  if (!databaseBackupsEnabled()) return
+  if (!existing || dbPath === ":memory:") return
+  const dir = backupRoot(dbPath)
+  mkdirSync(dir, { recursive: true })
+  if (Date.now() - latestBackupAt(dir) < backupInterval) return
+  const stamp = backupStamp()
+  const safeReason = reason.replace(/[^a-zA-Z0-9._-]/g, "-")
+  const target = path.join(dir, `${stamp}-${safeReason}.db`)
+  try {
+    db.run(`VACUUM INTO ${sqlString(target)}`)
+    writeFileSync(
+      path.join(dir, `${stamp}-${safeReason}.json`),
+      `${JSON.stringify({ created: new Date().toISOString(), reason, source: dbPath, mode: "vacuum-into" }, null, 2)}\n`,
+    )
+    pruneBackups(dir)
+    log.info("created database backup", { path: target, reason })
+  } catch (error) {
+    rawBackup(dbPath, dir, stamp, safeReason, error)
+    pruneBackups(dir)
+    log.warn("created raw database backup after sqlite backup failed", {
+      path: dir,
+      reason,
+      error: error instanceof Error ? error.message : String(error),
+    })
+  }
+}
+
 let client: Client | undefined
 let loaded = false
 
@@ -98,6 +188,7 @@ export const Client = Object.assign(
 
     const dbPath = getPath(flags)
     log.info("opening database", { path: dbPath })
+    const existing = dbPath !== ":memory:" && existsSync(dbPath)
 
     const db = init(dbPath)
 
@@ -107,6 +198,7 @@ export const Client = Object.assign(
     db.run("PRAGMA cache_size = -64000")
     db.run("PRAGMA foreign_keys = ON")
     db.run("PRAGMA wal_checkpoint(PASSIVE)")
+    ensureBackup(db, dbPath, "startup", existing)
 
     // Apply schema migrations
     const entries =
@@ -122,6 +214,8 @@ export const Client = Object.assign(
         for (const item of entries) {
           item.sql = "select 1;"
         }
+      } else {
+        ensureBackup(db, dbPath, "pre-migration", existing)
       }
       applyMigrations(db, entries)
     }

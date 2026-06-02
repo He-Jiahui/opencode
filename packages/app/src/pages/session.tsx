@@ -16,6 +16,7 @@ import {
   untrack,
   createResource,
   For,
+  type JSX,
 } from "solid-js"
 import { Portal } from "solid-js/web"
 import { makeEventListener } from "@solid-primitives/event-listener"
@@ -39,6 +40,7 @@ import { checksum } from "@opencode-ai/core/util/encode"
 import { getFilename } from "@opencode-ai/core/util/path"
 import { useLocation, useNavigate, useSearchParams } from "@solidjs/router"
 import { NewSessionDesignView, NewSessionView, SessionHeader } from "@/components/session"
+import { FilePathContextMenu } from "@/components/file-path-context-menu"
 import { useComments } from "@/context/comments"
 import { getSessionPrefetch, SESSION_PREFETCH_TTL } from "@/context/global-sync/session-prefetch"
 import { useServerSync } from "@/context/server-sync"
@@ -586,6 +588,7 @@ export default function Page() {
   const workflowReferencesSession = (workflow: WorkflowGraph["workflow"], sessionID: string) => {
     if (workflow.rootSessionID === sessionID || workflow.pmSessionID === sessionID || workflow.testerSessionID === sessionID)
       return true
+    if (sync.data.workflow_session[sessionID]?.includes(workflow.id)) return true
     const graph = sync.data.workflow_graph[workflow.id]
     return (
       graph?.members?.some((member) => member.sessionID === sessionID) ||
@@ -692,6 +695,22 @@ export default function Page() {
     ),
   )
 
+  const refreshWorkflowList = debounce((sessionID: string) => {
+    void sync.session.workflow(sessionID, { force: true }).catch((error) => {
+      console.debug("[workflow] failed to refresh workflows", error)
+    })
+  }, 350)
+  const refreshWorkflowGraph = debounce((workflowID: string) => {
+    void sync.session.workflowGraph(workflowID, { force: true }).catch((error) => {
+      console.debug("[workflow] failed to refresh graph", error)
+    })
+  }, 600)
+  const refreshWorkflowSessions = debounce(() => {
+    void sync.session.fetch(0).catch((error) => {
+      console.debug("[workflow] failed to refresh sessions", error)
+    })
+  }, 800)
+
   const stopWorkflowEvents = sdk.event.listen((event) => {
     const type = event.details.type
     if (
@@ -703,12 +722,12 @@ export default function Page() {
       return
     const id = params.id
     if (!id) return
-    if (type === "workflow.created" || type === "workflow.updated") void sync.session.workflow(id, { force: true })
-    void sync.session.fetch(0)
+    if (type === "workflow.created" || type === "workflow.updated") refreshWorkflowList(id)
+    refreshWorkflowSessions()
     const workflowID =
       "workflowID" in event.details.properties ? event.details.properties.workflowID : activeWorkflow()?.id
     if (workflowID && (type === "workflow.node.updated" || type === "workflow.graph.updated"))
-      void sync.session.workflowGraph(workflowID, { force: true })
+      refreshWorkflowGraph(workflowID)
   })
   onCleanup(stopWorkflowEvents)
 
@@ -1743,10 +1762,9 @@ export default function Page() {
   const startWorkflowMutation = useMutation(() => ({
     mutationFn: async (input: { request: string; variant?: string; staffing: WorkflowStaffing }) => {
       const sessionID = params.id
-      if (!sessionID) return
       const result = await sdk.client.workflow.start({
         workflowStartInput: {
-          sessionID,
+          ...(sessionID ? { sessionID } : {}),
           prompt: input.request,
           model: workflowModel(),
           variant: input.variant,
@@ -1762,15 +1780,17 @@ export default function Page() {
     onSuccess: (workflow) => {
       if (!workflow) return
       setWorkflowUi("expanded", true)
+      const sessionID = params.id ?? workflow.rootSessionID
       showToast({
         variant: "success",
         icon: "circle-check",
         title: language.t("session.workflow.started.title"),
         description: workflow.id,
       })
-      void sync.session.workflow(params.id!, { force: true })
+      if (sessionID) void sync.session.workflow(sessionID, { force: true })
       void sync.session.workflowGraph(workflow.id, { force: true })
       void sync.session.fetch(0)
+      if (!params.id && workflow.rootSessionID) navigate(`/${params.dir}/session/${workflow.rootSessionID}`)
       dialog.close()
     },
     onError: fail,
@@ -3015,7 +3035,12 @@ export default function Page() {
       .map((item) => ({ id: item.id, text: line(item.id) }))
   })
 
-  const actions = { revert }
+  const actions = {
+    revert,
+    renderFileReference: (input: { path: string; type: "file"; children: JSX.Element }) => (
+      <FilePathContextMenu target={{ path: input.path, type: input.type }}>{input.children}</FilePathContextMenu>
+    ),
+  }
 
   createEffect(() => {
     const sessionID = params.id
@@ -3250,8 +3275,33 @@ export default function Page() {
                 </Show>
               </Match>
               <Match when={true}>
-                <Show when={newSessionDesign()} fallback={<NewSessionView worktree={newSessionWorktree()} />}>
-                  <NewSessionDesignView>{composerRegion("inline")}</NewSessionDesignView>
+                <Show
+                  when={newSessionDesign()}
+                  fallback={
+                    <NewSessionView
+                      worktree={newSessionWorktree()}
+                      workflowPending={startWorkflowMutation.isPending}
+                      onStartWorkflow={openStartWorkflowDialog}
+                    />
+                  }
+                >
+                  <NewSessionDesignView>
+                    <div class="flex flex-col gap-3">
+                      <div class="flex justify-center">
+                        <Button
+                          type="button"
+                          size="large"
+                          variant="secondary"
+                          icon="branch"
+                          disabled={startWorkflowMutation.isPending}
+                          onClick={openStartWorkflowDialog}
+                        >
+                          {language.t("session.workflow.start")}
+                        </Button>
+                      </div>
+                      {composerRegion("inline")}
+                    </div>
+                  </NewSessionDesignView>
                 </Show>
               </Match>
             </Switch>

@@ -46,6 +46,9 @@ export type State = {
   session: Session[]
   sessionTotal: number
   workflow: Workflow[]
+  workflow_session: {
+    [sessionID: string]: string[]
+  }
   workflow_graph: {
     [workflowID: string]: WorkflowGraph
   }

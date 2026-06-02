@@ -172,6 +172,7 @@ export function applyDirectoryEvent(input: {
     case "workflow.created":
     case "workflow.updated": {
       const info = (event.properties as { info: Workflow }).info
+      upsertWorkflowSessionIndex(input.setStore, info)
       const result = Binary.search(input.store.workflow, info.id, (item) => item.id)
       if (result.found) {
         input.setStore("workflow", result.index, reconcile(info))
@@ -216,6 +217,7 @@ export function applyDirectoryEvent(input: {
     case "workflow.graph.updated": {
       const graph = (event.properties as { graph?: WorkflowGraph }).graph
       if (!graph) break
+      upsertWorkflowSessionIndex(input.setStore, graph.workflow, graph)
       input.setStore("workflow_graph", graph.workflow.id, reconcile(graph))
       const result = Binary.search(input.store.workflow, graph.workflow.id, (item) => item.id)
       if (result.found) {
@@ -443,4 +445,21 @@ export function applyDirectoryEvent(input: {
       break
     }
   }
+}
+
+function upsertWorkflowSessionIndex(setStore: SetStoreFunction<State>, workflow: Workflow, graph?: WorkflowGraph) {
+  const sessionIDs = [
+    workflow.rootSessionID,
+    workflow.pmSessionID,
+    workflow.testerSessionID,
+    ...(graph?.members ?? []).map((member) => member.sessionID),
+    ...(graph?.milestones ?? []).flatMap((milestone) => milestone.session.map((session) => session.sessionID)),
+  ].filter((sessionID): sessionID is string => !!sessionID)
+  if (sessionIDs.length === 0) return
+  sessionIDs.forEach((sessionID) => {
+    setStore("workflow_session", sessionID, (items = []) => {
+      if (items.includes(workflow.id)) return items
+      return [...items, workflow.id]
+    })
+  })
 }

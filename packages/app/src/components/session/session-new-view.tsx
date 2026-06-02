@@ -6,6 +6,7 @@ import { useLanguage } from "@/context/language"
 import { Icon } from "@opencode-ai/ui/icon"
 import { Mark } from "@opencode-ai/ui/logo"
 import { getDirectory, getFilename } from "@opencode-ai/core/util/path"
+import { Button } from "@opencode-ai/ui/button"
 
 const MAIN_WORKTREE = "main"
 const CREATE_WORKTREE = "create"
@@ -13,6 +14,8 @@ const ROOT_CLASS = "size-full flex flex-col"
 
 interface NewSessionViewProps {
   worktree: string
+  workflowPending?: boolean
+  onStartWorkflow?: () => void
 }
 
 export function NewSessionView(props: NewSessionViewProps) {
@@ -81,6 +84,20 @@ export function NewSessionView(props: NewSessionViewProps) {
                     </span>
                   </div>
                 </div>
+              )}
+            </Show>
+            <Show when={props.onStartWorkflow}>
+              {(onStartWorkflow) => (
+                <Button
+                  type="button"
+                  size="large"
+                  variant="secondary"
+                  icon="branch"
+                  disabled={props.workflowPending}
+                  onClick={onStartWorkflow()}
+                >
+                  {language.t("session.workflow.start")}
+                </Button>
               )}
             </Show>
           </div>

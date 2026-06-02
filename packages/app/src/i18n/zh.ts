@@ -627,6 +627,13 @@ export const dict = {
   "session.header.open.ariaLabel": "在 {{app}} 中打开",
   "session.header.open.menu": "打开选项",
   "session.header.open.copyPath": "复制路径",
+  "file.context.openDefault": "默认方式打开",
+  "file.context.openFolder": "打开所在文件夹",
+  "session.context.pin": "置顶",
+  "session.context.unpin": "取消置顶",
+  "session.context.saveLocal": "保存会话记录到本地",
+  "session.context.exported": "会话记录已保存",
+  "session.context.exportFailed": "保存会话记录失败",
 
   "status.popover.trigger": "状态",
   "status.popover.ariaLabel": "服务器配置",

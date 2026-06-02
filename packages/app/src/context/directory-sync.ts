@@ -619,6 +619,7 @@ export const createDirSyncContext = (directory: string, serverSync: ReturnType<t
             )
               return
             await client.workflow.list({ sessionID }).then((x) => {
+              setStore("workflow_session", sessionID, (x.data ?? []).map((workflow) => workflow.id))
               setStore("workflow", reconcile(merge(store.workflow, x.data ?? []), { key: "id" }))
             })
             return

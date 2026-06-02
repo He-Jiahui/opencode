@@ -10,9 +10,11 @@ import { ButtonV2 } from "@opencode-ai/ui/v2/components/button-v2.jsx"
 import { Icon as IconV2 } from "@opencode-ai/ui/v2/components/icon.jsx"
 import { IconButtonV2 } from "@opencode-ai/ui/v2/components/icon-button-v2.jsx"
 import { MenuV2 } from "@opencode-ai/ui/v2/components/menu-v2.jsx"
+import { showToast } from "@opencode-ai/ui/toast"
 import { getAvatarColors, useLayout, type LocalProject } from "@/context/layout"
 import { useNavigate } from "@solidjs/router"
 import { base64Encode } from "@opencode-ai/core/util/encode"
+import { getDirectory } from "@opencode-ai/core/util/path"
 import { Icon } from "@opencode-ai/ui/icon"
 import { usePlatform } from "@/context/platform"
 import { DateTime } from "luxon"
@@ -421,20 +423,58 @@ function HomeProjectRow(props: {
 }) {
   const name = createMemo(() => displayName(props.project))
   const [menuOpen, setMenuOpen] = createSignal(false)
+  const platform = usePlatform()
+  const server = useServer()
+  const canOpen = createMemo(() => platform.platform === "desktop" && !!platform.openPath && server.isLocal())
+  const pathLabel = createMemo(() => {
+    const parent = getDirectory(props.project.worktree)
+    if (!parent || parent === props.project.worktree) return props.project.worktree
+    return parent
+  })
+
+  const showPathError = (err: unknown) => {
+    showToast({
+      variant: "error",
+      title: props.language.t("common.requestFailed"),
+      description: err instanceof Error ? err.message : String(err),
+    })
+  }
+
+  const openProjectPath = () => {
+    if (!canOpen() || !platform.openPath) return
+    platform.openPath(props.project.worktree).catch(showPathError)
+  }
+
+  const copyProjectPath = () => {
+    navigator.clipboard
+      .writeText(props.project.worktree)
+      .then(() => {
+        showToast({
+          variant: "success",
+          icon: "circle-check",
+          title: props.language.t("session.share.copy.copied"),
+          description: props.project.worktree,
+        })
+      })
+      .catch(showPathError)
+  }
 
   return (
-    <div class="group/project relative flex h-8 min-w-0 items-center rounded-[6px]">
+    <div class="group/project relative flex h-10 min-w-0 items-center rounded-[6px]">
       <button
         type="button"
         data-component="home-project-row"
-        class={`${HOME_PROJECT_NAV_ROW} pr-16 peer`}
+        class={`${HOME_ROW} h-10 gap-2 px-1.5 pr-16 peer`}
         classList={{ "bg-v2-overlay-simple-overlay-hover": props.selected }}
         data-selected={props.selected ? "" : undefined}
         aria-current={props.selected ? "page" : undefined}
         onClick={() => props.selectProject(props.project.worktree)}
       >
         <HomeProjectAvatar project={props.project} />
-        <span>{name()}</span>
+        <span class="flex min-w-0 flex-col overflow-hidden text-left">
+          <span class="truncate text-v2-text-text-muted">{name()}</span>
+          <span class="truncate text-[11px] leading-3 text-v2-text-text-faint">{pathLabel()}</span>
+        </span>
       </button>
       <div
         class="absolute right-1 top-1/2 flex -translate-y-1/2 items-center gap-0.5 opacity-0 transition-opacity group-hover/project:opacity-100 peer-focus-visible:opacity-100 focus-within:opacity-100 data-[menu=true]:opacity-100"
@@ -454,6 +494,10 @@ function HomeProjectRow(props: {
               <MenuV2.Item onSelect={() => props.openNewSession(props.project.worktree)}>
                 {props.language.t("command.session.new")}
               </MenuV2.Item>
+              <MenuV2.Item disabled={!canOpen()} onSelect={openProjectPath}>
+                {props.language.t("session.header.open.fileExplorer")}
+              </MenuV2.Item>
+              <MenuV2.Item onSelect={copyProjectPath}>{props.language.t("session.header.open.copyPath")}</MenuV2.Item>
               <MenuV2.Item onSelect={() => props.editProject(props.project)}>
                 {props.language.t("common.edit")}
               </MenuV2.Item>

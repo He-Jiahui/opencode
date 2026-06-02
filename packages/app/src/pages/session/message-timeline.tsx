@@ -71,6 +71,7 @@ import { sessionTitle } from "@/utils/session-title"
 import { makeTimer } from "@solid-primitives/timer"
 import { Markdown } from "@opencode-ai/ui/markdown"
 import { OpencodePlanBlock } from "@/components/opencode-plan-block"
+import { FilePathContextMenu } from "@/components/file-path-context-menu"
 import { parseOpencodePlanSegments, type OpencodePlanBlock as PlanBlock } from "@/utils/opencode-plan"
 import { MessageComment, SummaryDiff, Timeline, TimelineRow, TimelineRowMap } from "./message-timeline.data"
 
@@ -217,22 +218,24 @@ function TimelineDiffSummaryRow(props: { diffs: SummaryDiff[] }) {
                 <Accordion.Item value={diff.file}>
                   <StickyAccordionHeader>
                     <Accordion.Trigger>
-                      <div data-slot="session-turn-diff-trigger">
-                        <span data-slot="session-turn-diff-path">
-                          <Show when={diff.file.includes("/")}>
-                            <span data-slot="session-turn-diff-directory">{`\u202A${getDirectory(diff.file)}\u202C`}</span>
-                          </Show>
-                          <span data-slot="session-turn-diff-filename">{getFilename(diff.file)}</span>
-                        </span>
-                        <div data-slot="session-turn-diff-meta">
-                          <span data-slot="session-turn-diff-changes">
-                            <DiffChanges changes={diff} />
+                      <FilePathContextMenu target={{ path: diff.file, type: "file" }}>
+                        <div data-slot="session-turn-diff-trigger">
+                          <span data-slot="session-turn-diff-path">
+                            <Show when={diff.file.includes("/")}>
+                              <span data-slot="session-turn-diff-directory">{`\u202A${getDirectory(diff.file)}\u202C`}</span>
+                            </Show>
+                            <span data-slot="session-turn-diff-filename">{getFilename(diff.file)}</span>
                           </span>
-                          <span data-slot="session-turn-diff-chevron">
-                            <Icon name="chevron-down" size="small" />
-                          </span>
+                          <div data-slot="session-turn-diff-meta">
+                            <span data-slot="session-turn-diff-changes">
+                              <DiffChanges changes={diff} />
+                            </span>
+                            <span data-slot="session-turn-diff-chevron">
+                              <Icon name="chevron-down" size="small" />
+                            </span>
+                          </div>
                         </div>
-                      </div>
+                      </FilePathContextMenu>
                     </Accordion.Trigger>
                   </StickyAccordionHeader>
                   <Accordion.Content>
@@ -1164,24 +1167,26 @@ export function MessageTimeline(props: {
                 <div class="flex w-max min-w-full justify-end gap-2">
                   <Index each={comments()}>
                     {(comment) => (
-                      <div class="shrink-0 max-w-[260px] rounded-[6px] border border-border-weak-base bg-background-stronger px-2.5 py-2">
-                        <div class="flex items-center gap-1.5 min-w-0 text-11-medium text-text-strong">
-                          <FileIcon node={{ path: comment().path, type: "file" }} class="size-3.5 shrink-0" />
-                          <span class="truncate">{getFilename(comment().path)}</span>
-                          <Show when={comment().selection}>
-                            {(selection) => (
-                              <span class="shrink-0 text-text-weak">
-                                {selection().startLine === selection().endLine
-                                  ? `:${selection().startLine}`
-                                  : `:${selection().startLine}-${selection().endLine}`}
-                              </span>
-                            )}
-                          </Show>
+                      <FilePathContextMenu target={{ path: comment().path, type: "file" }}>
+                        <div class="shrink-0 max-w-[260px] rounded-[6px] border border-border-weak-base bg-background-stronger px-2.5 py-2">
+                          <div class="flex items-center gap-1.5 min-w-0 text-11-medium text-text-strong">
+                            <FileIcon node={{ path: comment().path, type: "file" }} class="size-3.5 shrink-0" />
+                            <span class="truncate">{getFilename(comment().path)}</span>
+                            <Show when={comment().selection}>
+                              {(selection) => (
+                                <span class="shrink-0 text-text-weak">
+                                  {selection().startLine === selection().endLine
+                                    ? `:${selection().startLine}`
+                                    : `:${selection().startLine}-${selection().endLine}`}
+                                </span>
+                              )}
+                            </Show>
+                          </div>
+                          <div class="pt-1 text-12-regular text-text-strong whitespace-pre-wrap break-words">
+                            {comment().comment}
+                          </div>
                         </div>
-                        <div class="pt-1 text-12-regular text-text-strong whitespace-pre-wrap break-words">
-                          {comment().comment}
-                        </div>
-                      </div>
+                      </FilePathContextMenu>
                     )}
                   </Index>
                 </div>

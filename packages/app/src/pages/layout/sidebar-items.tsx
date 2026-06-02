@@ -1,9 +1,10 @@
-import type { Session } from "@opencode-ai/sdk/v2/client"
+import type { Session, Workflow, WorkflowGraph } from "@opencode-ai/sdk/v2/client"
 import { Avatar } from "@opencode-ai/ui/avatar"
 import { Icon } from "@opencode-ai/ui/icon"
 import { IconButton } from "@opencode-ai/ui/icon-button"
 import { Spinner } from "@opencode-ai/ui/spinner"
 import { Tooltip } from "@opencode-ai/ui/tooltip"
+import { ContextMenu } from "@opencode-ai/ui/context-menu"
 import { getFilename } from "@opencode-ai/core/util/path"
 import { A, useParams } from "@solidjs/router"
 import { type Accessor, createEffect, createMemo, For, type JSX, Match, Show, Switch } from "solid-js"
@@ -91,6 +92,55 @@ export type SessionItemProps = {
   clearHoverProjectSoon: () => void
   prefetchSession: (session: Session, priority?: "high" | "low") => void
   archiveSession: (session: Session) => Promise<void>
+  renameSession: (session: Session, title: string) => Promise<void>
+  togglePinSession: (session: Session) => void
+  exportSession: (session: Session) => Promise<void>
+  sessionPinned: (session: Session) => boolean
+}
+
+type WorkflowProgress = {
+  percent: number
+  summary: string
+  status: string
+}
+
+const completedWorkflowMilestone = (status: string | undefined) =>
+  status === "approved" || status === "completed" || status === "done" || status === "skipped"
+
+const workflowStatusPercent = (status: Workflow["status"]) => {
+  if (status === "completed") return 100
+  if (status === "accepting") return 92
+  if (status === "testing") return 82
+  if (status === "reviewing") return 68
+  if (status === "executing") return 52
+  if (status === "dispatching" || status === "running") return 34
+  if (status === "planning") return 18
+  if (status === "blocked") return 50
+  if (status === "failed" || status === "cancelled") return 0
+  return 8
+}
+
+const workflowProgressInfo = (workflow: Workflow, graph: WorkflowGraph | undefined): WorkflowProgress => {
+  if (graph?.milestones.length) {
+    const completed = graph.milestones.filter((milestone) => completedWorkflowMilestone(milestone.status)).length
+    const current =
+      graph.milestones.find(
+        (milestone) =>
+          milestone.status !== "pending" &&
+          !completedWorkflowMilestone(milestone.status) &&
+          milestone.status !== "cancelled",
+      ) ?? graph.milestones.find((milestone) => !completedWorkflowMilestone(milestone.status))
+    return {
+      percent: Math.round((completed / graph.milestones.length) * 100),
+      summary: current ? `${current.title ?? current.id} · ${current.status}` : workflow.status,
+      status: workflow.status,
+    }
+  }
+  return {
+    percent: workflowStatusPercent(workflow.status),
+    summary: workflow.error ?? workflow.status,
+    status: workflow.status,
+  }
 }
 
 const SessionRow = (props: {
@@ -107,6 +157,7 @@ const SessionRow = (props: {
   sidebarOpened: Accessor<boolean>
   warmPress: () => void
   warmFocus: () => void
+  workflowProgress: Accessor<WorkflowProgress | undefined>
 }): JSX.Element => {
   const title = () => sessionTitle(props.session.title)
 
@@ -142,7 +193,23 @@ const SessionRow = (props: {
           </Switch>
         </div>
       </Show>
-      <span class="text-14-regular text-text-strong min-w-0 flex-1 truncate">{title()}</span>
+      <div class="min-w-0 flex-1">
+        <span class="block text-14-regular text-text-strong min-w-0 truncate">{title()}</span>
+        <Show when={props.workflowProgress()}>
+          {(progress) => (
+            <div class="mt-0.5 flex min-w-0 items-center gap-1.5 text-[10px] leading-3 text-text-weaker">
+              <div class="h-1 w-12 shrink-0 overflow-hidden rounded-full bg-surface-raised-base">
+                <div
+                  class="h-full rounded-full bg-text-interactive-base"
+                  style={{ width: `${Math.max(0, Math.min(100, progress().percent))}%` }}
+                />
+              </div>
+              <span class="shrink-0 tabular-nums">{progress().percent}%</span>
+              <span class="truncate">{progress().summary || progress().status}</span>
+            </div>
+          )}
+        </Show>
+      </div>
     </A>
   )
 }
@@ -172,10 +239,19 @@ export const SessionItem = (props: SessionItemProps): JSX.Element => {
   const tooltip = createMemo(() => props.showTooltip ?? (props.mobile || !props.sidebarExpanded()))
   const expandable = createMemo(() => props.showChild && childSessionCount(sessionStore.session, props.session.id) > 0)
   const autoExpanded = createMemo(() => !!props.showChild && sessionOnPath(sessionStore.session, props.session.id, params.id))
-  const open = createMemo(() => autoExpanded() || expanded[props.session.id])
+  const workflowRoot = createMemo(
+    () => !props.level && sessionStore.workflow.some((workflow) => workflow.rootSessionID === props.session.id),
+  )
+  const open = createMemo(() => autoExpanded() || workflowRoot() || expanded[props.session.id])
   const childSessions = createMemo(() => {
     if (!open()) return []
-    return sortedChildSessions(sessionStore.session, props.session.id, Date.now())
+    return sortedChildSessions(sessionStore.session, props.session.id, Date.now(), props.sessionPinned)
+  })
+  const workflowProgress = createMemo(() => {
+    if (props.level) return
+    const workflow = sessionStore.workflow.find((workflow) => workflow.rootSessionID === props.session.id)
+    if (!workflow) return
+    return workflowProgressInfo(workflow, sessionStore.workflow_graph[workflow.id])
   })
 
   createEffect(() => {
@@ -218,10 +294,11 @@ export const SessionItem = (props: SessionItemProps): JSX.Element => {
       sidebarOpened={layout.sidebar.opened}
       warmPress={() => warm(2, "high")}
       warmFocus={() => warm(2, "high")}
+      workflowProgress={workflowProgress}
     />
   )
 
-  return (
+  const content = (
     <>
       <div
         data-session-id={props.session.id}
@@ -299,6 +376,38 @@ export const SessionItem = (props: SessionItemProps): JSX.Element => {
         )}
       </For>
     </>
+  )
+
+  return (
+    <ContextMenu modal={false}>
+      <ContextMenu.Trigger as="div" class="contents">
+        {content}
+      </ContextMenu.Trigger>
+      <ContextMenu.Portal>
+        <ContextMenu.Content>
+          <ContextMenu.Item onSelect={() => void props.archiveSession(props.session)}>
+            <ContextMenu.ItemLabel>{language.t("common.archive")}</ContextMenu.ItemLabel>
+          </ContextMenu.Item>
+          <ContextMenu.Item
+            onSelect={() => {
+              const next = window.prompt(language.t("common.rename"), sessionTitle(props.session.title))
+              if (!next?.trim()) return
+              void props.renameSession(props.session, next.trim())
+            }}
+          >
+            <ContextMenu.ItemLabel>{language.t("common.rename")}</ContextMenu.ItemLabel>
+          </ContextMenu.Item>
+          <ContextMenu.Item onSelect={() => props.togglePinSession(props.session)}>
+            <ContextMenu.ItemLabel>
+              {props.sessionPinned(props.session) ? language.t("session.context.unpin") : language.t("session.context.pin")}
+            </ContextMenu.ItemLabel>
+          </ContextMenu.Item>
+          <ContextMenu.Item onSelect={() => void props.exportSession(props.session)}>
+            <ContextMenu.ItemLabel>{language.t("session.context.saveLocal")}</ContextMenu.ItemLabel>
+          </ContextMenu.Item>
+        </ContextMenu.Content>
+      </ContextMenu.Portal>
+    </ContextMenu>
   )
 }
 

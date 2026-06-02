@@ -1,6 +1,6 @@
 import path from "path"
 import { appendFileSync, mkdirSync } from "fs"
-import { cp, mkdir, readFile, stat, writeFile } from "fs/promises"
+import { appendFile, cp, mkdir, readFile, stat, writeFile } from "fs/promises"
 
 import { serviceUse } from "@opencode-ai/core/effect/service-use"
 import { Bus } from "@/bus"
@@ -640,6 +640,11 @@ async function writeFileEnsured(file: string, content: string) {
   await writeFile(file, content)
 }
 
+async function appendFileEnsured(file: string, content: string) {
+  await mkdir(path.dirname(file), { recursive: true })
+  await appendFile(file, content)
+}
+
 async function writeFileEnsuredIfMissing(file: string, content: string) {
   if (await exists(file)) return
   await writeFileEnsured(file, content)
@@ -716,6 +721,15 @@ function toInfo(row: typeof WorkflowTable.$inferSelect): WorkflowInfo {
   }
 }
 
+function toListInfo(row: typeof WorkflowTable.$inferSelect): WorkflowInfo {
+  const info = toInfo(row)
+  return {
+    ...info,
+    request: compactMarkdown(info.request, 800),
+    xml: "",
+  }
+}
+
 function toMilestone(row: typeof WorkflowMilestoneTable.$inferSelect): WorkflowMilestoneInfo {
   return {
     id: row.id,
@@ -764,6 +778,23 @@ function toIntervention(row: typeof WorkflowInterventionTable.$inferSelect): Wor
       created: row.time_created,
       updated: row.time_updated,
     },
+  }
+}
+
+function compactGraphConsultation(item: WorkflowConsultationInfo): WorkflowConsultationInfo {
+  return {
+    ...item,
+    question: compactMarkdown(item.question, 800),
+    answer: compactMarkdown(item.answer, 800),
+    reason: item.reason ? compactMarkdown(item.reason, 240) : undefined,
+  }
+}
+
+function compactGraphIntervention(item: WorkflowInterventionInfo): WorkflowInterventionInfo {
+  return {
+    ...item,
+    message: compactMarkdown(item.message, 800),
+    response: item.response ? compactMarkdown(item.response, 800) : undefined,
   }
 }
 
@@ -864,14 +895,13 @@ function archivePart(part: MessageV2.Part) {
   return [`#### ${part.type}`, "", jsonFence(part)].join("\n")
 }
 
-function archiveSessionMarkdown(input: {
+function archiveSessionHeaderMarkdown(input: {
   workflow: WorkflowInfo
   session: Session.Info
   role: WorkflowSessionRef["role"]
   prompt?: string
   milestoneID?: WorkflowMilestoneID
   attempt?: number
-  messages: MessageV2.WithParts[]
 }) {
   return [
     `# ${input.session.title}`,
@@ -894,31 +924,90 @@ function archiveSessionMarkdown(input: {
     ...(input.prompt ? ["## Initial Prompt", "", input.prompt, ""] : []),
     "## Messages",
     "",
-    ...(input.messages.length === 0
-      ? ["_No messages recorded yet._"]
-      : input.messages.flatMap((message) => [
-          `### ${message.info.role} ${message.info.id}`,
-          "",
-          `Created: ${new Date(message.info.time.created).toISOString()}`,
-          ...(message.info.role === "assistant"
-            ? [
-                ...(message.info.time.completed
-                  ? [`Completed: ${new Date(message.info.time.completed).toISOString()}`]
-                  : []),
-                `Agent: ${message.info.agent}`,
-                `Model: ${message.info.providerID}/${message.info.modelID}`,
-                ...(message.info.variant ? [`Variant: ${message.info.variant}`] : []),
-                `Finish: ${message.info.finish ?? "unknown"}`,
-                ...(message.info.error ? ["", "#### Error", "", jsonFence(message.info.error)] : []),
-              ]
-            : [
-                `Agent: ${message.info.agent}`,
-                `Model: ${message.info.model.providerID}/${message.info.model.modelID}`,
-                ...(message.info.model.variant ? [`Variant: ${message.info.model.variant}`] : []),
-              ]),
-          "",
-          ...message.parts.flatMap((part) => [archivePart(part), ""]),
-        ])),
+  ].join("\n")
+}
+
+function archiveMessageMarkdown(message: MessageV2.WithParts) {
+  return [
+    `### ${message.info.role} ${message.info.id}`,
+    "",
+    `Created: ${new Date(message.info.time.created).toISOString()}`,
+    ...(message.info.role === "assistant"
+      ? [
+          ...(message.info.time.completed ? [`Completed: ${new Date(message.info.time.completed).toISOString()}`] : []),
+          `Agent: ${message.info.agent}`,
+          `Model: ${message.info.providerID}/${message.info.modelID}`,
+          ...(message.info.variant ? [`Variant: ${message.info.variant}`] : []),
+          `Finish: ${message.info.finish ?? "unknown"}`,
+          ...(message.info.error ? ["", "#### Error", "", jsonFence(message.info.error)] : []),
+        ]
+      : [
+          `Agent: ${message.info.agent}`,
+          `Model: ${message.info.model.providerID}/${message.info.model.modelID}`,
+          ...(message.info.model.variant ? [`Variant: ${message.info.model.variant}`] : []),
+        ]),
+    "",
+    ...message.parts.flatMap((part) => [archivePart(part), ""]),
+  ].join("\n")
+}
+
+const archiveWorkflowSessionMessages = Effect.fn("Workflow.archiveWorkflowSessionMessages")(function* (input: {
+  workflow: WorkflowInfo
+  session: Session.Info
+  role: WorkflowSessionRef["role"]
+  prompt?: string
+  milestoneID?: WorkflowMilestoneID
+  attempt?: number
+  file: string
+}) {
+  yield* Effect.promise(() =>
+    writeFileEnsured(
+      input.file,
+      [
+        archiveSessionHeaderMarkdown(input),
+        "Message order: newest first.",
+        "",
+      ].join("\n"),
+    ),
+  )
+  const pageSize = 20
+  let before: string | undefined
+  let wrote = false
+  while (true) {
+    const page = yield* MessageV2.page({
+      sessionID: input.session.id,
+      limit: pageSize,
+      before,
+    }).pipe(Effect.mapError((error) => new Error({ message: error.message })))
+    if (page.items.length === 0) break
+    wrote = true
+    yield* Effect.promise(() =>
+      appendFileEnsured(
+        input.file,
+        `${page.items
+          .toReversed()
+          .map(archiveMessageMarkdown)
+          .join("\n")}\n`,
+      ),
+    )
+    if (!page.more || !page.cursor) break
+    before = page.cursor
+  }
+  if (!wrote) yield* Effect.promise(() => appendFileEnsured(input.file, "_No messages recorded yet._\n"))
+})
+
+function archiveSessionMarkdown(input: {
+  workflow: WorkflowInfo
+  session: Session.Info
+  role: WorkflowSessionRef["role"]
+  prompt?: string
+  milestoneID?: WorkflowMilestoneID
+  attempt?: number
+  messages: MessageV2.WithParts[]
+}) {
+  return [
+    archiveSessionHeaderMarkdown(input),
+    input.messages.length === 0 ? "_No messages recorded yet._" : input.messages.map(archiveMessageMarkdown).join("\n"),
     "",
   ].join("\n")
 }
@@ -1869,6 +1958,7 @@ export function workflowReferencePrompt(workflow: WorkflowInfo) {
     "For role-based communication, emit:",
     '<opencode-workflow-message to-role="expert|main_pm|department_pm|executor|reviewer|tester|requester" specialty="optional area" timing="after-task|interrupt|temporary-interrupt" reason="short reason">message or question</opencode-workflow-message>',
     "Use timing=\"after-task\" for normal handoff, timing=\"temporary-interrupt\" when you need a quick answer before continuing, and timing=\"interrupt\" when the current task should pause until direction changes.",
+    "If the only valid blocker is a requester/user decision, send it to to-role=\"requester\" with 2-3 explicit options, mark one option as Recommended, and include the tradeoff for each option. Do not stop silently after asking.",
     "Main PM and department PM sessions may revise the workflow graph directly by emitting:",
     '<opencode-workflow-update reason="why the graph changed"><workflow>...</workflow></opencode-workflow-update>',
     "Use workflow updates when a milestone is too broad, requester strategy changes, or the company needs new ordered/parallel work. Preserve completed milestone ids when they remain valid.",
@@ -1921,6 +2011,7 @@ export function workflowEmployeeContextPrompt(
     '<opencode-workflow-consult target-session="ses_xxx" timing="after-task|interrupt|temporary-interrupt" reason="short reason">question</opencode-workflow-consult>',
     "Use this role-based communication XML when the workflow should route the message to an employee by function:",
     '<opencode-workflow-message to-role="expert|main_pm|department_pm|executor|reviewer|tester|requester" specialty="optional area" timing="after-task|interrupt|temporary-interrupt" reason="short reason">message or question</opencode-workflow-message>',
+    "When asking the requester/user to decide, include 2-3 concrete options in the message body, label the recommended option, and state the impact of each option.",
   ].join("\n")
 }
 
@@ -2724,8 +2815,8 @@ function graphFrom(
           to,
           kind: "consultation" as const,
           label: consultation.timing ?? "consult",
-          question: consultation.question,
-          answer: consultation.answer,
+          question: compactMarkdown(consultation.question, 800),
+          answer: compactMarkdown(consultation.answer, 800),
           summary: [
             `${roleSessionTitle(consultation.fromRole)} consulted ${roleSessionTitle(consultation.toRole)}`,
             ...(consultation.reason ? [`Reason: ${consultation.reason}`] : []),
@@ -2743,8 +2834,8 @@ function graphFrom(
           to: to ?? (intervention.targetRole === "main_pm" ? mainPMID : info.id),
           kind: "consultation" as const,
           label: intervention.timing,
-          question: intervention.message,
-          answer: intervention.response,
+          question: compactMarkdown(intervention.message, 800),
+          answer: intervention.response ? compactMarkdown(intervention.response, 800) : undefined,
           summary: `Requester intervention to ${roleSessionTitle(intervention.targetRole)} [${intervention.status}]`,
         },
         ...(includeDocumentGraph
@@ -2950,8 +3041,8 @@ function graphFrom(
     workflow: info,
     milestones,
     members,
-    consultations,
-    interventions,
+    consultations: consultations.map(compactGraphConsultation),
+    interventions: interventions.map(compactGraphIntervention),
     nodes,
     edges: graphEdges,
   }
@@ -3001,6 +3092,7 @@ function promptMainPm(input: { workflow: WorkflowInfo }) {
     "Create and supervise an implementation-scale workflow plan for this request. Treat requester strategy as adjustable during the project, and keep the organization aligned when direction changes.",
     "Do not treat staff sessions as disposable. The requester, main PM, department PMs, executors, testers, and technical advisors are long-lived employees who should accumulate context and collaborate across milestones.",
     "Do not hide a complex feature behind a single broad milestone. Every milestone must be small enough for one executor session to finish, one department PM session to functionally review, and the tester to verify for completeness.",
+    "PM roles must not edit implementation code or perform code changes. PMs may write workflow, plan, decomposition, reference, organization, and review documents under the workflow directory; implementation belongs to executor sessions.",
     `Write the canonical XML to ${workflowArtifactPath(input.workflow, "workflow.xml")}.`,
     `Write the high-level plan to ${workflowArtifactPath(input.workflow, "main-plan.md")}.`,
     `Maintain the company organization chart at ${workflowArtifactPath(input.workflow, "organization.md")}.`,
@@ -3034,6 +3126,7 @@ function promptDepartmentPm(input: { workflow: WorkflowInfo; milestone: Workflow
     workflowReferencePrompt(input.workflow),
     "",
     "Act like a department lead: turn the milestone into concrete work, coordinate with executors, consult the technical advisor for architecture or performance-sensitive choices, and keep main PM strategy visible.",
+    "Do not edit implementation code from the department PM session. You may write or revise workflow plan, decomposition, reference, and review documents; implementation belongs to executor sessions.",
     `Save a detailed execution plan to ${workflowArtifactPath(input.workflow, input.milestone.id, "plan.md")}.`,
     `If this milestone is still too broad, update ${workflowArtifactPath(input.workflow, "workflow.xml")} before writing a broad plan.`,
     `When splitting, replace this milestone with ordered/parallel child milestones whose ids are prefixed with "${input.milestone.id}-". Preserve the dependency intent and do not leave dependencies pointing at a removed milestone id.`,
@@ -3194,9 +3287,13 @@ function mainPlanningExpectation(): WorkflowPromptExpectation {
       "Finish the main PM planning task now.",
       "Write workflow.xml and main-plan.md, or emit:",
       '<opencode-workflow-update reason="initial dispatch"><workflow>...</workflow></opencode-workflow-update>',
-      "Do not say dispatch has started unless the workflow XML is available for the runtime to validate.",
+      "After writing files, call the built-in workflow tool with action=update_xml or action=resume so the runtime can validate and dispatch.",
+      "Do not say dispatch has started unless the workflow runtime has received workflow XML.",
     ].join("\n"),
-    matches: (text) => parseWorkflowUpdateXml(text) !== undefined || (/workflow\.xml/i.test(text) && /main-plan\.md/i.test(text)),
+    matches: (text) =>
+      parseWorkflowUpdateXml(text) !== undefined ||
+      /opencode-workflow-control\b[^>]*\baction=["']resume["']/i.test(text) ||
+      (/workflow\.xml/i.test(text) && /main-plan\.md/i.test(text)),
   }
 }
 
@@ -3324,6 +3421,7 @@ function workflowExpectedOutputPrompt(expectation: WorkflowPromptExpectation, at
     expectation.reminder,
     "",
     "Do not request product clarification unless the original request is genuinely impossible to interpret. If another workflow employee has needed context, use workflow communication XML and then continue after the answer.",
+    "If a requester/user decision is truly required, emit `<opencode-workflow-message to-role=\"requester\" timing=\"interrupt\" reason=\"decision required\">...Options: 1. ... (Recommended) ... 2. ...</opencode-workflow-message>` with concrete options and impacts.",
     `This is automatic continuation attempt ${attempt} of ${maxAttempts}.`,
   ].join("\n")
 }
@@ -3672,12 +3770,9 @@ export const layer: Layer.Layer<
           .orderBy(asc(WorkflowTable.time_created))
           .all(),
       )
-      if (!input?.sessionID) {
-        const result = yield* Effect.all(rows.map((row) => ensureRequesterSession(toInfo(row))))
-        yield* Effect.all(result.map((workflow) => normalizeWorkflowSessions(workflow).pipe(Effect.ignore)))
-        yield* Effect.all(result.map((workflow) => archiveWorkflowSessions(workflow.id).pipe(Effect.ignore)))
-        return result
-      }
+      const workflows = rows.map(toListInfo)
+      if (!input?.sessionID) return workflows
+      const sessionID = input.sessionID
       const milestoneWorkflowIDs =
         rows.length === 0
           ? new Set<WorkflowID>()
@@ -3692,19 +3787,36 @@ export const layer: Layer.Layer<
                   .where(inArray(WorkflowMilestoneTable.workflow_id, rows.map((row) => row.id)))
                   .all(),
               )
-                .filter((row) => row.session.some((ref) => ref.sessionID === input.sessionID))
+                .filter((row) => row.session.some((ref) => ref.sessionID === sessionID))
                 .map((row) => row.workflow_id),
             )
-      const result = (yield* Effect.all(rows.map((row) => ensureRequesterSession(toInfo(row))))).filter(
+      const memberWorkflowIDs =
+        rows.length === 0
+          ? new Set<WorkflowID>()
+          : new Set(
+              Database.use((db) =>
+                db
+                  .select({
+                    workflow_id: WorkflowMemberTable.workflow_id,
+                  })
+                  .from(WorkflowMemberTable)
+                  .where(
+                    and(
+                      inArray(WorkflowMemberTable.workflow_id, rows.map((row) => row.id)),
+                      eq(WorkflowMemberTable.session_id, sessionID),
+                    ),
+                  )
+                  .all(),
+              ).map((row) => row.workflow_id),
+            )
+      return workflows.filter(
         (workflow) =>
-          workflow.rootSessionID === input.sessionID ||
-          workflow.pmSessionID === input.sessionID ||
-          workflow.testerSessionID === input.sessionID ||
+          workflow.rootSessionID === sessionID ||
+          workflow.pmSessionID === sessionID ||
+          workflow.testerSessionID === sessionID ||
+          memberWorkflowIDs.has(workflow.id) ||
           milestoneWorkflowIDs.has(workflow.id),
       )
-      yield* Effect.all(result.map((workflow) => normalizeWorkflowSessions(workflow).pipe(Effect.ignore)))
-      yield* Effect.all(result.map((workflow) => archiveWorkflowSessions(workflow.id).pipe(Effect.ignore)))
-      return result
     })
 
     const milestones = Effect.fn("Workflow.milestones")(function* (workflowID: WorkflowID) {
@@ -5171,23 +5283,24 @@ export const layer: Layer.Layer<
       attempt?: number
     }) {
       const workflow = yield* get(input.workflowID)
+      const ctx = yield* InstanceState.context
       const info = yield* session.get(input.sessionID).pipe(Effect.mapError((error) => new Error({ message: error.message })))
-      const messages = yield* session
-        .messages({ sessionID: input.sessionID })
-        .pipe(Effect.mapError((error) => new Error({ message: error.message })))
       const role = input.role ?? workflowSessionRole(workflow, yield* milestones(workflow.id), input.sessionID)
-      yield* writeNote(
-        workflowArtifactPath(workflow, workflowSessionArchivePath(input.sessionID)),
-        archiveSessionMarkdown({
-          workflow,
-          session: info,
-          role,
-          prompt: input.prompt,
-          milestoneID: input.milestoneID,
-          attempt: input.attempt,
-          messages,
-        }),
-      )
+      yield* archiveWorkflowSessionMessages({
+        workflow,
+        session: info,
+        role,
+        prompt: input.prompt,
+        milestoneID: input.milestoneID,
+        attempt: input.attempt,
+        file: path.join(ctx.directory, workflowArtifactPath(workflow, workflowSessionArchivePath(input.sessionID))),
+      })
+      const messages = (
+        yield* MessageV2.page({
+          sessionID: input.sessionID,
+          limit: 60,
+        }).pipe(Effect.mapError((error) => new Error({ message: error.message })))
+      ).items
       yield* writeNote(
         workflowArtifactPath(workflow, workflowSessionSummaryPath(input.sessionID)),
         archiveSessionSummaryMarkdown({
@@ -5217,8 +5330,17 @@ export const layer: Layer.Layer<
           })),
         ),
       ]
+      const uniqueRefs = Array.from(
+        refs
+          .reduce((result, ref) => {
+            const existing = result.get(ref.sessionID)
+            result.set(ref.sessionID, existing?.milestoneID ? existing : ref)
+            return result
+          }, new Map<SessionID, WorkflowArchiveSessionRef>())
+          .values(),
+      )
       yield* Effect.all(
-        refs.map((ref) =>
+        uniqueRefs.map((ref) =>
           archiveWorkflowSession({
             workflowID,
             sessionID: ref.sessionID,
@@ -5227,7 +5349,7 @@ export const layer: Layer.Layer<
             attempt: ref.attempt,
           }).pipe(Effect.ignore),
         ),
-        { concurrency: "unbounded", discard: true },
+        { concurrency: 2, discard: true },
       )
       yield* writeReferenceIndex(workflowID).pipe(Effect.ignore)
       yield* writeArchiveIndex(workflowID).pipe(Effect.ignore)
@@ -6368,6 +6490,40 @@ export const layer: Layer.Layer<
       yield* continuePlanning(workflowID)
     })
 
+    const resumeActiveWorkflowsOnStartup = Effect.fn("Workflow.resumeActiveWorkflowsOnStartup")(function* () {
+      const ctx = yield* InstanceState.context
+      const activeStatuses: WorkflowInfo["status"][] = [
+        "pending",
+        "running",
+        "planning",
+        "dispatching",
+        "executing",
+        "reviewing",
+        "testing",
+        "accepting",
+      ]
+      const activeJobs = new Set(
+        (yield* background.list())
+          .filter((job) => job.status === "running" && job.metadata?.workflowID)
+          .map((job) => String(job.metadata?.workflowID)),
+      )
+      const workflows = Database.use((db) =>
+        db
+          .select()
+          .from(WorkflowTable)
+          .where(and(eq(WorkflowTable.project_id, ctx.project.id), inArray(WorkflowTable.status, activeStatuses)))
+          .all()
+          .map(toInfo),
+      )
+      for (const workflow of workflows.filter((item) => !activeJobs.has(item.id))) {
+        yield* applyWorkflowControl(
+          workflow.id,
+          workflowToolResumeBlock("opencode startup resume"),
+          "opencode startup",
+        ).pipe(Effect.catchCause(() => Effect.void))
+      }
+    })
+
     const initState = yield* InstanceState.make(
       Effect.fn("Workflow.initState")(function* () {
         yield* (yield* bus.subscribe(WorkflowToolCommandEvent)).pipe(
@@ -6413,7 +6569,7 @@ export const layer: Layer.Layer<
               if (["blocked", "cancelled", "completed", "failed"].includes(context.workflow.status)) return
               const contextItems = yield* milestones(context.workflow.id)
               const active = contextItems.find((item) => item.id === context.milestoneID)
-              if (!active || !interruptedMilestone(active.status)) return
+              if (!active || ["approved", "completed", "done", "skipped", "cancelled"].includes(active.status)) return
               const running = (yield* background.list()).some(
                 (job) =>
                   job.status === "running" &&
@@ -6496,6 +6652,7 @@ export const layer: Layer.Layer<
           }),
           Effect.forkScoped,
         )
+        yield* resumeActiveWorkflowsOnStartup().pipe(Effect.delay("500 millis"), Effect.catchCause(() => Effect.void), Effect.forkScoped)
       }),
     )
 

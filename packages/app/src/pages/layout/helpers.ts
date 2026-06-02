@@ -7,9 +7,12 @@ type SessionStore = {
   path: { directory: string }
 }
 
-function sortSessions(now: number) {
+function sortSessions(now: number, pinned?: (session: Session) => boolean) {
   const oneMinuteAgo = now - 60 * 1000
   return (a: Session, b: Session) => {
+    const pinnedA = pinned?.(a) ?? false
+    const pinnedB = pinned?.(b) ?? false
+    if (pinnedA !== pinnedB) return pinnedA ? -1 : 1
     const aUpdated = a.time.updated ?? a.time.created
     const bUpdated = b.time.updated ?? b.time.created
     const aRecent = aUpdated > oneMinuteAgo
@@ -27,10 +30,18 @@ const isRootVisibleSession = (session: Session, directory: string) =>
 export const roots = (store: SessionStore) =>
   (store.session ?? []).filter((session) => isRootVisibleSession(session, store.path.directory))
 
-export const sortedRootSessions = (store: SessionStore, now: number) => roots(store).sort(sortSessions(now))
+export const sortedRootSessions = (store: SessionStore, now: number, pinned?: (session: Session) => boolean) =>
+  roots(store).sort(sortSessions(now, pinned))
 
-export const sortedChildSessions = (sessions: Session[] | undefined, parentID: string, now: number) =>
-  (sessions ?? []).filter((session) => session.parentID === parentID && !session.time?.archived).sort(sortSessions(now))
+export const sortedChildSessions = (
+  sessions: Session[] | undefined,
+  parentID: string,
+  now: number,
+  pinned?: (session: Session) => boolean,
+) =>
+  (sessions ?? [])
+    .filter((session) => session.parentID === parentID && !session.time?.archived)
+    .sort(sortSessions(now, pinned))
 
 export const childSessionCount = (sessions: Session[] | undefined, parentID: string) =>
   (sessions ?? []).filter((session) => session.parentID === parentID && !session.time?.archived).length

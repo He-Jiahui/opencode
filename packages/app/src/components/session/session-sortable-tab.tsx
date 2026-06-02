@@ -9,6 +9,7 @@ import { getFilename } from "@opencode-ai/core/util/path"
 import { useFile } from "@/context/file"
 import { useLanguage } from "@/context/language"
 import { useCommand } from "@/context/command"
+import { FilePathContextMenu } from "@/components/file-path-context-menu"
 
 export function FileVisual(props: { path: string; active?: boolean }): JSX.Element {
   return (
@@ -40,7 +41,7 @@ export function SortableTab(props: { tab: string; onTabClose: (tab: string) => v
   })
   return (
     <div use:sortable class="h-full flex items-center" classList={{ "opacity-0": sortable.isActiveDraggable }}>
-      <div class="relative">
+      <FilePathContextMenu target={path() ? { path: path()!, type: "file" } : undefined}>
         <Tabs.Trigger
           value={props.tab}
           closeButton={
@@ -64,7 +65,7 @@ export function SortableTab(props: { tab: string; onTabClose: (tab: string) => v
         >
           <Show when={content()}>{(value) => value()}</Show>
         </Tabs.Trigger>
-      </div>
+      </FilePathContextMenu>
     </div>
   )
 }

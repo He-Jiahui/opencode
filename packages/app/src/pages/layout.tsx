@@ -27,7 +27,7 @@ import { Tooltip } from "@opencode-ai/ui/tooltip"
 import { DropdownMenu } from "@opencode-ai/ui/dropdown-menu"
 import { Dialog } from "@opencode-ai/ui/dialog"
 import { getFilename } from "@opencode-ai/core/util/path"
-import { Session, type Message } from "@opencode-ai/sdk/v2/client"
+import { Session, type Message, type Part } from "@opencode-ai/sdk/v2/client"
 import { usePlatform } from "@/context/platform"
 import { useSettings } from "@/context/settings"
 import { createStore, produce, reconcile } from "solid-js/store"
@@ -56,6 +56,7 @@ import { createAim } from "@/utils/aim"
 import { setNavigate } from "@/utils/notification-click"
 import { Worktree as WorktreeState } from "@/utils/worktree"
 import { setSessionHandoff } from "@/pages/session/handoff"
+import { sessionTitle } from "@/utils/session-title"
 
 import { useDialog } from "@opencode-ai/ui/context/dialog"
 import { useTheme, type ColorScheme } from "@opencode-ai/ui/theme/context"
@@ -101,6 +102,7 @@ export default function Layout(props: ParentProps) {
       workspaceName: {} as Record<string, string>,
       workspaceBranchName: {} as Record<string, Record<string, string>>,
       workspaceExpanded: {} as Record<string, boolean>,
+      pinnedSession: {} as Record<string, boolean>,
       gettingStartedDismissed: false,
     }),
   )
@@ -642,7 +644,7 @@ export default function Layout(props: ParentProps) {
     const result: Session[] = []
     for (const dir of dirs) {
       const [dirStore] = serverSync.child(dir, { bootstrap: true })
-      const dirSessions = sortedRootSessions(dirStore, now)
+      const dirSessions = sortedRootSessions(dirStore, now, sessionPinned)
       result.push(...dirSessions)
     }
     return result
@@ -997,6 +999,83 @@ export default function Layout(props: ParentProps) {
         navigate(`/${params.dir}/session`)
       }
     }
+  }
+
+  async function renameSession(session: Session, title: string) {
+    const [, setStore] = serverSync.child(session.directory)
+    await serverSDK.client.session.update({
+      directory: session.directory,
+      sessionID: session.id,
+      title,
+    })
+    setStore("session", (items) => items.map((item) => (item.id === session.id ? { ...item, title } : item)))
+  }
+
+  const sessionPinned = (session: Session) => store.pinnedSession[`${pathKey(session.directory)}:${session.id}`] === true
+  const togglePinSession = (session: Session) => {
+    const key = `${pathKey(session.directory)}:${session.id}`
+    setStore("pinnedSession", key, !store.pinnedSession[key])
+  }
+
+  const loadExportMessages = async (session: Session) => {
+    const messages: Array<{ info: Message; parts: Part[] }> = []
+    const seen = new Set<string>()
+    const limit = 200
+    let before: string | undefined
+
+    for (let page = 0; page < 500; page++) {
+      const response = await retry(() =>
+        serverSDK.client.session.messages({
+          directory: session.directory,
+          sessionID: session.id,
+          limit,
+          ...(before ? { before } : {}),
+        }),
+      )
+      const items = (response.data ?? []).filter((item) => !!item?.info?.id)
+      for (const item of items) {
+        if (seen.has(item.info.id)) continue
+        seen.add(item.info.id)
+        messages.push({
+          info: item.info,
+          parts: item.parts ?? [],
+        })
+      }
+
+      const next = response.response.headers.get("x-next-cursor") ?? undefined
+      if (!next || next === before || items.length === 0)
+        return messages.sort((a, b) => (a.info.id < b.info.id ? -1 : a.info.id > b.info.id ? 1 : 0))
+      before = next
+    }
+
+    return messages.sort((a, b) => (a.info.id < b.info.id ? -1 : a.info.id > b.info.id ? 1 : 0))
+  }
+
+  const exportSession = async (session: Session) => {
+    await loadExportMessages(session)
+      .then((messages) => {
+        const title = sessionTitle(session.title) ?? session.id
+        const filename = `${title.replace(/[<>:"/\\|?*\x00-\x1f]+/g, "_").slice(0, 80) || session.id}.json`
+        const blob = new Blob([JSON.stringify({ info: session, messages }, null, 2)], { type: "application/json" })
+        const url = URL.createObjectURL(blob)
+        const link = document.createElement("a")
+        link.href = url
+        link.download = filename
+        link.click()
+        URL.revokeObjectURL(url)
+        showToast({
+          variant: "success",
+          title: language.t("session.context.exported"),
+          description: filename,
+        })
+      })
+      .catch((error) => {
+        showToast({
+          variant: "error",
+          title: language.t("session.context.exportFailed"),
+          description: errorMessage(error, language.t("common.requestFailed")),
+        })
+      })
   }
 
   command.register("layout", () => {
@@ -1993,6 +2072,10 @@ export default function Layout(props: ParentProps) {
     clearHoverProjectSoon,
     prefetchSession,
     archiveSession,
+    renameSession,
+    togglePinSession,
+    exportSession,
+    sessionPinned,
     workspaceName,
     renameWorkspace,
     editorOpen,
@@ -2039,6 +2122,10 @@ export default function Layout(props: ParentProps) {
       clearHoverProjectSoon,
       prefetchSession,
       archiveSession,
+      renameSession,
+      togglePinSession,
+      exportSession,
+      sessionPinned,
     },
   }
 

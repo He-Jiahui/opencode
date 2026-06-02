@@ -168,6 +168,7 @@ export type SessionAction = (input: { sessionID: string; messageID: string }) =>
 export type UserActions = {
   fork?: SessionAction
   revert?: SessionAction
+  renderFileReference?: (input: { path: string; type: "file"; children: JSX.Element }) => JSX.Element
 }
 
 export interface MessagePartProps {
@@ -1125,7 +1126,7 @@ export function UserMessageDisplay(props: { message: UserMessage; parts: PartTyp
               const type = kind(file)
               const name = file.filename ?? i18n.t("ui.message.attachment.alt")
 
-              return (
+              const content = (
                 <div
                   data-slot="user-message-attachment"
                   data-type={type}
@@ -1148,6 +1149,9 @@ export function UserMessageDisplay(props: { message: UserMessage; parts: PartTyp
                   </Show>
                 </div>
               )
+              return type === "file"
+                ? renderFileReference(props.actions, { path: referencePath(file) ?? name, children: content })
+                : content
             }}
           </For>
         </div>
@@ -1156,7 +1160,7 @@ export function UserMessageDisplay(props: { message: UserMessage; parts: PartTyp
         <>
           <div data-slot="user-message-body">
             <div data-slot="user-message-text">
-              <HighlightedText text={text()} references={inlineFiles()} agents={agents()} />
+              <HighlightedText text={text()} references={inlineFiles()} agents={agents()} actions={props.actions} />
             </div>
           </div>
           <div data-slot="user-message-copy-wrapper">
@@ -1219,16 +1223,35 @@ export function UserMessageDisplay(props: { message: UserMessage; parts: PartTyp
   )
 }
 
-type HighlightSegment = { text: string; type?: "file" | "agent" }
+type HighlightSegment = { text: string; type?: "file" | "agent"; path?: string }
 
-function HighlightedText(props: { text: string; references: FilePart[]; agents: AgentPart[] }) {
+function referencePath(part: FilePart) {
+  if (part.source && "path" in part.source) return part.source.path
+  const value = part.source?.text?.value
+  return value?.startsWith("@") ? value.slice(1) : value
+}
+
+function renderFileReference(
+  actions: UserActions | undefined,
+  input: { path: string | undefined; children: JSX.Element },
+) {
+  if (!input.path) return input.children
+  return actions?.renderFileReference?.({ path: input.path, type: "file", children: input.children }) ?? input.children
+}
+
+function HighlightedText(props: { text: string; references: FilePart[]; agents: AgentPart[]; actions?: UserActions }) {
   const segments = createMemo(() => {
     const text = props.text
 
-    const allRefs: { start: number; end: number; type: "file" | "agent" }[] = [
+    const allRefs: { start: number; end: number; type: "file" | "agent"; path?: string }[] = [
       ...props.references
         .filter((r) => r.source?.text?.start !== undefined && r.source?.text?.end !== undefined)
-        .map((r) => ({ start: r.source!.text!.start, end: r.source!.text!.end, type: "file" as const })),
+        .map((r) => ({
+          start: r.source!.text!.start,
+          end: r.source!.text!.end,
+          type: "file" as const,
+          path: referencePath(r),
+        })),
       ...props.agents
         .filter((a) => a.source?.start !== undefined && a.source?.end !== undefined)
         .map((a) => ({ start: a.source!.start, end: a.source!.end, type: "agent" as const })),
@@ -1255,7 +1278,15 @@ function HighlightedText(props: { text: string; references: FilePart[]; agents: 
     return result
   })
 
-  return <For each={segments()}>{(segment) => <span data-highlight={segment.type}>{segment.text}</span>}</For>
+  return (
+    <For each={segments()}>
+      {(segment) => {
+        const content = <span data-highlight={segment.type}>{segment.text}</span>
+        if (segment.type !== "file") return content
+        return renderFileReference(props.actions, { path: segment.path, children: content })
+      }}
+    </For>
+  )
 }
 
 export function Part(props: MessagePartProps) {

@@ -689,6 +689,13 @@ export const dict = {
   "session.header.open.app.androidStudio": "Android Studio",
   "session.header.open.app.powershell": "PowerShell",
   "session.header.open.app.sublimeText": "Sublime Text",
+  "file.context.openDefault": "Open",
+  "file.context.openFolder": "Open folder",
+  "session.context.pin": "Pin",
+  "session.context.unpin": "Unpin",
+  "session.context.saveLocal": "Save transcript locally",
+  "session.context.exported": "Session transcript saved",
+  "session.context.exportFailed": "Failed to save session transcript",
 
   "status.popover.trigger": "Status",
   "status.popover.ariaLabel": "Server configurations",

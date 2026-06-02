@@ -117,6 +117,8 @@ const fullscreenFitViewOptions = {
   maxZoom: 1.15,
 }
 
+const workflowPreviewLimit = 1200
+
 export function mountWorkflowReactFlow(container: HTMLElement, props: WorkflowReactFlowProps): WorkflowReactFlowInstance {
   const root = createRoot(container)
   renderWorkflow(root, props)
@@ -319,16 +321,18 @@ function displayEdge(kind: WorkflowFlowEdgeKind, from: string, to: string): Work
 
 function edgeTooltip(edge: WorkflowGraph["edges"][number]) {
   if (edge.kind === "consultation") {
-    return [
-      edge.summary,
-      edge.question ? `Question:\n${edge.question}` : undefined,
-      edge.answer ? `Answer:\n${edge.answer}` : undefined,
-    ]
-      .filter(Boolean)
-      .join("\n\n")
+    return previewText(
+      [
+        edge.summary,
+        edge.question ? `Question:\n${edge.question}` : undefined,
+        edge.answer ? `Answer:\n${edge.answer}` : undefined,
+      ]
+        .filter(Boolean)
+        .join("\n\n"),
+    )
   }
-  if (edge.kind === "document") return [edge.summary, edge.path].filter(Boolean).join("\n\n")
-  return edge.summary
+  if (edge.kind === "document") return previewText([edge.summary, edge.path].filter(Boolean).join("\n\n"))
+  return previewText(edge.summary)
 }
 
 function uniqueEdges(edges: WorkflowDisplayEdge[]) {
@@ -375,7 +379,7 @@ function workflowNodeData(
       label: milestone?.department ?? milestoneLabel,
       status: milestone?.status ?? node.status,
       summary: milestone?.attempt ? `#${milestone.attempt}` : undefined,
-      prompt: milestone?.prompt,
+      prompt: previewText(milestone?.prompt),
       sessionID: node.sessionID,
       sessionState: state,
       currentSession,
@@ -392,7 +396,7 @@ function workflowNodeData(
       title: node.title,
       label: roleLabel(node.role ?? "requester"),
       status: node.status ?? workflowStatus,
-      prompt: workflowRequest,
+      prompt: node.role === "requester" || node.role === "main_pm" ? previewText(workflowRequest) : undefined,
       sessionID: node.sessionID,
       sessionState: state,
       currentSession,
@@ -410,7 +414,7 @@ function workflowNodeData(
       department: milestone?.department ?? session?.milestone.department,
       label: workflowDocumentLabel(documentKind),
       summary: node.role ? roleLabel(node.role) : undefined,
-      prompt: [node.summary, node.path].filter(Boolean).join("\n\n"),
+      prompt: previewText([node.summary, node.path].filter(Boolean).join("\n\n")),
       sessionID: node.sessionID,
       sessionState: state,
       currentSession,
@@ -428,7 +432,7 @@ function workflowNodeData(
     title: session?.milestone.title ?? node.title,
     label: roleLabel(role ?? "main_pm"),
     summary: node.summary ?? (session?.session.attempt ? `#${session.session.attempt}` : undefined),
-    prompt: node.summary ?? session?.milestone.prompt ?? workflowRequest,
+    prompt: previewText(node.summary ?? session?.milestone.prompt),
     sessionID: node.sessionID,
     sessionState: state,
     currentSession,
@@ -803,6 +807,13 @@ function workflowDocumentLabel(kind: WorkflowFlowNodeData["documentKind"]) {
   if (kind === "standup") return "Standup"
   if (kind === "summary") return "Summary"
   return "Document"
+}
+
+function previewText(value: string | undefined) {
+  if (!value) return undefined
+  const trimmed = value.trim()
+  if (trimmed.length <= workflowPreviewLimit) return trimmed
+  return `${trimmed.slice(0, workflowPreviewLimit)}...`
 }
 
 function statusTone(status: string | undefined) {

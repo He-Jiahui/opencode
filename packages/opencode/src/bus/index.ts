@@ -11,6 +11,9 @@ import type { InstanceContext } from "@/project/instance-context"
 import { InstanceRef } from "@/effect/instance-ref"
 
 const log = Log.create({ service: "bus" })
+// SSE clients can stall while large workflow graph events are being rendered; keep only recent events instead of
+// retaining an unbounded per-subscriber backlog.
+const EVENT_QUEUE_CAPACITY = 2048
 
 type BusProperties<D extends BusEvent.Definition<string, Schema.Top>> = Schema.Schema.Type<D["properties"]>
 
@@ -64,7 +67,7 @@ export const layer = Layer.effect(
   Effect.gen(function* () {
     const state = yield* InstanceState.make<State>(
       Effect.fn("Bus.state")(function* (ctx) {
-        const wildcard = yield* PubSub.unbounded<Payload>()
+        const wildcard = yield* PubSub.sliding<Payload>(EVENT_QUEUE_CAPACITY)
         const typed = new Map<string, PubSub.PubSub<Payload>>()
 
         yield* Effect.addFinalizer(() =>
@@ -90,7 +93,7 @@ export const layer = Layer.effect(
       return Effect.gen(function* () {
         let ps = state.typed.get(def.type)
         if (!ps) {
-          ps = yield* PubSub.unbounded<Payload>()
+          ps = yield* PubSub.sliding<Payload>(EVENT_QUEUE_CAPACITY)
           state.typed.set(def.type, ps)
         }
         return ps as unknown as PubSub.PubSub<Payload<D>>

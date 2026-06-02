@@ -6,6 +6,8 @@ import { ConfigProvider, Context, Effect, Exit, Layer, Scope } from "effect"
 import { HttpRouter, HttpServer } from "effect/unstable/http"
 import { OpenApi } from "effect/unstable/httpapi"
 import { createServer } from "node:http"
+import { appendFileSync, mkdirSync, writeFileSync } from "node:fs"
+import { join } from "node:path"
 import { MDNS } from "./mdns"
 import { HttpApiApp } from "./routes/instance/httpapi/server"
 import { disposeMiddleware } from "./routes/instance/httpapi/lifecycle"
@@ -190,6 +192,7 @@ function forceClose(state: ListenerState) {
 
 function serverLayer(opts: { port: number; hostname: string }) {
   const server = createServer()
+  installServerDiagnostics(server)
   const serverRef = { closeStarted: false, forceStop: false }
   const close = server.close.bind(server)
   // Keep shutdown owned by NodeHttpServer, but honor listener.stop(true) by
@@ -213,6 +216,111 @@ function serverLayer(opts: { port: number; hostname: string }) {
       }),
     ),
   )
+}
+
+type HttpDiagnosticRequest = {
+  id: number
+  method: string
+  url: string
+  started: number
+  socketBytes: number
+}
+
+function installServerDiagnostics(server: ReturnType<typeof createServer>) {
+  const dir = process.env.OPENCODE_SIDECAR_DIAGNOSTIC_DIR
+  if (!dir) return
+  const active = new Map<number, HttpDiagnosticRequest>()
+  const file = join(dir, "http.jsonl")
+  const activeFile = join(dir, "http-active.jsonl")
+  const latestFile = join(dir, "latest-http-active.json")
+  let next = 0
+  try {
+    mkdirSync(dir, { recursive: true })
+  } catch {}
+  const interval = setInterval(() => {
+    if (active.size === 0) return
+    const record = {
+      type: "active",
+      at: new Date().toISOString(),
+      active: active.size,
+      memory: diagnosticMemory(),
+      requests: Array.from(active.values()).map((item) => ({
+        id: item.id,
+        method: item.method,
+        url: item.url,
+        ageMS: Math.round(performance.now() - item.started),
+      })),
+    }
+    appendDiagnostic(activeFile, record)
+    writeDiagnostic(latestFile, record)
+  }, 5000)
+  interval.unref?.()
+  server.on("request", (request, response) => {
+    const item = {
+      id: ++next,
+      method: request.method ?? "UNKNOWN",
+      url: request.url ?? "",
+      started: performance.now(),
+      socketBytes: request.socket.bytesWritten,
+    }
+    active.set(item.id, item)
+    appendDiagnostic(file, {
+      type: "start",
+      at: new Date().toISOString(),
+      id: item.id,
+      method: item.method,
+      url: item.url,
+      active: active.size,
+      memory: diagnosticMemory(),
+    })
+    const finish = (event: "finish" | "close") => {
+      if (!active.delete(item.id)) return
+      const durationMS = Math.round(performance.now() - item.started)
+      const responseBytes = Math.max(0, request.socket.bytesWritten - item.socketBytes)
+      const record = {
+        type: "end",
+        event,
+        at: new Date().toISOString(),
+        id: item.id,
+        method: item.method,
+        url: item.url,
+        status: response.statusCode,
+        durationMS,
+        responseBytes,
+        active: active.size,
+        memory: diagnosticMemory(),
+      }
+      appendDiagnostic(file, record)
+      if (active.size > 20 || responseBytes > 10 * 1024 * 1024 || durationMS > 10000) {
+        console.warn("[server-http]", JSON.stringify(record))
+      }
+    }
+    response.once("finish", () => finish("finish"))
+    response.once("close", () => finish("close"))
+  })
+}
+
+function diagnosticMemory() {
+  const memory = process.memoryUsage()
+  return {
+    rss: memory.rss,
+    heapTotal: memory.heapTotal,
+    heapUsed: memory.heapUsed,
+    external: memory.external,
+    arrayBuffers: memory.arrayBuffers,
+  }
+}
+
+function appendDiagnostic(file: string, record: unknown) {
+  try {
+    appendFileSync(file, JSON.stringify(record) + "\n")
+  } catch {}
+}
+
+function writeDiagnostic(file: string, record: unknown) {
+  try {
+    writeFileSync(file, JSON.stringify(record, null, 2))
+  } catch {}
 }
 
 export * as Server from "./server"

@@ -214,7 +214,8 @@ export function applyDirectoryEvent(input: {
       break
     }
     case "workflow.graph.updated": {
-      const graph = (event.properties as { graph: WorkflowGraph }).graph
+      const graph = (event.properties as { graph?: WorkflowGraph }).graph
+      if (!graph) break
       input.setStore("workflow_graph", graph.workflow.id, reconcile(graph))
       const result = Binary.search(input.store.workflow, graph.workflow.id, (item) => item.id)
       if (result.found) {

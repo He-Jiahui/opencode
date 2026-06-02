@@ -331,7 +331,7 @@ const main = Effect.gen(function* () {
         onSqliteProgress: (progress) => initEmitter.emit("sqlite", progress),
         onStdout: (message) => writeLog("server", "stdout", { message }),
         onStderr: (message) => writeLog("server", "stderr", { message }, "warn"),
-        onExit: (code) => writeLog("utility", "sidecar exited", { code }, "warn"),
+        onExit: (code, diagnostics) => writeLog("utility", "sidecar exited", { code, diagnostics }, "warn"),
       }),
     )
     server = listener

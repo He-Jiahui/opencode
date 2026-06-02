@@ -9,6 +9,7 @@ export type Event =
   | EventTuiCommandExecute
   | EventTuiToastShow1
   | EventTuiSessionSelect
+  | EventWorkflowToolCommand
   | EventServerConnected
   | EventGlobalDisposed
   | EventServerInstanceDisposed
@@ -176,6 +177,45 @@ export type EventTuiSessionSelect = {
      */
     sessionID: string
   }
+}
+
+export type WorkflowToolCommand = {
+  action: "status" | "resume" | "block" | "update_xml" | "milestone_status" | "workflow_status" | "complete"
+  workflowID?: string
+  sourceSessionID: string
+  sourceAgent?: string
+  milestoneID?: string
+  milestoneStatus?:
+    | "pending"
+    | "planning"
+    | "executing"
+    | "reviewing"
+    | "rejected"
+    | "approved"
+    | "blocked"
+    | "testing"
+    | "done"
+    | "failed"
+    | "skipped"
+    | "running"
+    | "completed"
+    | "cancelled"
+  workflowStatus?:
+    | "pending"
+    | "running"
+    | "planning"
+    | "dispatching"
+    | "executing"
+    | "reviewing"
+    | "testing"
+    | "accepting"
+    | "blocked"
+    | "completed"
+    | "failed"
+    | "cancelled"
+  targetRole?: "requester" | "main_pm" | "department_pm" | "executor" | "reviewer" | "tester" | "expert"
+  xml?: string
+  message?: string
 }
 
 export type PermissionRequest = {
@@ -581,7 +621,7 @@ export type WorkflowGraph = {
 
 export type WorkflowGraphUpdatedEvent = {
   workflowID: string
-  graph: WorkflowGraph
+  graph?: WorkflowGraph
 }
 
 export type Pty = {
@@ -1018,6 +1058,7 @@ export type GlobalEvent = {
     | EventTuiCommandExecute
     | EventTuiToastShow
     | EventTuiSessionSelect
+    | EventWorkflowToolCommand
     | EventServerConnected
     | EventGlobalDisposed
     | EventServerInstanceDisposed
@@ -2855,6 +2896,12 @@ export type SyncEventSessionNextCompactionEnded = {
     text: string
     include?: string
   }
+}
+
+export type EventWorkflowToolCommand = {
+  id: string
+  type: "workflow.tool.command"
+  properties: WorkflowToolCommand
 }
 
 export type EventServerConnected = {

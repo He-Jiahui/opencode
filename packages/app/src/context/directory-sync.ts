@@ -189,6 +189,9 @@ export const createDirSyncContext = (directory: string, serverSync: ReturnType<t
   const inflight = new Map<string, Promise<void>>()
   const inflightDiff = new Map<string, Promise<void>>()
   const inflightTodo = new Map<string, Promise<void>>()
+  const inflightSessionList = new Map<string, Promise<void>>()
+  const inflightWorkflow = new Map<string, Promise<void>>()
+  const inflightWorkflowGraph = new Map<string, Promise<void>>()
   const optimistic = new Map<string, Map<string, OptimisticItem>>()
   const maxDirs = 30
   const seen = new Map<string, Set<string>>()
@@ -583,50 +586,57 @@ export const createDirSyncContext = (directory: string, serverSync: ReturnType<t
         evict(_directory, setStore, [sessionID])
       },
       fetch: async (count = 10) => {
-        const [store, setStore] = serverSync.child(directory)
+        const [, setStore] = serverSync.child(directory)
         setStore("limit", (x) => x + count)
-        await client.session.list().then((x) => {
-          const sessions = (x.data ?? [])
-            .filter((s) => !!s?.id)
-            .sort((a, b) => cmp(a.id, b.id))
-            .slice(0, store.limit)
-          setStore("session", reconcile(sessions, { key: "id" }))
+        return runInflight(inflightSessionList, directory, async () => {
+          const [store, setStore] = serverSync.child(directory)
+          await client.session.list().then((x) => {
+            const sessions = (x.data ?? [])
+              .filter((s) => !!s?.id)
+              .sort((a, b) => cmp(a.id, b.id))
+              .slice(0, store.limit)
+            setStore("session", reconcile(sessions, { key: "id" }))
+          })
         })
       },
       more: createMemo(() => current()[0].session.length >= current()[0].limit),
       workflow: async (sessionID?: string, opts?: { force?: boolean }) => {
-        const [store, setStore] = serverSync.child(directory)
-        if (sessionID) {
-          if (
-            store.workflow.some(
-              (workflow) =>
-                workflow.rootSessionID === sessionID ||
-                workflow.pmSessionID === sessionID ||
-                workflow.testerSessionID === sessionID ||
-                store.workflow_graph[workflow.id]?.members?.some((member) => member.sessionID === sessionID) ||
-                store.workflow_graph[workflow.id]?.milestones?.some((milestone) =>
-                  milestone.session?.some((ref) => ref.sessionID === sessionID),
-                ),
-            ) &&
-            !opts?.force
-          )
+        return runInflight(inflightWorkflow, keyFor(directory, sessionID ?? "all"), async () => {
+          const [store, setStore] = serverSync.child(directory)
+          if (sessionID) {
+            if (
+              store.workflow.some(
+                (workflow) =>
+                  workflow.rootSessionID === sessionID ||
+                  workflow.pmSessionID === sessionID ||
+                  workflow.testerSessionID === sessionID ||
+                  store.workflow_graph[workflow.id]?.members?.some((member) => member.sessionID === sessionID) ||
+                  store.workflow_graph[workflow.id]?.milestones?.some((milestone) =>
+                    milestone.session?.some((ref) => ref.sessionID === sessionID),
+                  ),
+              ) &&
+              !opts?.force
+            )
+              return
+            await client.workflow.list({ sessionID }).then((x) => {
+              setStore("workflow", reconcile(merge(store.workflow, x.data ?? []), { key: "id" }))
+            })
             return
-          await client.workflow.list({ sessionID }).then((x) => {
-            setStore("workflow", reconcile(merge(store.workflow, x.data ?? []), { key: "id" }))
+          }
+          if (store.workflow.length > 0 && !opts?.force) return
+          await client.workflow.list().then((x) => {
+            setStore("workflow", reconcile(x.data ?? [], { key: "id" }))
           })
-          return
-        }
-        if (store.workflow.length > 0 && !opts?.force) return
-        await client.workflow.list().then((x) => {
-          setStore("workflow", reconcile(x.data ?? [], { key: "id" }))
         })
       },
       workflowGraph: async (workflowID: string, opts?: { force?: boolean }) => {
-        const [store, setStore] = serverSync.child(directory)
-        if (store.workflow_graph[workflowID] !== undefined && !opts?.force) return
-        await client.workflow.graph({ workflowID }).then((x) => {
-          if (!x.data) return
-          setStore("workflow_graph", workflowID, reconcile(x.data))
+        return runInflight(inflightWorkflowGraph, keyFor(directory, workflowID), async () => {
+          const [store, setStore] = serverSync.child(directory)
+          if (store.workflow_graph[workflowID] !== undefined && !opts?.force) return
+          await client.workflow.graph({ workflowID }).then((x) => {
+            if (!x.data) return
+            setStore("workflow_graph", workflowID, reconcile(x.data))
+          })
         })
       },
       archive: async (sessionID: string) => {

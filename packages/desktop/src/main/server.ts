@@ -1,3 +1,4 @@
+import { mkdirSync } from "node:fs"
 import { dirname, join } from "node:path"
 import { fileURLToPath } from "node:url"
 import { app, utilityProcess } from "electron"
@@ -29,7 +30,7 @@ type SpawnLocalServerOptions = {
   onSqliteProgress?: (progress: SqliteMigrationProgress) => void
   onStdout?: (message: string) => void
   onStderr?: (message: string) => void
-  onExit?: (code: number) => void
+  onExit?: (code: number, diagnostics: string) => void
 }
 
 export function getDefaultServerUrl(): string | null {
@@ -73,9 +74,12 @@ export async function spawnLocalServer(
   options: SpawnLocalServerOptions,
 ) {
   const sidecar = join(dirname(fileURLToPath(import.meta.url)), "sidecar.js")
+  const diagnosticDir = sidecarDiagnosticDir(options.userDataPath)
+  options.onStderr?.(`sidecar diagnostics enabled dir=${diagnosticDir}`)
   const child = utilityProcess.fork(sidecar, [], {
     cwd: process.cwd(),
-    env: createSidecarEnv(),
+    env: createSidecarEnv(diagnosticDir),
+    execArgv: sidecarDiagnosticExecArgv(diagnosticDir),
     serviceName: SIDECAR_SERVICE_NAME,
     stdio: "pipe",
   })
@@ -84,14 +88,17 @@ export async function spawnLocalServer(
 
   const onProcessGone = (_event: unknown, details: Details) => {
     if (details.type !== "Utility" || details.name !== SIDECAR_SERVICE_NAME) return
-    options.onStderr?.(`utility process gone reason=${details.reason} exitCode=${details.exitCode}`)
+    options.onStderr?.(
+      `utility process gone reason=${details.reason} exitCode=${details.exitCode} diagnostics=${diagnosticDir}`,
+    )
   }
 
   app.on("child-process-gone", onProcessGone)
   child.once("exit", (code) => {
     exited = true
     app.off("child-process-gone", onProcessGone)
-    options.onExit?.(code)
+    options.onExit?.(code, diagnosticDir)
+    options.onStderr?.(`sidecar exited code=${code} diagnostics=${diagnosticDir}`)
     exit.resolve(code)
   })
   child.on("error", (error) => options.onStderr?.(`utility process error: ${serializeError(error).message}`))
@@ -227,13 +234,39 @@ export async function checkHealth(url: string, password?: string | null): Promis
   }
 }
 
-function createSidecarEnv(): Record<string, string> {
+function createSidecarEnv(diagnosticDir: string): Record<string, string> {
   const env = Object.fromEntries(
     Object.entries(process.env).flatMap(([key, value]) => (value === undefined ? [] : [[key, String(value)]])),
   )
+  env.OPENCODE_SIDECAR_DIAGNOSTIC_DIR = diagnosticDir
   delete env.DEBUG
   if (process.platform === "linux") delete env.LD_PRELOAD
   return env
+}
+
+function sidecarDiagnosticDir(userDataPath: string) {
+  const dir = join(userDataPath, "opencode", "log", "diagnostics", stamp())
+  mkdirSync(dir, { recursive: true })
+  return dir
+}
+
+function sidecarDiagnosticExecArgv(diagnosticDir: string) {
+  if (process.env.OPENCODE_SIDECAR_DIAGNOSTICS === "0") return []
+  return [
+    `--diagnostic-dir=${diagnosticDir}`,
+    `--report-directory=${diagnosticDir}`,
+    "--report-on-fatalerror",
+    "--report-uncaught-exception",
+    "--heapsnapshot-near-heap-limit=2",
+    `--redirect-warnings=${join(diagnosticDir, "warnings.log")}`,
+  ]
+}
+
+function stamp() {
+  return new Date()
+    .toISOString()
+    .replace(/[-:]/g, "")
+    .replace(/\.\d+Z$/, "")
 }
 
 function delay(ms: number) {

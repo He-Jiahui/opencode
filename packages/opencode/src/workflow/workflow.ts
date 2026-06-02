@@ -1,4 +1,5 @@
 import path from "path"
+import { appendFileSync, mkdirSync } from "fs"
 import { cp, mkdir, readFile, stat, writeFile } from "fs/promises"
 
 import { serviceUse } from "@opencode-ai/core/effect/service-use"
@@ -300,7 +301,7 @@ const NodeUpdatedPayload = Schema.Struct({
 
 const GraphUpdatedPayload = Schema.Struct({
   workflowID: WorkflowID,
-  graph: WorkflowGraph,
+  graph: Schema.optional(WorkflowGraph),
 }).annotate({ identifier: "WorkflowGraphUpdatedEvent" })
 
 export const Event = {
@@ -370,6 +371,62 @@ function workflowAutorunEnabled() {
   return value !== "0" && value !== "false"
 }
 
+function workflowGraphDocumentsEnabled() {
+  const value = process.env.OPENCODE_WORKFLOW_GRAPH_DOCUMENTS?.toLowerCase()
+  if (value === "1" || value === "true") return true
+  if (value === "0" || value === "false") return false
+  return process.env.NODE_ENV === "test"
+}
+
+function recordWorkflowGraphDiagnostic(graph: WorkflowGraph) {
+  const dir = process.env.OPENCODE_SIDECAR_DIAGNOSTIC_DIR
+  if (!dir) return
+  const record = {
+    at: new Date().toISOString(),
+    workflowID: graph.workflow.id,
+    status: graph.workflow.status,
+    nodes: graph.nodes.length,
+    edges: graph.edges.length,
+    milestones: graph.milestones.length,
+    members: graph.members.length,
+    consultations: graph.consultations.length,
+    interventions: graph.interventions.length,
+    nodeTypes: countGraphValues(graph.nodes.map((node) => node.type)),
+    edgeKinds: countGraphValues(graph.edges.map((edge) => edge.kind ?? "unknown")),
+    approxTextBytes:
+      byteLength(graph.workflow.title) +
+      byteLength(graph.workflow.request) +
+      graph.nodes.reduce((sum, node) => sum + byteLength(node.title) + byteLength(node.summary ?? ""), 0) +
+      graph.edges.reduce(
+        (sum, edge) =>
+          sum +
+          byteLength(edge.label ?? "") +
+          byteLength(edge.summary ?? "") +
+          byteLength(edge.question ?? "") +
+          byteLength(edge.answer ?? ""),
+        0,
+      ),
+  }
+  try {
+    mkdirSync(dir, { recursive: true })
+    appendFileSync(path.join(dir, "workflow-graph.jsonl"), JSON.stringify(record) + "\n")
+  } catch {}
+  if (graph.nodes.length > 500 || graph.edges.length > 1_500 || record.approxTextBytes > 10 * 1024 * 1024) {
+    console.warn("[workflow-graph]", JSON.stringify(record))
+  }
+}
+
+function countGraphValues(values: string[]) {
+  return values.reduce<Record<string, number>>((acc, value) => {
+    acc[value] = (acc[value] ?? 0) + 1
+    return acc
+  }, {})
+}
+
+function byteLength(value: string) {
+  return Buffer.byteLength(value)
+}
+
 function staffLimitForRole(staffing: WorkflowStaffingConfig | undefined, role: WorkflowSessionRef["role"]) {
   const config = normalizeStaffing(staffing)
   if (role === "main_pm") return config.mainPM
@@ -412,7 +469,28 @@ export function selectWorkflowMember(input: {
   const available = active
     .slice(0, input.limit === undefined ? active.length : Math.max(0, Math.trunc(input.limit)))
     .filter((member) => !busySessions.has(member.sessionID))
-  return available.find((member) => member.specialty === input.specialty) ?? available[0]
+  const continuity = input.excludeMilestoneID
+    ? available.find((member) =>
+        input.milestones.some(
+          (milestone) =>
+            milestone.id === input.excludeMilestoneID &&
+            milestone.session.some((ref) => ref.role === input.role && ref.sessionID === member.sessionID),
+        ),
+      )
+    : undefined
+  if (continuity) return continuity
+  const assignments = new Map<SessionID, number>()
+  input.milestones
+    .flatMap((milestone) => milestone.session)
+    .filter((ref) => ref.role === input.role)
+    .forEach((ref) => assignments.set(ref.sessionID, (assignments.get(ref.sessionID) ?? 0) + 1))
+  return available.toSorted((a, b) => {
+    const load = (assignments.get(a.sessionID) ?? 0) - (assignments.get(b.sessionID) ?? 0)
+    if (load !== 0) return load
+    const specialty = Number(b.specialty === input.specialty) - Number(a.specialty === input.specialty)
+    if (specialty !== 0) return specialty
+    return a.time.created - b.time.created || a.id.localeCompare(b.id)
+  })[0]
 }
 
 function roleSpecialty(role: WorkflowSessionRef["role"], specialty?: string) {
@@ -2103,6 +2181,7 @@ function graphFrom(
   interventions: WorkflowInterventionInfo[],
   standupDocs: WorkflowStandupDoc[],
 ): WorkflowGraph {
+  const includeDocumentGraph = workflowGraphDocumentsEnabled()
   const memberNodeID = (member: WorkflowMemberInfo) => `${info.id}:member:${member.id}`
   const mainMember = members.find((member) => member.role === "main_pm" && member.sessionID === info.pmSessionID)
   const testerMember = members.find((member) => member.role === "tester" && member.sessionID === info.testerSessionID)
@@ -2113,44 +2192,46 @@ function graphFrom(
   const testerID = testerMember ? memberNodeID(testerMember) : `${info.id}:tester`
   const expertID = expertMember ? memberNodeID(expertMember) : `${info.id}:expert`
   const libraryID = `${info.id}:reference`
-  const operationDocs = [
-    {
-      id: `${info.id}:organization`,
-      title: "Company organization",
-      path: workflowArtifactPath(info, "organization.md"),
-      summary: "Company staffing limits, long-lived employee roles, responsibilities, and current assignments.",
-    },
-    {
-      id: `${info.id}:progress`,
-      title: "Workflow progress",
-      path: workflowArtifactPath(info, "progress.md"),
-      summary: "Live workflow state, active milestones, staff assignments, interventions, and supervision notes.",
-    },
-    {
-      id: `${info.id}:main-plan`,
-      title: "Main PM plan",
-      path: workflowArtifactPath(info, "main-plan.md"),
-      summary: "Main product manager high-level plan and linked workflow file index.",
-    },
-    {
-      id: `${info.id}:workflow-xml`,
-      title: "Workflow XML",
-      path: workflowArtifactPath(info, "workflow.xml"),
-      summary: "Canonical ordered and parallel workflow scheduling definition.",
-    },
-    {
-      id: `${info.id}:archive-index`,
-      title: "Local archive index",
-      path: workflowArtifactPath(info, "index.md"),
-      summary: "Local workflow artifact index with archived session records.",
-    },
-    {
-      id: `${info.id}:delivery-summary`,
-      title: "Delivery summary",
-      path: workflowArtifactPath(info, workflowDeliverySummaryPath()),
-      summary: "Workflow final state, milestone outcomes, review gates, acceptance, and reuse guidance.",
-    },
-  ]
+  const operationDocs = includeDocumentGraph
+    ? [
+        {
+          id: `${info.id}:organization`,
+          title: "Company organization",
+          path: workflowArtifactPath(info, "organization.md"),
+          summary: "Company staffing limits, long-lived employee roles, responsibilities, and current assignments.",
+        },
+        {
+          id: `${info.id}:progress`,
+          title: "Workflow progress",
+          path: workflowArtifactPath(info, "progress.md"),
+          summary: "Live workflow state, active milestones, staff assignments, interventions, and supervision notes.",
+        },
+        {
+          id: `${info.id}:main-plan`,
+          title: "Main PM plan",
+          path: workflowArtifactPath(info, "main-plan.md"),
+          summary: "Main product manager high-level plan and linked workflow file index.",
+        },
+        {
+          id: `${info.id}:workflow-xml`,
+          title: "Workflow XML",
+          path: workflowArtifactPath(info, "workflow.xml"),
+          summary: "Canonical ordered and parallel workflow scheduling definition.",
+        },
+        {
+          id: `${info.id}:archive-index`,
+          title: "Local archive index",
+          path: workflowArtifactPath(info, "index.md"),
+          summary: "Local workflow artifact index with archived session records.",
+        },
+        {
+          id: `${info.id}:delivery-summary`,
+          title: "Delivery summary",
+          path: workflowArtifactPath(info, workflowDeliverySummaryPath()),
+          summary: "Workflow final state, milestone outcomes, review gates, acceptance, and reuse guidance.",
+        },
+      ]
+    : []
   const requesterMemoryID = `${info.id}:requester-memory`
   const interventionIndexID = `${info.id}:interventions`
   const standupIndexID = `${info.id}:standups`
@@ -2160,15 +2241,18 @@ function graphFrom(
     path: workflowArtifactPath(info, workflowRequesterMemoryPath()),
     summary: "Requester strategic direction, latest handoff, intervention history, and acceptance context.",
   }
-  const staffMemoryDocs = members.map((member) => ({
-    id: `${info.id}:staff:${member.id}:memory`,
-    member,
-    title: `${member.title} memory`,
-    path: workflowArtifactPath(info, workflowStaffMemoryPath(member)),
-    summary: `Long-lived staff memory for ${roleSessionTitle(member.role)} ${member.specialty}.`,
-  }))
+  const staffMemoryDocs = includeDocumentGraph
+    ? members.map((member) => ({
+        id: `${info.id}:staff:${member.id}:memory`,
+        member,
+        title: `${member.title} memory`,
+        path: workflowArtifactPath(info, workflowStaffMemoryPath(member)),
+        summary: `Long-lived staff memory for ${roleSessionTitle(member.role)} ${member.specialty}.`,
+      }))
+    : []
   const finalReviewDocs =
-    info.testPath || info.status === "testing" || info.status === "accepting" || info.status === "completed"
+    includeDocumentGraph &&
+    (info.testPath || info.status === "testing" || info.status === "accepting" || info.status === "completed")
       ? [
           {
             id: `${info.id}:test-plan`,
@@ -2196,22 +2280,24 @@ function graphFrom(
           },
         ]
       : []
-  const expertNoteDocs = milestones.flatMap((milestone) =>
-    milestone.session
-      .filter((ref) => ref.role === "expert")
-      .map((ref) => {
-        const attempt = ref.attempt ?? milestone.attempt
-        return {
-          id: `${milestone.id}:expert:${attempt}:document`,
-          milestone,
-          ref,
-          attempt,
-          title: `${milestone.title ?? milestone.id} technical advisor note #${attempt}`,
-          path: workflowArtifactPath(info, workflowExpertNotePath(milestone.id, attempt)),
-          summary: `Technical advisor milestone note for ${milestone.id} attempt ${attempt}.`,
-        }
-      }),
-  )
+  const expertNoteDocs = includeDocumentGraph
+    ? milestones.flatMap((milestone) =>
+        milestone.session
+          .filter((ref) => ref.role === "expert")
+          .map((ref) => {
+            const attempt = ref.attempt ?? milestone.attempt
+            return {
+              id: `${milestone.id}:expert:${attempt}:document`,
+              milestone,
+              ref,
+              attempt,
+              title: `${milestone.title ?? milestone.id} technical advisor note #${attempt}`,
+              path: workflowArtifactPath(info, workflowExpertNotePath(milestone.id, attempt)),
+              summary: `Technical advisor milestone note for ${milestone.id} attempt ${attempt}.`,
+            }
+          }),
+      )
+    : []
   const sessionNodeID = (milestone: WorkflowMilestoneInfo, session: WorkflowSessionRef) =>
     members.find((member) => member.sessionID === session.sessionID && member.role === session.role)
       ? memberNodeID(members.find((member) => member.sessionID === session.sessionID && member.role === session.role)!)
@@ -2225,27 +2311,31 @@ function graphFrom(
       milestone.session.map((session) => [session.sessionID, sessionNodeID(milestone, session)] as const),
     ),
   ])
-  const sessionRefs: WorkflowArchiveSessionRef[] = [
-    ...(info.rootSessionID ? [{ role: "requester" as const, sessionID: info.rootSessionID }] : []),
-    ...(info.pmSessionID ? [{ role: "main_pm" as const, sessionID: info.pmSessionID }] : []),
-    ...(info.testerSessionID ? [{ role: "tester" as const, sessionID: info.testerSessionID }] : []),
-    ...members.map((member) => ({ role: member.role, sessionID: member.sessionID })),
-    ...milestones.flatMap((milestone) =>
-      milestone.session.map((ref) => ({
-        ...ref,
-        milestoneID: ref.milestoneID ?? milestone.id,
-      })),
-    ),
-  ]
-  const consultationDocs = consultations.map((consultation) => ({
-    id: `${consultation.id}:document`,
-    consultation,
-    title: `${roleSessionTitle(consultation.fromRole)} to ${roleSessionTitle(consultation.toRole)} consultation`,
-    path: workflowArtifactPath(info, workflowConsultationPath(consultation.id)),
-    summary: compactMarkdown(consultation.question, 240),
-    fromNodeID: sessionNodeIDs.get(consultation.fromSessionID),
-    toNodeID: sessionNodeIDs.get(consultation.toSessionID),
-  }))
+  const sessionRefs: WorkflowArchiveSessionRef[] = includeDocumentGraph
+    ? [
+        ...(info.rootSessionID ? [{ role: "requester" as const, sessionID: info.rootSessionID }] : []),
+        ...(info.pmSessionID ? [{ role: "main_pm" as const, sessionID: info.pmSessionID }] : []),
+        ...(info.testerSessionID ? [{ role: "tester" as const, sessionID: info.testerSessionID }] : []),
+        ...members.map((member) => ({ role: member.role, sessionID: member.sessionID })),
+        ...milestones.flatMap((milestone) =>
+          milestone.session.map((ref) => ({
+            ...ref,
+            milestoneID: ref.milestoneID ?? milestone.id,
+          })),
+        ),
+      ]
+    : []
+  const consultationDocs = includeDocumentGraph
+    ? consultations.map((consultation) => ({
+        id: `${consultation.id}:document`,
+        consultation,
+        title: `${roleSessionTitle(consultation.fromRole)} to ${roleSessionTitle(consultation.toRole)} consultation`,
+        path: workflowArtifactPath(info, workflowConsultationPath(consultation.id)),
+        summary: compactMarkdown(consultation.question, 240),
+        fromNodeID: sessionNodeIDs.get(consultation.fromSessionID),
+        toNodeID: sessionNodeIDs.get(consultation.toSessionID),
+      }))
+    : []
   const sessionByRole = (
     milestone: WorkflowMilestoneInfo,
     attempt: number,
@@ -2283,25 +2373,27 @@ function graphFrom(
           },
         ]
       : []),
-    {
-      id: `${libraryID}->${requesterMemoryID}:document`,
-      from: libraryID,
-      to: requesterMemoryID,
-      kind: "document" as const,
-      label: "requester memory",
-      path: requesterMemoryDoc.path,
-      summary: requesterMemoryDoc.summary,
-    },
-    {
-      id: `${info.id}->${requesterMemoryID}:document`,
-      from: info.id,
-      to: requesterMemoryID,
-      kind: "document" as const,
-      label: "memory",
-      path: requesterMemoryDoc.path,
-      summary: "Strategic owner memory for workflow direction and requester interventions.",
-    },
-    ...operationDocs.flatMap((doc) => [
+    ...(includeDocumentGraph
+      ? [
+          {
+            id: `${libraryID}->${requesterMemoryID}:document`,
+            from: libraryID,
+            to: requesterMemoryID,
+            kind: "document" as const,
+            label: "requester memory",
+            path: requesterMemoryDoc.path,
+            summary: requesterMemoryDoc.summary,
+          },
+          {
+            id: `${info.id}->${requesterMemoryID}:document`,
+            from: info.id,
+            to: requesterMemoryID,
+            kind: "document" as const,
+            label: "memory",
+            path: requesterMemoryDoc.path,
+            summary: "Strategic owner memory for workflow direction and requester interventions.",
+          },
+          ...operationDocs.flatMap((doc) => [
       {
         id: `${libraryID}->${doc.id}:document`,
         from: libraryID,
@@ -2320,26 +2412,26 @@ function graphFrom(
         path: doc.path,
         summary: doc.summary,
       },
-    ]),
-    {
-      id: `${libraryID}->${interventionIndexID}:document`,
-      from: libraryID,
-      to: interventionIndexID,
-      kind: "document" as const,
-      label: "interventions",
-      path: workflowArtifactPath(info, workflowInterventionIndexPath()),
-      summary: "Requester intervention index",
-    },
-    {
-      id: `${libraryID}->${standupIndexID}:document`,
-      from: libraryID,
-      to: standupIndexID,
-      kind: "document" as const,
-      label: "standups",
-      path: workflowArtifactPath(info, workflowStandupIndexPath()),
-      summary: "Main PM workflow standup notes",
-    },
-    ...standupDocs.flatMap((doc) => [
+          ]),
+          {
+            id: `${libraryID}->${interventionIndexID}:document`,
+            from: libraryID,
+            to: interventionIndexID,
+            kind: "document" as const,
+            label: "interventions",
+            path: workflowArtifactPath(info, workflowInterventionIndexPath()),
+            summary: "Requester intervention index",
+          },
+          {
+            id: `${libraryID}->${standupIndexID}:document`,
+            from: libraryID,
+            to: standupIndexID,
+            kind: "document" as const,
+            label: "standups",
+            path: workflowArtifactPath(info, workflowStandupIndexPath()),
+            summary: "Main PM workflow standup notes",
+          },
+          ...standupDocs.flatMap((doc) => [
       {
         id: `${standupIndexID}->${doc.id}:document`,
         from: standupIndexID,
@@ -2371,8 +2463,8 @@ function graphFrom(
             },
           ]
         : []),
-    ]),
-    ...staffMemoryDocs.flatMap((doc) => [
+          ]),
+          ...staffMemoryDocs.flatMap((doc) => [
       {
         id: `${libraryID}->${doc.id}:document`,
         from: libraryID,
@@ -2391,8 +2483,8 @@ function graphFrom(
         path: doc.path,
         summary: `Personal workflow memory for ${doc.member.title}.`,
       },
-    ]),
-    ...expertNoteDocs.flatMap((doc) => [
+          ]),
+          ...expertNoteDocs.flatMap((doc) => [
       {
         id: `${libraryID}->${doc.id}:document`,
         from: libraryID,
@@ -2424,17 +2516,17 @@ function graphFrom(
             },
           ]
         : []),
-    ]),
-    ...finalReviewDocs.map((doc) => ({
-      id: `${libraryID}->${doc.id}:document`,
-      from: libraryID,
-      to: doc.id,
-      kind: "document" as const,
-      label: "final review",
-      path: doc.path,
-      summary: doc.summary,
-    })),
-    ...finalReviewDocs.flatMap((doc) => {
+          ]),
+          ...finalReviewDocs.map((doc) => ({
+            id: `${libraryID}->${doc.id}:document`,
+            from: libraryID,
+            to: doc.id,
+            kind: "document" as const,
+            label: "final review",
+            path: doc.path,
+            summary: doc.summary,
+          })),
+          ...finalReviewDocs.flatMap((doc) => {
       if (doc.id.endsWith(":test-plan") && info.testerSessionID) {
         return [
           {
@@ -2488,8 +2580,8 @@ function graphFrom(
         ]
       }
       return []
-    }),
-    ...consultationDocs.flatMap((doc) => [
+          }),
+          ...consultationDocs.flatMap((doc) => [
       {
         id: `${libraryID}->${doc.id}:document`,
         from: libraryID,
@@ -2525,7 +2617,9 @@ function graphFrom(
             },
           ]
         : []),
-    ]),
+          ]),
+        ]
+      : []),
     ...milestones
       .filter((milestone) => milestone.dependsOn.length === 0)
       .map((milestone) => ({
@@ -2592,31 +2686,33 @@ function graphFrom(
             })),
         ]
       : []),
-    ...sessionRefs.flatMap((ref) => {
-      const nodeID = sessionNodeIDs.get(ref.sessionID)
-      const docID = `${String(ref.sessionID)}:summary`
-      if (!nodeID) return []
-      return [
-        {
-          id: `${libraryID}->${docID}:document`,
-          from: libraryID,
-          to: docID,
-          kind: "document" as const,
-          label: "reference",
-          path: workflowArtifactPath(info, workflowSessionSummaryPath(ref.sessionID)),
-          summary: `${roleSessionTitle(ref.role)} reference summary`,
-        },
-        {
-          id: `${nodeID}->${docID}:document`,
-          from: nodeID,
-          to: docID,
-          kind: "document" as const,
-          label: "summary",
-          path: workflowArtifactPath(info, workflowSessionSummaryPath(ref.sessionID)),
-          summary: "Session summary document",
-        },
-      ]
-    }),
+    ...(includeDocumentGraph
+      ? sessionRefs.flatMap((ref) => {
+          const nodeID = sessionNodeIDs.get(ref.sessionID)
+          const docID = `${String(ref.sessionID)}:summary`
+          if (!nodeID) return []
+          return [
+            {
+              id: `${libraryID}->${docID}:document`,
+              from: libraryID,
+              to: docID,
+              kind: "document" as const,
+              label: "reference",
+              path: workflowArtifactPath(info, workflowSessionSummaryPath(ref.sessionID)),
+              summary: `${roleSessionTitle(ref.role)} reference summary`,
+            },
+            {
+              id: `${nodeID}->${docID}:document`,
+              from: nodeID,
+              to: docID,
+              kind: "document" as const,
+              label: "summary",
+              path: workflowArtifactPath(info, workflowSessionSummaryPath(ref.sessionID)),
+              summary: "Session summary document",
+            },
+          ]
+        })
+      : []),
     ...consultations.flatMap((consultation) => {
       const from = sessionNodeIDs.get(consultation.fromSessionID)
       const to = sessionNodeIDs.get(consultation.toSessionID)
@@ -2651,15 +2747,19 @@ function graphFrom(
           answer: intervention.response,
           summary: `Requester intervention to ${roleSessionTitle(intervention.targetRole)} [${intervention.status}]`,
         },
-        {
-          id: `${interventionIndexID}->${intervention.id}:document`,
-          from: interventionIndexID,
-          to: `${intervention.id}:document`,
-          kind: "document" as const,
-          label: "intervention",
-          path: intervention.path,
-          summary: compactMarkdown(intervention.message, 240),
-        },
+        ...(includeDocumentGraph
+          ? [
+              {
+                id: `${interventionIndexID}->${intervention.id}:document`,
+                from: interventionIndexID,
+                to: `${intervention.id}:document`,
+                kind: "document" as const,
+                label: "intervention",
+                path: intervention.path,
+                summary: compactMarkdown(intervention.message, 240),
+              },
+            ]
+          : []),
       ]
     }),
   ].filter(
@@ -2679,78 +2779,82 @@ function graphFrom(
       status: info.status,
       ...(info.rootSessionID ? { sessionID: info.rootSessionID } : {}),
     },
-    {
-      id: libraryID,
-      type: "document" as const,
-      title: "Reference library",
-      path: workflowArtifactPath(info, workflowReferenceIndexPath()),
-      summary: "Workflow reference library with session summaries, plans, and consultation history.",
-    },
-    ...operationDocs.map((doc) => ({
-      id: doc.id,
-      type: "document" as const,
-      title: doc.title,
-      path: doc.path,
-      summary: doc.summary,
-    })),
-    {
-      id: requesterMemoryID,
-      type: "document" as const,
-      title: requesterMemoryDoc.title,
-      role: "requester" as const,
-      ...(info.rootSessionID ? { sessionID: info.rootSessionID } : {}),
-      path: requesterMemoryDoc.path,
-      summary: requesterMemoryDoc.summary,
-    },
-    {
-      id: interventionIndexID,
-      type: "document" as const,
-      title: "Requester interventions",
-      path: workflowArtifactPath(info, workflowInterventionIndexPath()),
-      summary: "Requester intervention history and direction changes.",
-    },
-    {
-      id: standupIndexID,
-      type: "document" as const,
-      title: "Company standups",
-      path: workflowArtifactPath(info, workflowStandupIndexPath()),
-      summary: "Main PM standups and workflow-triggered coordination notes.",
-    },
-    ...standupDocs.map((doc) => ({
-      id: doc.id,
-      type: "document" as const,
-      title: doc.title,
-      role: "main_pm" as const,
-      ...(info.pmSessionID ? { sessionID: info.pmSessionID } : {}),
-      path: doc.path,
-      summary: doc.summary,
-    })),
-    ...staffMemoryDocs.map((doc) => ({
-      id: doc.id,
-      type: "document" as const,
-      title: doc.title,
-      role: doc.member.role,
-      sessionID: doc.member.sessionID,
-      path: doc.path,
-      summary: doc.summary,
-    })),
-    ...expertNoteDocs.map((doc) => ({
-      id: doc.id,
-      type: "document" as const,
-      title: doc.title,
-      role: "expert" as const,
-      sessionID: doc.ref.sessionID,
-      milestoneID: doc.milestone.id,
-      path: doc.path,
-      summary: doc.summary,
-    })),
-    ...finalReviewDocs.map((doc) => ({
-      id: doc.id,
-      type: "document" as const,
-      title: doc.title,
-      path: doc.path,
-      summary: doc.summary,
-    })),
+    ...(includeDocumentGraph
+      ? [
+          {
+            id: libraryID,
+            type: "document" as const,
+            title: "Reference library",
+            path: workflowArtifactPath(info, workflowReferenceIndexPath()),
+            summary: "Workflow reference library with session summaries, plans, and consultation history.",
+          },
+          ...operationDocs.map((doc) => ({
+            id: doc.id,
+            type: "document" as const,
+            title: doc.title,
+            path: doc.path,
+            summary: doc.summary,
+          })),
+          {
+            id: requesterMemoryID,
+            type: "document" as const,
+            title: requesterMemoryDoc.title,
+            role: "requester" as const,
+            ...(info.rootSessionID ? { sessionID: info.rootSessionID } : {}),
+            path: requesterMemoryDoc.path,
+            summary: requesterMemoryDoc.summary,
+          },
+          {
+            id: interventionIndexID,
+            type: "document" as const,
+            title: "Requester interventions",
+            path: workflowArtifactPath(info, workflowInterventionIndexPath()),
+            summary: "Requester intervention history and direction changes.",
+          },
+          {
+            id: standupIndexID,
+            type: "document" as const,
+            title: "Company standups",
+            path: workflowArtifactPath(info, workflowStandupIndexPath()),
+            summary: "Main PM standups and workflow-triggered coordination notes.",
+          },
+          ...standupDocs.map((doc) => ({
+            id: doc.id,
+            type: "document" as const,
+            title: doc.title,
+            role: "main_pm" as const,
+            ...(info.pmSessionID ? { sessionID: info.pmSessionID } : {}),
+            path: doc.path,
+            summary: doc.summary,
+          })),
+          ...staffMemoryDocs.map((doc) => ({
+            id: doc.id,
+            type: "document" as const,
+            title: doc.title,
+            role: doc.member.role,
+            sessionID: doc.member.sessionID,
+            path: doc.path,
+            summary: doc.summary,
+          })),
+          ...expertNoteDocs.map((doc) => ({
+            id: doc.id,
+            type: "document" as const,
+            title: doc.title,
+            role: "expert" as const,
+            sessionID: doc.ref.sessionID,
+            milestoneID: doc.milestone.id,
+            path: doc.path,
+            summary: doc.summary,
+          })),
+          ...finalReviewDocs.map((doc) => ({
+            id: doc.id,
+            type: "document" as const,
+            title: doc.title,
+            path: doc.path,
+            summary: doc.summary,
+          })),
+        ]
+      : []),
     ...(info.pmSessionID
       ? mainMember
         ? []
@@ -2808,35 +2912,39 @@ function graphFrom(
           },
         ]
       : []),
-    ...sessionRefs.map((ref) => ({
-      id: `${String(ref.sessionID)}:summary`,
-      type: "document" as const,
-      title: `${roleSessionTitle(ref.role)} summary`,
-      role: ref.role,
-      sessionID: ref.sessionID,
-      ...(ref.milestoneID ? { milestoneID: ref.milestoneID } : {}),
-      path: workflowArtifactPath(info, workflowSessionSummaryPath(ref.sessionID)),
-      summary: "Short reference document for other workflow sessions.",
-    })),
-    ...consultationDocs.map((doc) => ({
-      id: doc.id,
-      type: "document" as const,
-      title: doc.title,
-      role: doc.consultation.fromRole,
-      sessionID: doc.consultation.fromSessionID,
-      ...(doc.consultation.milestoneID ? { milestoneID: doc.consultation.milestoneID } : {}),
-      path: doc.path,
-      summary: doc.summary,
-    })),
-    ...interventions.map((intervention) => ({
-      id: `${intervention.id}:document`,
-      type: "document" as const,
-      title: `Intervention ${new Date(intervention.time.created).toISOString()}`,
-      role: "requester" as const,
-      sessionID: intervention.fromSessionID,
-      path: intervention.path,
-      summary: compactMarkdown(intervention.message, 240),
-    })),
+    ...(includeDocumentGraph
+      ? [
+          ...sessionRefs.map((ref) => ({
+            id: `${String(ref.sessionID)}:summary`,
+            type: "document" as const,
+            title: `${roleSessionTitle(ref.role)} summary`,
+            role: ref.role,
+            sessionID: ref.sessionID,
+            ...(ref.milestoneID ? { milestoneID: ref.milestoneID } : {}),
+            path: workflowArtifactPath(info, workflowSessionSummaryPath(ref.sessionID)),
+            summary: "Short reference document for other workflow sessions.",
+          })),
+          ...consultationDocs.map((doc) => ({
+            id: doc.id,
+            type: "document" as const,
+            title: doc.title,
+            role: doc.consultation.fromRole,
+            sessionID: doc.consultation.fromSessionID,
+            ...(doc.consultation.milestoneID ? { milestoneID: doc.consultation.milestoneID } : {}),
+            path: doc.path,
+            summary: doc.summary,
+          })),
+          ...interventions.map((intervention) => ({
+            id: `${intervention.id}:document`,
+            type: "document" as const,
+            title: `Intervention ${new Date(intervention.time.created).toISOString()}`,
+            role: "requester" as const,
+            sessionID: intervention.fromSessionID,
+            path: intervention.path,
+            summary: compactMarkdown(intervention.message, 240),
+          })),
+        ]
+      : []),
   ].filter((node, index, all) => all.findIndex((item) => item.id === node.id) === index)
   return {
     workflow: info,
@@ -3359,7 +3467,7 @@ export const layer: Layer.Layer<
     const publishUpdated = Effect.fn("Workflow.publishUpdated")(function* (workflowID: WorkflowID) {
       const info = yield* get(workflowID)
       yield* bus.publish(Event.Updated, { workflowID, info })
-      yield* bus.publish(Event.GraphUpdated, { workflowID, graph: yield* graph(workflowID) })
+      yield* bus.publish(Event.GraphUpdated, { workflowID })
       return info
     })
 
@@ -3788,7 +3896,7 @@ export const layer: Layer.Layer<
           .all()
           .map((row) => row.data ?? { id: `${row.from_id}->${row.to_id}`, from: String(row.from_id), to: String(row.to_id) }),
       )
-      return graphFrom(
+      const result = graphFrom(
         next,
         items,
         edges,
@@ -3797,6 +3905,8 @@ export const layer: Layer.Layer<
         yield* interventions(workflowID),
         standupDocsFromIndex(next, standupIndex),
       )
+      recordWorkflowGraphDiagnostic(result)
+      return result
     })
 
     const setStatus = Effect.fn("Workflow.setStatus")(function* (
@@ -3953,7 +4063,7 @@ export const layer: Layer.Layer<
             .run()
         }
       })
-      yield* bus.publish(Event.GraphUpdated, { workflowID, graph: yield* graph(workflowID) })
+      yield* bus.publish(Event.GraphUpdated, { workflowID })
       yield* writeArchiveIndex(workflowID).pipe(Effect.ignore)
       yield* writeOrganization(workflowID).pipe(Effect.ignore)
       yield* writeProgress(workflowID).pipe(Effect.ignore)
@@ -4018,7 +4128,7 @@ export const layer: Layer.Layer<
       yield* writeReferenceIndex(input.workflow.id).pipe(Effect.ignore)
       yield* writeOrganization(input.workflow.id).pipe(Effect.ignore)
       yield* writeProgress(input.workflow.id).pipe(Effect.ignore)
-      yield* bus.publish(Event.GraphUpdated, { workflowID: input.workflow.id, graph: yield* graph(input.workflow.id) })
+      yield* bus.publish(Event.GraphUpdated, { workflowID: input.workflow.id })
     })
 
     const answerPendingRequesterConsultations = Effect.fn("Workflow.answerPendingRequesterConsultations")(function* (
@@ -4109,7 +4219,7 @@ export const layer: Layer.Layer<
       yield* writeReferenceIndex(workflow.id).pipe(Effect.ignore)
       yield* writeOrganization(workflow.id).pipe(Effect.ignore)
       yield* writeProgress(workflow.id).pipe(Effect.ignore)
-      yield* bus.publish(Event.GraphUpdated, { workflowID: workflow.id, graph: yield* graph(workflow.id) })
+      yield* bus.publish(Event.GraphUpdated, { workflowID: workflow.id })
       return true
     })
 
@@ -4151,7 +4261,7 @@ export const layer: Layer.Layer<
       yield* writeReferenceIndex(workflow.id).pipe(Effect.ignore)
       yield* writeProgress(workflow.id).pipe(Effect.ignore)
       yield* writeArchiveIndex(workflow.id).pipe(Effect.ignore)
-      yield* bus.publish(Event.GraphUpdated, { workflowID: workflow.id, graph: yield* graph(workflow.id) })
+      yield* bus.publish(Event.GraphUpdated, { workflowID: workflow.id })
       return true
     })
 
@@ -4826,7 +4936,6 @@ export const layer: Layer.Layer<
       yield* writeReferenceIndex(workflow.id).pipe(Effect.ignore)
       yield* writeArchiveIndex(workflow.id).pipe(Effect.ignore)
       yield* writeOrganization(workflow.id).pipe(Effect.ignore)
-      yield* bus.publish(Event.GraphUpdated, { workflowID: workflow.id, graph: yield* graph(workflow.id) })
       yield* applyWorkflowControl(workflow.id, latestText(result), "requester strategic direction").pipe(Effect.ignore)
       yield* publishUpdated(workflow.id).pipe(Effect.ignore)
     })
@@ -4937,7 +5046,6 @@ export const layer: Layer.Layer<
         ].join("\n"),
         { milestoneID: context.milestoneID },
       ).pipe(Effect.ignore)
-      yield* bus.publish(Event.GraphUpdated, { workflowID: context.workflow.id, graph: yield* graph(context.workflow.id) })
       yield* publishUpdated(context.workflow.id).pipe(Effect.ignore)
     })
 
@@ -4987,7 +5095,7 @@ export const layer: Layer.Layer<
       yield* appendStandupIndex(workflow, standupPath, reason)
       yield* writeReferenceIndex(workflowID).pipe(Effect.ignore)
       yield* applyWorkflowControl(workflowID, output, "company standup", { exceptJobID: jobID }).pipe(Effect.ignore)
-      yield* bus.publish(Event.GraphUpdated, { workflowID, graph: yield* graph(workflowID) })
+      yield* publishUpdated(workflowID).pipe(Effect.ignore)
     })
 
     const triggerCompanyStandup = Effect.fn("Workflow.triggerCompanyStandup")(function* (workflowID: WorkflowID, reason: string) {
@@ -6521,7 +6629,6 @@ export const layer: Layer.Layer<
       yield* writeNote(workflowArtifactPath(yield* get(input.workflowID), "workflow.xml"), input.xml)
       const result = yield* saveDefinition(input.workflowID, input.xml, definition)
       yield* writePrecreatedPlans(yield* get(input.workflowID), yield* milestones(input.workflowID))
-      yield* bus.publish(Event.GraphUpdated, { workflowID: input.workflowID, graph: result })
       yield* publishUpdated(input.workflowID)
       return result
     })
@@ -6542,7 +6649,6 @@ export const layer: Layer.Layer<
       yield* writeOrganization(input.workflowID).pipe(Effect.ignore)
       yield* writeArchiveIndex(input.workflowID).pipe(Effect.ignore)
       yield* writeProgress(input.workflowID).pipe(Effect.ignore)
-      yield* bus.publish(Event.GraphUpdated, { workflowID: input.workflowID, graph: yield* graph(input.workflowID) })
       return yield* publishUpdated(workflow.id)
     })
 
@@ -6566,7 +6672,7 @@ export const layer: Layer.Layer<
       yield* writeInterventionArtifacts(workflowID).pipe(Effect.ignore)
       yield* writeReferenceIndex(workflowID).pipe(Effect.ignore)
       yield* writeArchiveIndex(workflowID).pipe(Effect.ignore)
-      yield* bus.publish(Event.GraphUpdated, { workflowID, graph: yield* graph(workflowID) })
+      yield* bus.publish(Event.GraphUpdated, { workflowID })
       return (yield* interventions(workflowID)).find((item) => item.id === interventionID)
     })
 
@@ -6690,7 +6796,6 @@ export const layer: Layer.Layer<
         }).pipe(Effect.ignore)
       }
       if (!workflowAutorunEnabled()) {
-        yield* bus.publish(Event.GraphUpdated, { workflowID: workflow.id, graph: yield* graph(workflow.id) })
         return yield* publishUpdated(workflow.id)
       }
       const jobID = `${workflow.id}:${id}`
@@ -6709,7 +6814,6 @@ export const layer: Layer.Layer<
           Effect.as("workflow intervention delivered"),
         ),
       })
-      yield* bus.publish(Event.GraphUpdated, { workflowID: workflow.id, graph: yield* graph(workflow.id) })
       return yield* publishUpdated(workflow.id)
     })
 

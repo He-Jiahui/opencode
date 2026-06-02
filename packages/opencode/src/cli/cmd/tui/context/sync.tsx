@@ -277,6 +277,24 @@ export const { use: useSync, provider: SyncProvider } = createSimpleContext({
 
         case "workflow.graph.updated": {
           const graph = event.properties.graph
+          if (!graph) {
+            void sdk.client.workflow.graph({ workflowID: event.properties.workflowID }).then((result) => {
+              if (!result.data) return
+              setStore("workflow_graph", result.data.workflow.id, reconcile(result.data))
+              const index = Binary.search(store.workflow, result.data.workflow.id, (workflow) => workflow.id)
+              if (index.found) {
+                setStore("workflow", index.index, reconcile(result.data.workflow))
+                return
+              }
+              setStore(
+                "workflow",
+                produce((draft) => {
+                  draft.splice(index.index, 0, result.data!.workflow)
+                }),
+              )
+            })
+            break
+          }
           setStore("workflow_graph", graph.workflow.id, reconcile(graph))
           const result = Binary.search(store.workflow, graph.workflow.id, (workflow) => workflow.id)
           if (result.found) {

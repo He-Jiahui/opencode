@@ -117,6 +117,42 @@ describe("selectWorkflowMember", () => {
     ).toBe(sessionID("ses_exec_1"))
   })
 
+  test("balances sequential assignments across same-role staff", () => {
+    expect(
+      selectWorkflowMember({
+        role: "executor",
+        specialty: "engineering",
+        members: [
+          member({ role: "executor", specialty: "engineering", sessionID: "ses_exec_1", created: 1 }),
+          member({ role: "executor", specialty: "engineering-2", sessionID: "ses_exec_2", created: 2 }),
+          member({ role: "executor", specialty: "engineering-3", sessionID: "ses_exec_3", created: 3 }),
+        ],
+        milestones: [
+          milestone({ id: "m01", status: "approved", role: "executor", sessionID: "ses_exec_1" }),
+          milestone({ id: "m02", status: "approved", role: "executor", sessionID: "ses_exec_1" }),
+        ],
+      })?.sessionID,
+    ).toBe(sessionID("ses_exec_2"))
+  })
+
+  test("keeps a reopened milestone with its existing owner before balancing", () => {
+    expect(
+      selectWorkflowMember({
+        role: "executor",
+        specialty: "engineering",
+        members: [
+          member({ role: "executor", specialty: "engineering", sessionID: "ses_exec_1", created: 1 }),
+          member({ role: "executor", specialty: "engineering-2", sessionID: "ses_exec_2", created: 2 }),
+        ],
+        milestones: [
+          milestone({ id: "m01", status: "pending", role: "executor", sessionID: "ses_exec_1" }),
+          milestone({ id: "m02", status: "approved", role: "executor", sessionID: "ses_exec_1" }),
+        ],
+        excludeMilestoneID: milestoneID("m01"),
+      })?.sessionID,
+    ).toBe(sessionID("ses_exec_1"))
+  })
+
   test("treats department PM review work as busy", () => {
     expect(
       selectWorkflowMember({

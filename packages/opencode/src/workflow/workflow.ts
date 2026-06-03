@@ -2253,6 +2253,16 @@ function retryableMilestone(status: WorkflowMilestoneInfo["status"]) {
   )
 }
 
+function terminalMilestone(status: WorkflowMilestoneInfo["status"]) {
+  return (
+    status === "approved" ||
+    status === "done" ||
+    status === "completed" ||
+    status === "skipped" ||
+    status === "cancelled"
+  )
+}
+
 export function temporaryInterruptPauseStatus(status: WorkflowMilestoneInfo["status"] | undefined) {
   if (status === "planning" || status === "executing" || status === "reviewing" || status === "running") return status
   return undefined
@@ -5116,6 +5126,7 @@ export const layer: Layer.Layer<
       if (!context || context.role === "requester") return
       const text = yield* requesterMessageTextWithRetry(input)
       if (!text) return
+      if (/^\/workflow-continue(?:\s|$)/i.test(text.trim())) return
       observedWorkflowMessageKeys.add(key)
       const id = `intervention_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`
       const interventionPath = workflowArtifactPath(context.workflow, workflowInterventionPath(id))
@@ -6111,6 +6122,35 @@ export const layer: Layer.Layer<
       }
     })
 
+    const startMilestoneJob = Effect.fn("Workflow.startMilestoneJob")(function* (
+      workflow: WorkflowInfo,
+      current: WorkflowMilestoneInfo,
+      options?: { delay?: "50 millis" },
+    ) {
+      const jobID = milestoneJobID(workflow.id, current.id, current.attempt + 1)
+      const run = runMilestone(workflow, current, jobID).pipe(
+        Effect.catchCause((cause) =>
+          Cause.hasInterruptsOnly(cause)
+            ? Effect.interrupt
+            : Effect.gen(function* () {
+                yield* updateMilestone(workflow.id, current.id, { status: "failed" })
+                yield* setStatus(workflow.id, "failed", {
+                  error: `Milestone ${current.id} failed: ${errorFromCause(cause)}`,
+                })
+              }),
+        ),
+        Effect.as(`milestone ${current.id} completed`),
+      )
+      yield* background.start({
+        id: jobID,
+        type: "workflow.milestone",
+        title: `${workflow.title} ${current.id}`,
+        metadata: { workflowID: workflow.id, milestoneID: current.id },
+        run: options?.delay ? run.pipe(Effect.delay(options.delay)) : run,
+      })
+      return jobID
+    })
+
     const schedule: (workflowID: WorkflowID) => Effect.Effect<WorkflowInfo, unknown> = Effect.fn("Workflow.schedule")(
       function* (workflowID: WorkflowID) {
       const workflow = yield* get(workflowID)
@@ -6165,26 +6205,7 @@ export const layer: Layer.Layer<
       for (const item of ready) {
         const current = items.find((milestone) => milestone.id === item.id)
         if (!current) continue
-        const jobID = milestoneJobID(workflowID, current.id, current.attempt + 1)
-        yield* background.start({
-          id: jobID,
-          type: "workflow.milestone",
-          title: `${workflow.title} ${current.id}`,
-          metadata: { workflowID, milestoneID: current.id },
-          run: runMilestone(workflow, current, jobID).pipe(
-            Effect.catchCause((cause) =>
-              Cause.hasInterruptsOnly(cause)
-                ? Effect.interrupt
-                : Effect.gen(function* () {
-                    yield* updateMilestone(workflowID, current.id, { status: "failed" })
-                    yield* setStatus(workflowID, "failed", {
-                      error: `Milestone ${current.id} failed: ${errorFromCause(cause)}`,
-                    })
-                  }),
-            ),
-            Effect.as(`milestone ${current.id} completed`),
-          ),
-        })
+        yield* startMilestoneJob(workflow, current)
       }
       yield* triggerCompanyStandup(
         workflowID,
@@ -7008,11 +7029,61 @@ export const layer: Layer.Layer<
       return workflow
     })
 
+    const resumeMilestoneFromSession = Effect.fn("Workflow.resumeMilestoneFromSession")(function* (input: {
+      sessionID: SessionID
+      message?: string
+    }) {
+      const context = yield* workflowSessionContext(input.sessionID)
+      if (!context?.milestoneID) return false
+      const workflow = yield* get(context.workflow.id)
+      if (workflow.status === "cancelled" || workflow.status === "completed") return true
+      const current = (yield* milestones(workflow.id)).find((item) => item.id === context.milestoneID)
+      if (!current) return false
+      yield* archiveWorkflowSession({
+        workflowID: workflow.id,
+        sessionID: input.sessionID,
+        role: context.role,
+        milestoneID: context.milestoneID,
+        attempt: context.attempt,
+      }).pipe(Effect.ignore)
+      if (terminalMilestone(current.status) || current.status === "testing") {
+        yield* setStatus(workflow.id, "executing", { error: "" }).pipe(Effect.ignore)
+        yield* schedule(workflow.id).pipe(Effect.ignore)
+        return true
+      }
+      const workflowJobs = (yield* background.list()).filter(
+        (job) => job.status === "running" && job.type === "workflow" && job.metadata?.workflowID === workflow.id,
+      )
+      yield* Effect.all(workflowJobs.map((job) => background.cancel(job.id).pipe(Effect.ignore)), { discard: true })
+      const selectedJobs = (yield* background.list()).filter(
+        (job) =>
+          job.status === "running" &&
+          job.type === "workflow.milestone" &&
+          job.metadata?.workflowID === workflow.id &&
+          job.metadata?.milestoneID === context.milestoneID,
+      )
+      yield* Effect.all(selectedJobs.map((job) => background.cancel(job.id).pipe(Effect.ignore)), { discard: true })
+      yield* Effect.all(
+        Array.from({ length: current.attempt + 2 }, (_, index) =>
+          background.cancel(milestoneJobID(workflow.id, current.id, index + 1)).pipe(Effect.ignore),
+        ),
+        { discard: true },
+      )
+      const reset = yield* updateMilestone(workflow.id, current.id, { status: "pending" })
+      const next = yield* setStatus(workflow.id, "executing", { error: "" })
+      yield* startMilestoneJob(next, reset ?? { ...current, status: "pending" }, { delay: "50 millis" })
+      return true
+    })
+
     const continueFromSession = Effect.fn("Workflow.continueFromSession")(function* (input: {
       sessionID: SessionID
       message?: string
     }) {
       yield* InstanceState.get(initState)
+      if (yield* resumeMilestoneFromSession(input)) {
+        const context = yield* workflowSessionContext(input.sessionID)
+        if (context) return yield* get(context.workflow.id)
+      }
       const workflowID = yield* workflowToolCommandWorkflowID({
         action: "resume",
         sourceSessionID: input.sessionID,

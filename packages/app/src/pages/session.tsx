@@ -1886,6 +1886,22 @@ export default function Page() {
     mutationFn: async () => {
       const workflow = activeWorkflow()
       if (!workflow) return
+      const sessionID = params.id
+      if (sessionID && sessionBelongsToWorkflow()) {
+        const agent = local.agent.current()?.name
+        const model = workflowModel()
+        const variant = local.model.variant.current()
+        const result = await sdk.client.session.command({
+          sessionID,
+          command: "workflow-continue",
+          arguments: "",
+          ...(agent ? { agent } : {}),
+          ...(model ? { model } : {}),
+          ...(variant ? { variant } : {}),
+        })
+        if (!result.data) return
+        return sdk.client.workflow.get({ workflowID: workflow.id }).then((next) => next.data)
+      }
       return sdk.client.workflow.resume({ workflowID: workflow.id }).then((result) => result.data)
     },
     onSuccess: (workflow) => {

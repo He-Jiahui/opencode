@@ -5,6 +5,7 @@ import path from "path"
 
 import { BackgroundJob } from "@/background/job"
 import { Bus } from "@/bus"
+import { EventV2Bridge } from "@/event-v2-bridge"
 import { ModelID, ProviderID } from "@/provider/schema"
 import { MessageV2 } from "@/session/message-v2"
 import { MessageID, PartID, SessionID } from "@/session/schema"
@@ -93,7 +94,7 @@ const fakePromptLayer = Layer.effect(
 const it = testEffect(
   Workflow.layer.pipe(
     Layer.provideMerge(fakePromptLayer),
-    Layer.provideMerge(Layer.mergeAll(BackgroundJob.defaultLayer, Bus.layer, Session.defaultLayer)),
+    Layer.provideMerge(Layer.mergeAll(BackgroundJob.defaultLayer, Bus.layer, EventV2Bridge.defaultLayer, Session.defaultLayer)),
   ),
 )
 

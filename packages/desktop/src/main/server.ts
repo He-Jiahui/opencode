@@ -3,17 +3,14 @@ import { dirname, join } from "node:path"
 import { fileURLToPath } from "node:url"
 import { app, utilityProcess } from "electron"
 import type { Details } from "electron"
-import { DEFAULT_SERVER_URL_KEY, WSL_ENABLED_KEY } from "./constants"
+import { getLogger } from "./logging"
 import { getUserShell, loadShellEnv } from "./shell-env"
 import { getStore } from "./store"
-import type { SqliteMigrationProgress } from "../preload/types"
-
-export type WslConfig = { enabled: boolean }
+import { DEFAULT_SERVER_URL_KEY } from "./store-keys"
 
 export type HealthCheck = { wait: Promise<void> }
 
 type SidecarMessage =
-  | { type: "sqlite"; progress: SqliteMigrationProgress }
   | { type: "ready" }
   | { type: "stopped" }
   | { type: "error"; error: { message: string; stack?: string } }
@@ -25,9 +22,7 @@ const SIDECAR_START_STALL_TIMEOUT = 60_000
 const SIDECAR_STOP_TIMEOUT = 6_000
 
 type SpawnLocalServerOptions = {
-  needsMigration: boolean
   userDataPath: string
-  onSqliteProgress?: (progress: SqliteMigrationProgress) => void
   onStdout?: (message: string) => void
   onStderr?: (message: string) => void
   onExit?: (code: number, diagnostics: string) => void
@@ -47,19 +42,10 @@ export function setDefaultServerUrl(url: string | null) {
   getStore().delete(DEFAULT_SERVER_URL_KEY)
 }
 
-export function getWslConfig(): WslConfig {
-  const value = getStore().get(WSL_ENABLED_KEY)
-  return { enabled: typeof value === "boolean" ? value : false }
-}
-
-export function setWslConfig(config: WslConfig) {
-  getStore().set(WSL_ENABLED_KEY, config.enabled)
-}
-
 export function preferAppEnv(userDataPath: string) {
   const shell = process.platform === "win32" ? null : getUserShell()
   Object.assign(process.env, {
-    ...(shell ? loadShellEnv(shell) : null),
+    ...(shell ? loadShellEnv(shell, getLogger()) : null),
     OPENCODE_EXPERIMENTAL_ICON_DISCOVERY: "true",
     OPENCODE_EXPERIMENTAL_FILEWATCHER: "true",
     OPENCODE_CLIENT: "desktop",
@@ -125,11 +111,6 @@ export async function spawnLocalServer(
     }
 
     const onMessage = (message: SidecarMessage) => {
-      if (message.type === "sqlite") {
-        refreshTimeout()
-        options.onSqliteProgress?.(message.progress)
-        return
-      }
       if (message.type === "ready") {
         if (done) return
         done = true
@@ -159,7 +140,6 @@ export async function spawnLocalServer(
       port,
       password,
       userDataPath: options.userDataPath,
-      needsMigration: options.needsMigration,
     })
   }).catch((error) => {
     if (!exited) child.kill()
@@ -241,6 +221,7 @@ function createSidecarEnv(diagnosticDir: string): Record<string, string> {
   env.OPENCODE_SIDECAR_DIAGNOSTIC_DIR = diagnosticDir
   delete env.DEBUG
   if (process.platform === "linux") delete env.LD_PRELOAD
+  if (!app.isPackaged) env.OPENCODE_DISABLE_CHANNEL_DB = "1"
   return env
 }
 

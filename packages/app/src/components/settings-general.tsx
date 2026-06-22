@@ -7,6 +7,7 @@ import { Switch } from "@opencode-ai/ui/switch"
 import { TextField } from "@opencode-ai/ui/text-field"
 import { Tooltip } from "@opencode-ai/ui/tooltip"
 import { useTheme, type ColorScheme } from "@opencode-ai/ui/theme/context"
+import { useDialog } from "@opencode-ai/ui/context/dialog"
 import { showToast } from "@opencode-ai/ui/toast"
 import { useParams } from "@solidjs/router"
 import { useLanguage } from "@/context/language"
@@ -14,6 +15,7 @@ import { usePermission } from "@/context/permission"
 import { usePlatform, type DisplayBackend } from "@/context/platform"
 import { useServerSync } from "@/context/server-sync"
 import { useServerSDK } from "@/context/server-sdk"
+import { useUpdaterAction } from "./updater-action"
 import {
   monoDefault,
   monoFontFamily,
@@ -86,6 +88,7 @@ export const SettingsGeneral: Component = () => {
   const language = useLanguage()
   const permission = usePermission()
   const platform = usePlatform()
+  const dialog = useDialog()
   const params = useParams()
   const settings = useSettings()
 
@@ -95,9 +98,10 @@ export const SettingsGeneral: Component = () => {
     ignoreText: "",
     ignoreLoaded: "",
   })
+  const updater = useUpdaterAction()
 
   const serverSync = useServerSync()
-  const globalSdk = useServerSDK()
+  const serverSdk = useServerSDK()
   const linux = createMemo(() => platform.platform === "desktop" && platform.os === "linux")
   const dir = createMemo(() => decode64(params.dir))
   const accepting = createMemo(() => {
@@ -128,7 +132,7 @@ export const SettingsGeneral: Component = () => {
   const projectSdk = createMemo(() => {
     const value = dir()
     if (!value) return
-    return globalSdk.createClient({ directory: value, throwOnError: true })
+    return serverSdk().createClient({ directory: value, throwOnError: true })
   })
 
   const [ignoreFile, { mutate: setIgnoreFile }] = createResource(
@@ -154,64 +158,12 @@ export const SettingsGeneral: Component = () => {
     })
   })
 
-  const check = () => {
-    if (!platform.checkUpdate) return
-    setStore("checking", true)
-
-    void platform
-      .checkUpdate()
-      .then((result) => {
-        if (!result.updateAvailable) {
-          showToast({
-            variant: "success",
-            icon: "circle-check",
-            title: language.t("settings.updates.toast.latest.title"),
-            description: language.t("settings.updates.toast.latest.description", { version: platform.version ?? "" }),
-          })
-          return
-        }
-
-        const actions = platform.updateAndRestart
-          ? [
-              {
-                label: language.t("toast.update.action.installRestart"),
-                onClick: async () => {
-                  await platform.updateAndRestart!()
-                },
-              },
-              {
-                label: language.t("toast.update.action.notYet"),
-                onClick: "dismiss" as const,
-              },
-            ]
-          : [
-              {
-                label: language.t("toast.update.action.notYet"),
-                onClick: "dismiss" as const,
-              },
-            ]
-
-        showToast({
-          persistent: true,
-          icon: "download",
-          title: language.t("toast.update.title"),
-          description: language.t("toast.update.description", { version: result.version ?? "" }),
-          actions,
-        })
-      })
-      .catch((err: unknown) => {
-        const message = err instanceof Error ? err.message : String(err)
-        showToast({ title: language.t("common.requestFailed"), description: message })
-      })
-      .finally(() => setStore("checking", false))
-  }
-
   const themeOptions = createMemo<ThemeOption[]>(() => theme.ids().map((id) => ({ id, name: theme.name(id) })))
 
   const [shells] = createResource(
     () =>
-      globalSdk.client.pty
-        .shells()
+      serverSdk()
+        .client.pty.shells()
         .then((res) => res.data ?? [])
         .catch(() => [] as ShellOption[]),
     { initialValue: [] as ShellOption[] },
@@ -234,11 +186,11 @@ export const SettingsGeneral: Component = () => {
   })
 
   const autoOption = { id: "auto", value: "", label: language.t("settings.general.row.shell.autoDefault") }
-  const currentShell = createMemo(() => serverSync.data.config.shell ?? "")
+  const currentShell = createMemo(() => serverSync().data.config.shell ?? "")
 
   const shellOptions = createMemo<ShellSelectOption[]>(() => {
     const list = shells.latest
-    const current = serverSync.data.config.shell
+    const current = serverSync().data.config.shell
 
     const nameCounts = new Map<string, number>()
     for (const s of list) {
@@ -401,7 +353,7 @@ export const SettingsGeneral: Component = () => {
             onSelect={(option) => {
               if (!option) return
               if (option.value === currentShell()) return
-              serverSync.updateConfig({ shell: option.value })
+              serverSync().updateConfig({ shell: option.value })
             }}
             variant="secondary"
             size="small"
@@ -527,7 +479,13 @@ export const SettingsGeneral: Component = () => {
           <div data-action="settings-new-layout-designs">
             <Switch
               checked={settings.general.newLayoutDesigns()}
-              onChange={(checked) => settings.general.setNewLayoutDesigns(checked)}
+              onChange={(checked) => {
+                settings.general.setNewLayoutDesigns(checked)
+                if (!checked) return
+                void import("@/components/settings-v2").then((module) => {
+                  dialog.show(() => <module.DialogSettings />)
+                })
+              }}
             />
           </div>
         </SettingsRow>
@@ -836,19 +794,6 @@ export const SettingsGeneral: Component = () => {
 
       <SettingsList>
         <SettingsRow
-          title={language.t("settings.updates.row.startup.title")}
-          description={language.t("settings.updates.row.startup.description")}
-        >
-          <div data-action="settings-updates-startup">
-            <Switch
-              checked={settings.updates.startup()}
-              disabled={!platform.checkUpdate}
-              onChange={(checked) => settings.updates.setStartup(checked)}
-            />
-          </div>
-        </SettingsRow>
-
-        <SettingsRow
           title={language.t("settings.general.row.releaseNotes.title")}
           description={language.t("settings.general.row.releaseNotes.description")}
         >
@@ -864,10 +809,8 @@ export const SettingsGeneral: Component = () => {
           title={language.t("settings.updates.row.check.title")}
           description={language.t("settings.updates.row.check.description")}
         >
-          <Button size="small" variant="secondary" disabled={store.checking || !platform.checkUpdate} onClick={check}>
-            {store.checking
-              ? language.t("settings.updates.action.checking")
-              : language.t("settings.updates.action.checkNow")}
+          <Button size="small" variant="secondary" disabled={!updater.action().run} onClick={updater.run}>
+            {language.t(updater.action().label)}
           </Button>
         </SettingsRow>
       </SettingsList>

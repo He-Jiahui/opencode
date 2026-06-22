@@ -1,6 +1,6 @@
 import type { NamedError } from "@opencode-ai/core/util/error"
+import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { Cause, Clock, Duration, Effect, Schedule } from "effect"
-import { MessageV2 } from "./message-v2"
 import { iife } from "@/util/iife"
 import { isRecord } from "@/util/record"
 
@@ -58,11 +58,11 @@ function networkErrorMessage(value: unknown) {
 
 function networkError(error: Err) {
   if (isRecord(error.data) && networkErrorMessage(error.data.message)) return true
-  if (!MessageV2.APIError.isInstance(error)) return false
+  if (!SessionV1.APIError.isInstance(error)) return false
   return networkErrorMessage(error.data.metadata?.code) || networkErrorMessage(error.data.metadata?.message)
 }
 
-export function delay(attempt: number, error?: MessageV2.APIError) {
+export function delay(attempt: number, error?: SessionV1.APIError) {
   if (error) {
     const headers = error.data.responseHeaders
     if (headers) {
@@ -97,9 +97,9 @@ export function delay(attempt: number, error?: MessageV2.APIError) {
 
 export function retryable(error: Err, provider: string) {
   // context overflow errors should not be retried
-  if (MessageV2.ContextOverflowError.isInstance(error)) return undefined
+  if (SessionV1.ContextOverflowError.isInstance(error)) return undefined
   const isNetworkError = networkError(error)
-  if (MessageV2.APIError.isInstance(error)) {
+  if (SessionV1.APIError.isInstance(error)) {
     const status = error.data.statusCode
     // 5xx errors are transient server failures and should always be retried,
     // even when the provider SDK doesn't explicitly mark them as retryable.
@@ -216,7 +216,7 @@ export function policy(opts: {
       const retry = retryable(error, opts.provider)
       if (!retry) return Cause.done(meta.attempt)
       return Effect.gen(function* () {
-        const wait = delay(meta.attempt, MessageV2.APIError.isInstance(error) ? error : undefined)
+        const wait = delay(meta.attempt, SessionV1.APIError.isInstance(error) ? error : undefined)
         const now = yield* Clock.currentTimeMillis
         yield* opts.set({
           attempt: meta.attempt,

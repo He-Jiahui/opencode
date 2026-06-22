@@ -1,8 +1,10 @@
 import { EOL } from "os"
-import { Effect, Option } from "effect"
+import { Effect } from "effect"
 import { Catalog } from "@opencode-ai/core/catalog"
 import { LocationServiceMap } from "@opencode-ai/core/location-layer"
+import { Location } from "@opencode-ai/core/location"
 import { PluginBoot } from "@opencode-ai/core/plugin/boot"
+import { AbsolutePath } from "@opencode-ai/core/schema"
 import { effectCmd } from "../../effect-cmd"
 
 export const V2Command = effectCmd({
@@ -17,16 +19,11 @@ export const V2Command = effectCmd({
       const all = (yield* catalog.provider.all()).sort((a, b) => a.id.localeCompare(b.id))
       const result = {
         providers,
-        default: catalog.model
-          .default()
-          .pipe(Effect.map(Option.map((item) => item.id)), Effect.map(Option.getOrUndefined)),
+        default: catalog.model.default().pipe(Effect.map((item) => item?.id)),
         small: Object.fromEntries(
           yield* Effect.all(
             all.map((provider) =>
-              Effect.map(
-                catalog.model.small(provider.id),
-                (model) => [provider.id, Option.getOrUndefined(Option.map(model, (item) => item.id))] as const,
-              ),
+              Effect.map(catalog.model.small(provider.id), (model) => [provider.id, model?.id] as const),
             ),
             { concurrency: "unbounded" },
           ),
@@ -36,9 +33,11 @@ export const V2Command = effectCmd({
     }).pipe(
       Effect.withSpan("Cli.debug.v2"),
       Effect.provide(
-        LocationServiceMap.get({
-          directory: process.cwd(),
-        }),
+        LocationServiceMap.get(
+          Location.Ref.make({
+            directory: AbsolutePath.make(process.cwd()),
+          }),
+        ),
       ),
       Effect.provide(LocationServiceMap.layer),
     ),

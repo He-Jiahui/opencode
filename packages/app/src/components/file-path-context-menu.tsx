@@ -40,7 +40,7 @@ export function FilePathContextMenu(
   const targetPath = () => {
     const value = props.target?.path ?? ""
     if (!value || /^[A-Za-z]:[\\/]/.test(value) || value.startsWith("/") || value.startsWith("\\\\")) return value
-    return `${sdk.directory.replace(/[\\/]+$/, "")}/${value.replace(/^[\\/]+/, "")}`
+    return `${sdk().directory.replace(/[\\/]+$/, "")}/${value.replace(/^[\\/]+/, "")}`
   }
   const targetDirectory = () => {
     const target = props.target

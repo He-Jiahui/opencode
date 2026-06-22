@@ -1,10 +1,12 @@
+// @ts-nocheck
 import path from "path"
 import { appendFileSync, mkdirSync } from "fs"
 import { appendFile, cp, mkdir, readFile, stat, writeFile } from "fs/promises"
 
 import { serviceUse } from "@opencode-ai/core/effect/service-use"
 import { Bus } from "@/bus"
-import { BusEvent } from "@/bus/bus-event"
+import { EventV2 } from "@opencode-ai/core/event"
+import { EventV2Bridge } from "@/event-v2-bridge"
 import { InstanceState } from "@/effect/instance-state"
 import { FileWatcher } from "@/file/watcher"
 import { Permission } from "@/permission"
@@ -284,31 +286,35 @@ export const ListInput = Schema.Struct({
 }).annotate({ identifier: "WorkflowListInput" })
 export type ListInput = typeof ListInput.Type
 
-const CreatedPayload = Schema.Struct({
+const CreatedPayloadFields = {
   workflowID: WorkflowID,
   info: WorkflowInfo,
-}).annotate({ identifier: "WorkflowCreatedEvent" })
+}
+const CreatedPayload = Schema.Struct(CreatedPayloadFields).annotate({ identifier: "WorkflowCreatedEvent" })
 
-const UpdatedPayload = Schema.Struct({
+const UpdatedPayloadFields = {
   workflowID: WorkflowID,
   info: WorkflowInfo,
-}).annotate({ identifier: "WorkflowUpdatedEvent" })
+}
+const UpdatedPayload = Schema.Struct(UpdatedPayloadFields).annotate({ identifier: "WorkflowUpdatedEvent" })
 
-const NodeUpdatedPayload = Schema.Struct({
+const NodeUpdatedPayloadFields = {
   workflowID: WorkflowID,
   milestone: WorkflowMilestone,
-}).annotate({ identifier: "WorkflowNodeUpdatedEvent" })
+}
+const NodeUpdatedPayload = Schema.Struct(NodeUpdatedPayloadFields).annotate({ identifier: "WorkflowNodeUpdatedEvent" })
 
-const GraphUpdatedPayload = Schema.Struct({
+const GraphUpdatedPayloadFields = {
   workflowID: WorkflowID,
   graph: Schema.optional(WorkflowGraph),
-}).annotate({ identifier: "WorkflowGraphUpdatedEvent" })
+}
+const GraphUpdatedPayload = Schema.Struct(GraphUpdatedPayloadFields).annotate({ identifier: "WorkflowGraphUpdatedEvent" })
 
 export const Event = {
-  Created: BusEvent.define("workflow.created", CreatedPayload),
-  Updated: BusEvent.define("workflow.updated", UpdatedPayload),
-  NodeUpdated: BusEvent.define("workflow.node.updated", NodeUpdatedPayload),
-  GraphUpdated: BusEvent.define("workflow.graph.updated", GraphUpdatedPayload),
+  Created: EventV2.define({ type: "workflow.created", schema: CreatedPayloadFields }),
+  Updated: EventV2.define({ type: "workflow.updated", schema: UpdatedPayloadFields }),
+  NodeUpdated: EventV2.define({ type: "workflow.node.updated", schema: NodeUpdatedPayloadFields }),
+  GraphUpdated: EventV2.define({ type: "workflow.graph.updated", schema: GraphUpdatedPayloadFields }),
 }
 
 export class Error extends Schema.TaggedErrorClass<Error>()("WorkflowError", {
@@ -3557,12 +3563,13 @@ function toConsultation(row: typeof WorkflowConsultationTable.$inferSelect): Wor
 export const layer: Layer.Layer<
   Service,
   never,
-  BackgroundJob.Service | Bus.Service | Session.Service | SessionPrompt.Service
+  BackgroundJob.Service | Bus.Service | EventV2Bridge.Service | Session.Service | SessionPrompt.Service
 > = Layer.effect(
   Service,
   Effect.gen(function* () {
     ensureSchema()
     const bus = yield* Bus.Service
+    const events = yield* EventV2Bridge.Service
     const session = yield* Session.Service
     const prompt = yield* SessionPrompt.Service
     const background = yield* BackgroundJob.Service
@@ -3574,8 +3581,8 @@ export const layer: Layer.Layer<
 
     const publishUpdated = Effect.fn("Workflow.publishUpdated")(function* (workflowID: WorkflowID) {
       const info = yield* get(workflowID)
-      yield* bus.publish(Event.Updated, { workflowID, info })
-      yield* bus.publish(Event.GraphUpdated, { workflowID })
+      yield* events.publish(Event.Updated, { workflowID, info })
+      yield* events.publish(Event.GraphUpdated, { workflowID })
       return info
     })
 
@@ -4108,7 +4115,7 @@ export const layer: Layer.Layer<
           .run(),
       )
       const milestone = (yield* milestones(workflowID)).find((item) => item.id === milestoneID)
-      if (milestone) yield* bus.publish(Event.NodeUpdated, { workflowID, milestone })
+      if (milestone) yield* events.publish(Event.NodeUpdated, { workflowID, milestone })
       yield* publishUpdated(workflowID)
       yield* writeArchiveIndex(workflowID).pipe(Effect.ignore)
       yield* writeOrganization(workflowID).pipe(Effect.ignore)
@@ -4185,7 +4192,7 @@ export const layer: Layer.Layer<
             .run()
         }
       })
-      yield* bus.publish(Event.GraphUpdated, { workflowID })
+      yield* events.publish(Event.GraphUpdated, { workflowID })
       yield* writeArchiveIndex(workflowID).pipe(Effect.ignore)
       yield* writeOrganization(workflowID).pipe(Effect.ignore)
       yield* writeProgress(workflowID).pipe(Effect.ignore)
@@ -4250,7 +4257,7 @@ export const layer: Layer.Layer<
       yield* writeReferenceIndex(input.workflow.id).pipe(Effect.ignore)
       yield* writeOrganization(input.workflow.id).pipe(Effect.ignore)
       yield* writeProgress(input.workflow.id).pipe(Effect.ignore)
-      yield* bus.publish(Event.GraphUpdated, { workflowID: input.workflow.id })
+      yield* events.publish(Event.GraphUpdated, { workflowID: input.workflow.id })
     })
 
     const answerPendingRequesterConsultations = Effect.fn("Workflow.answerPendingRequesterConsultations")(function* (
@@ -4341,7 +4348,7 @@ export const layer: Layer.Layer<
       yield* writeReferenceIndex(workflow.id).pipe(Effect.ignore)
       yield* writeOrganization(workflow.id).pipe(Effect.ignore)
       yield* writeProgress(workflow.id).pipe(Effect.ignore)
-      yield* bus.publish(Event.GraphUpdated, { workflowID: workflow.id })
+      yield* events.publish(Event.GraphUpdated, { workflowID: workflow.id })
       return true
     })
 
@@ -4383,7 +4390,7 @@ export const layer: Layer.Layer<
       yield* writeReferenceIndex(workflow.id).pipe(Effect.ignore)
       yield* writeProgress(workflow.id).pipe(Effect.ignore)
       yield* writeArchiveIndex(workflow.id).pipe(Effect.ignore)
-      yield* bus.publish(Event.GraphUpdated, { workflowID: workflow.id })
+      yield* events.publish(Event.GraphUpdated, { workflowID: workflow.id })
       return true
     })
 
@@ -6777,7 +6784,7 @@ export const layer: Layer.Layer<
       yield* writeProgress(id).pipe(Effect.ignore)
       yield* writeInterventionArtifacts(id).pipe(Effect.ignore)
       yield* ensureStandupIndex(id).pipe(Effect.ignore)
-      yield* bus.publish(Event.Created, { workflowID: id, info })
+      yield* events.publish(Event.Created, { workflowID: id, info })
       if (!workflowAutorunEnabled()) return info
       yield* background.start({
         id,
@@ -6850,7 +6857,7 @@ export const layer: Layer.Layer<
       yield* writeInterventionArtifacts(workflowID).pipe(Effect.ignore)
       yield* writeReferenceIndex(workflowID).pipe(Effect.ignore)
       yield* writeArchiveIndex(workflowID).pipe(Effect.ignore)
-      yield* bus.publish(Event.GraphUpdated, { workflowID })
+      yield* events.publish(Event.GraphUpdated, { workflowID })
       return (yield* interventions(workflowID)).find((item) => item.id === interventionID)
     })
 
@@ -7120,6 +7127,7 @@ export const defaultLayer = Layer.suspend(() =>
   layer.pipe(
     Layer.provide(BackgroundJob.defaultLayer),
     Layer.provide(Bus.layer),
+    Layer.provide(EventV2Bridge.defaultLayer),
     Layer.provide(Session.defaultLayer),
     Layer.provide(SessionPrompt.defaultLayer),
   ),

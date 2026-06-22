@@ -7,8 +7,11 @@ import "./app.css"
 function AppMeta() {
   return (
     <>
-      <Title>opencode stats</Title>
-      <Meta name="description" content="OpenCode usage and stats." />
+      <Title>AI Model Usage Rankings | OpenCode Data</Title>
+      <Meta
+        name="description"
+        content="Explore OpenCode Go usage across AI models, including token volume, rankings, market share, token pricing, session cost, cache ratio, and geo breakdowns."
+      />
     </>
   )
 }

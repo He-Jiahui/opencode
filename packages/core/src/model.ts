@@ -1,6 +1,6 @@
-import { DateTime, Schema } from "effect"
-import { DateTimeUtcFromMillis } from "effect/Schema"
+import { Schema, Types } from "effect"
 import { ProviderV2 } from "./provider"
+import { ModelRequest } from "./model-request"
 
 export const ID = Schema.String.pipe(Schema.brand("ModelV2.ID"))
 export type ID = typeof ID.Type
@@ -15,8 +15,8 @@ export type Family = typeof Family.Type
 export const Capabilities = Schema.Struct({
   tools: Schema.Boolean,
   // mime patterns, image, audio, video/*, text/*
-  input: Schema.String.pipe(Schema.Array),
-  output: Schema.String.pipe(Schema.Array),
+  input: Schema.String.pipe(Schema.Array, Schema.mutable),
+  output: Schema.String.pipe(Schema.Array, Schema.mutable),
 })
 export type Capabilities = typeof Capabilities.Type
 
@@ -36,30 +36,41 @@ export const Cost = Schema.Struct({
 export const Ref = Schema.Struct({
   id: ID,
   providerID: ProviderV2.ID,
-  variant: VariantID,
+  variant: VariantID.pipe(Schema.optional),
 })
 export type Ref = typeof Ref.Type
 
+export const Api = Schema.Union([
+  Schema.Struct({
+    id: ID,
+    ...ProviderV2.AISDK.fields,
+  }),
+  Schema.Struct({
+    id: ID,
+    ...ProviderV2.Native.fields,
+  }),
+]).pipe(Schema.toTaggedUnion("type"))
+export type Api = typeof Api.Type
+
 export class Info extends Schema.Class<Info>("ModelV2.Info")({
   id: ID,
-  apiID: ID,
   providerID: ProviderV2.ID,
   family: Family.pipe(Schema.optional),
   name: Schema.String,
-  endpoint: ProviderV2.Endpoint,
+  api: Api,
   capabilities: Capabilities,
-  options: Schema.Struct({
-    ...ProviderV2.Options.fields,
+  request: Schema.Struct({
+    ...ModelRequest.Request.fields,
     variant: Schema.String.pipe(Schema.optional),
   }),
   variants: Schema.Struct({
     id: VariantID,
-    ...ProviderV2.Options.fields,
-  }).pipe(Schema.Array),
+    ...ModelRequest.Request.fields,
+  }).pipe(Schema.Array, Schema.mutable),
   time: Schema.Struct({
-    released: DateTimeUtcFromMillis,
+    released: Schema.Finite,
   }),
-  cost: Cost.pipe(Schema.Array),
+  cost: Cost.pipe(Schema.Array, Schema.mutable),
   status: Schema.Literals(["alpha", "beta", "deprecated", "active"]),
   enabled: Schema.Boolean,
   limit: Schema.Struct({
@@ -68,31 +79,30 @@ export class Info extends Schema.Class<Info>("ModelV2.Info")({
     output: Schema.Int,
   }),
 }) {
-  static empty(providerID: ProviderV2.ID, modelID: ID) {
+  static empty(providerID: ProviderV2.ID, modelID: ID): Info {
     return new Info({
       id: modelID,
-      apiID: modelID,
       providerID,
       name: modelID,
-      endpoint: {
-        type: "unknown",
+      api: {
+        id: modelID,
+        type: "native",
+        settings: {},
       },
       capabilities: {
         tools: false,
         input: [],
         output: [],
       },
-      options: {
+      request: {
         headers: {},
         body: {},
-        aisdk: {
-          provider: {},
-          request: {},
-        },
+        generation: {},
+        options: {},
       },
       variants: [],
       time: {
-        released: DateTime.makeUnsafe(0),
+        released: 0,
       },
       cost: [],
       status: "active",
@@ -103,6 +113,10 @@ export class Info extends Schema.Class<Info>("ModelV2.Info")({
       },
     })
   }
+}
+
+export type MutableInfo = Omit<Types.DeepMutable<Info>, "api"> & {
+  api: ProviderV2.MutableApi<Api>
 }
 
 export function parse(input: string): { providerID: ProviderV2.ID; modelID: ID } {

@@ -2,8 +2,8 @@ import { integer, index, primaryKey, sqliteTable, text } from "drizzle-orm/sqlit
 
 import type { ProjectID } from "@/project/schema"
 import type { SessionID } from "@/session/schema"
-import { SessionTable } from "@/session/session.sql"
-import { Timestamps } from "@/storage/schema.sql"
+import { Timestamps } from "@opencode-ai/core/database/schema.sql"
+import { SessionTable } from "@opencode-ai/core/session/sql"
 import type {
   WorkflowConsultationInfo,
   WorkflowGraphEdge,

@@ -14,7 +14,6 @@ import {
 } from "solid-js"
 import { makeEventListener } from "@solid-primitives/event-listener"
 import { useLocation, useNavigate, useParams } from "@solidjs/router"
-import { useQuery } from "@tanstack/solid-query"
 import { useLayout, LocalProject } from "@/context/layout"
 import { useServerSync } from "@/context/server-sync"
 import { Persist, persisted } from "@/utils/persist"
@@ -34,9 +33,10 @@ import { createStore, produce, reconcile } from "solid-js/store"
 import { DragDropProvider, DragDropSensors, DragOverlay, SortableProvider, closestCenter } from "@thisbeyond/solid-dnd"
 import type { DragEvent } from "@thisbeyond/solid-dnd"
 import { useProviders } from "@/hooks/use-providers"
-import { showToast, Toast, toaster } from "@opencode-ai/ui/toast"
+import { toaster } from "@opencode-ai/ui/toast"
+import { setV2Toast, showToast, ToastRegion } from "@/utils/toast"
 import { useServerSDK } from "@/context/server-sdk"
-import { clearWorkspaceTerminals, getTerminalServerScope } from "@/context/terminal"
+import { clearWorkspaceTerminals } from "@/context/terminal"
 import { dropSessionCaches, pickSessionCacheEvictions } from "@/context/global-sync/session-cache"
 import {
   clearSessionPrefetchInflight,
@@ -57,14 +57,17 @@ import { setNavigate } from "@/utils/notification-click"
 import { Worktree as WorktreeState } from "@/utils/worktree"
 import { setSessionHandoff } from "@/pages/session/handoff"
 import { sessionTitle } from "@/utils/session-title"
+import { SessionRouteKey, SessionStateKey } from "@/utils/server-scope"
 
 import { useDialog } from "@opencode-ai/ui/context/dialog"
 import { useTheme, type ColorScheme } from "@opencode-ai/ui/theme/context"
 import { useCommand, type CommandOption } from "@/context/command"
 import { ConstrainDragXAxis, getDraggableId } from "@/utils/solid-dnd"
 import { DebugBar } from "@/components/debug-bar"
+import { HelpButton } from "@/components/help-button"
 import { Titlebar, type TitlebarUpdate } from "@/components/titlebar"
-import { useServer } from "@/context/server"
+import { useDirectoryPicker } from "@/components/directory-picker"
+import { ServerConnection, useServer } from "@/context/server"
 import { useLanguage, type Locale } from "@/context/language"
 import { pathKey } from "@/utils/path-key"
 import {
@@ -92,8 +95,9 @@ import { ProjectDragOverlay, SortableProject, type ProjectSidebarContext } from 
 import { SidebarContent } from "./layout/sidebar-shell"
 
 export default function Layout(props: ParentProps) {
+  const serverSDK = useServerSDK()
   const [store, setStore, , ready] = persisted(
-    Persist.global("layout.page", ["layout.page.v1"]),
+    Persist.serverGlobal(serverSDK().scope, "layout.page", ["layout.page.v1"]),
     createStore({
       lastProjectSession: {} as { [directory: string]: { directory: string; id: string; at: number } },
       activeProject: undefined as string | undefined,
@@ -114,11 +118,11 @@ export default function Layout(props: ParentProps) {
   let dialogDead = false
 
   const params = useParams()
-  const serverSDK = useServerSDK()
   const serverSync = useServerSync()
   const layout = useLayout()
   const layoutReady = createMemo(() => layout.ready())
   const platform = usePlatform()
+  const pickDirectory = useDirectoryPicker()
   const settings = useSettings()
   const server = useServer()
   const notification = useNotification()
@@ -131,6 +135,7 @@ export default function Layout(props: ParentProps) {
   const theme = useTheme()
   const language = useLanguage()
   const newDesign = createMemo(() => settings.general.newLayoutDesigns())
+  createEffect(() => setV2Toast(newDesign()))
   const initialDirectory = decode64(params.dir)
   const location = useLocation()
   const route = createMemo(() => {
@@ -138,7 +143,7 @@ export default function Layout(props: ParentProps) {
     if (!slug) return { slug, dir: "" }
     const dir = decode64(slug)
     if (!dir) return { slug, dir: "" }
-    const store = serverSync.peek(dir, { bootstrap: false })
+    const store = serverSync().peek(dir, { bootstrap: false })
     return {
       slug,
       store,
@@ -168,32 +173,15 @@ export default function Layout(props: ParentProps) {
     sessionSidebarOpen: false,
   })
 
-  const [update, setUpdate] = createStore({
-    installing: false,
-  })
-  const updateQuery = useQuery(() => ({
-    queryKey: ["desktop", "update"] as const,
-    enabled: () =>
-      !!platform.checkUpdate && !!platform.updateAndRestart && settings.ready() && settings.updates.startup(),
-    queryFn: () => platform.checkUpdate?.() ?? Promise.resolve({ updateAvailable: false, version: undefined }),
-    refetchInterval: (query) => (query.state.data?.updateAvailable ? false : 10 * 60 * 1000),
-  }))
   const updateVersion = () => {
-    if (!settings.ready()) return
-    if (!settings.updates.startup()) return
-    if (!updateQuery.data?.updateAvailable) return
-    return updateQuery.data.version ?? ""
+    const state = platform.updater?.state()
+    if (state?.status !== "ready") return
+    return state.version
   }
-  const installUpdate = () => {
-    if (!platform.updateAndRestart) return
-    setUpdate("installing", true)
-    void platform.updateAndRestart().catch(() => {
-      setUpdate("installing", false)
-    })
-  }
+  const installUpdate = () => void platform.updater?.install()
   const titlebarUpdate: TitlebarUpdate = {
     version: updateVersion,
-    installing: () => update.installing,
+    installing: () => platform.updater?.state().status === "installing",
     install: installUpdate,
   }
 
@@ -229,7 +217,7 @@ export default function Layout(props: ParentProps) {
     active: () => state.hoverProject,
     el: () => state.nav?.querySelector<HTMLElement>("[data-component='sidebar-rail']") ?? state.nav,
     onActivate: (directory) => {
-      serverSync.child(directory)
+      serverSync().child(directory)
       setState("hoverProject", directory)
     },
   })
@@ -413,16 +401,20 @@ export default function Layout(props: ParentProps) {
         alertedAtBySession.delete(sessionKey)
       }
 
-      const unsub = serverSDK.event.listen((e) => {
+      const unsub = serverSDK().event.listen((e) => {
         if (e.details?.type === "worktree.ready") {
           setBusy(e.name, false)
-          WorktreeState.ready(e.name)
+          WorktreeState.ready(serverSDK().scope, e.name)
           return
         }
 
         if (e.details?.type === "worktree.failed") {
           setBusy(e.name, false)
-          WorktreeState.failed(e.name, e.details.properties?.message ?? language.t("common.requestFailed"))
+          WorktreeState.failed(
+            serverSDK().scope,
+            e.name,
+            e.details.properties?.message ?? language.t("common.requestFailed"),
+          )
           return
         }
 
@@ -447,7 +439,7 @@ export default function Layout(props: ParentProps) {
         const props = e.details.properties
         if (e.details.type === "permission.asked" && permission.autoResponds(e.details.properties, directory)) return
 
-        const [store] = serverSync.child(directory, { bootstrap: false })
+        const [store] = serverSync().child(directory, { bootstrap: false })
         const session = store.session.find((s) => s.id === props.sessionID)
         const sessionKey = `${directory}:${props.sessionID}`
 
@@ -510,7 +502,7 @@ export default function Layout(props: ParentProps) {
         if (!currentDir() || !currentSession) return
         const sessionKey = `${currentDir()}:${currentSession}`
         dismissSessionAlert(sessionKey)
-        const [store] = serverSync.child(currentDir(), { bootstrap: false })
+        const [store] = serverSync().child(currentDir(), { bootstrap: false })
         const childSessions = store.session.filter((s) => s.parentID === currentSession)
         for (const child of childSessions) {
           dismissSessionAlert(`${currentDir()}:${child.id}`)
@@ -548,11 +540,11 @@ export default function Layout(props: ParentProps) {
     const direct = projects.find((p) => pathKey(p.worktree) === key)
     if (direct) return direct
 
-    const [child] = serverSync.child(directory, { bootstrap: false })
+    const [child] = serverSync().child(directory, { bootstrap: false })
     const id = child.project
     if (!id) return
 
-    const meta = serverSync.data.project.find((p) => p.id === id)
+    const meta = serverSync().data.project.find((p) => p.id === id)
     const root = meta?.worktree
     if (!root) return
 
@@ -643,7 +635,7 @@ export default function Layout(props: ParentProps) {
 
     const result: Session[] = []
     for (const dir of dirs) {
-      const [dirStore] = serverSync.child(dir, { bootstrap: true })
+      const [dirStore] = serverSync().child(dir, { bootstrap: true })
       const dirSessions = sortedRootSessions(dirStore, now, sessionPinned)
       result.push(...dirSessions)
     }
@@ -695,10 +687,10 @@ export default function Layout(props: ParentProps) {
 
   createEffect(() => {
     route()
-    serverSDK.url
+    serverSDK().url
 
     prefetchToken.value += 1
-    clearSessionPrefetchInflight()
+    clearSessionPrefetchInflight(serverSDK().scope)
     prefetchQueues.clear()
   })
 
@@ -742,16 +734,17 @@ export default function Layout(props: ParentProps) {
   }
 
   async function prefetchMessages(directory: string, sessionID: string, token: number) {
-    const [store, setStore] = serverSync.child(directory, { bootstrap: false })
+    const [store, setStore] = serverSync().child(directory, { bootstrap: false })
 
     return runSessionPrefetch({
+      scope: serverSDK().scope,
       directory,
       sessionID,
       task: (rev) =>
-        retry(() => serverSDK.client.session.messages({ directory, sessionID, limit: prefetchChunk }))
+        retry(() => serverSDK().client.session.messages({ directory, sessionID, limit: prefetchChunk }))
           .then((messages) => {
             if (prefetchToken.value !== token) return
-            if (!isSessionPrefetchCurrent(directory, sessionID, rev)) return
+            if (!isSessionPrefetchCurrent(serverSDK().scope, directory, sessionID, rev)) return
 
             const items = (messages.data ?? []).filter((x) => !!x?.info?.id)
             const next = items.map((x) => x.info).filter((m): m is Message => !!m?.id)
@@ -766,9 +759,9 @@ export default function Layout(props: ParentProps) {
             }
 
             if (stale.length > 0) {
-              clearSessionPrefetch(directory, stale)
+              clearSessionPrefetch(serverSDK().scope, directory, stale)
               for (const id of stale) {
-                serverSync.todo.set(id, undefined)
+                serverSync().todo.set(id, undefined)
               }
             }
 
@@ -778,7 +771,7 @@ export default function Layout(props: ParentProps) {
               sorted,
             )
 
-            if (!isSessionPrefetchCurrent(directory, sessionID, rev)) return
+            if (!isSessionPrefetchCurrent(serverSDK().scope, directory, sessionID, rev)) return
 
             batch(() => {
               if (stale.length > 0) {
@@ -790,7 +783,7 @@ export default function Layout(props: ParentProps) {
               }
 
               setStore("message", sessionID, reconcile(merged, { key: "id" }))
-              setSessionPrefetch({ directory, sessionID, ...meta })
+              setSessionPrefetch({ scope: serverSDK().scope, directory, sessionID, ...meta })
 
               for (const message of items) {
                 const currentParts = store.part[message.info.id] ?? []
@@ -833,9 +826,9 @@ export default function Layout(props: ParentProps) {
     const directory = session.directory
     if (!directory) return
 
-    const [store] = serverSync.child(directory, { bootstrap: false })
+    const [store] = serverSync().child(directory, { bootstrap: false })
     const cached = untrack(() => {
-      const info = getSessionPrefetch(directory, session.id)
+      const info = getSessionPrefetch(serverSDK().scope, directory, session.id)
       return shouldSkipSessionPrefetch({
         message: store.message[session.id] !== undefined,
         info,
@@ -938,7 +931,7 @@ export default function Layout(props: ParentProps) {
     if (!target) return
 
     // warm up child store to prevent flicker
-    serverSync.child(target.worktree)
+    serverSync().child(target.worktree)
     void openProject(target.worktree)
   }
 
@@ -947,7 +940,7 @@ export default function Layout(props: ParentProps) {
     const target = projects[index]
     if (!target) return
 
-    serverSync.child(target.worktree)
+    serverSync().child(target.worktree)
     void openProject(target.worktree)
   }
 
@@ -976,12 +969,12 @@ export default function Layout(props: ParentProps) {
   }
 
   async function archiveSession(session: Session) {
-    const [store, setStore] = serverSync.child(session.directory)
+    const [store, setStore] = serverSync().child(session.directory)
     const sessions = store.session ?? []
     const index = sessions.findIndex((s) => s.id === session.id)
     const nextSession = sessions[index + 1] ?? sessions[index - 1]
 
-    await serverSDK.client.session.update({
+    await serverSDK().client.session.update({
       directory: session.directory,
       sessionID: session.id,
       time: { archived: Date.now() },
@@ -1002,8 +995,8 @@ export default function Layout(props: ParentProps) {
   }
 
   async function renameSession(session: Session, title: string) {
-    const [, setStore] = serverSync.child(session.directory)
-    await serverSDK.client.session.update({
+    const [, setStore] = serverSync().child(session.directory)
+    await serverSDK().client.session.update({
       directory: session.directory,
       sessionID: session.id,
       title,
@@ -1025,7 +1018,7 @@ export default function Layout(props: ParentProps) {
 
     for (let page = 0; page < 500; page++) {
       const response = await retry(() =>
-        serverSDK.client.session.messages({
+        serverSDK().client.session.messages({
           directory: session.directory,
           sessionID: session.id,
           limit,
@@ -1315,7 +1308,10 @@ export default function Layout(props: ParentProps) {
 
   function openSettings() {
     const run = ++dialogRun
-    void import("@/components/dialog-settings").then((x) => {
+    const module = settings.general.newLayoutDesigns()
+      ? import("@/components/settings-v2")
+      : import("@/components/dialog-settings")
+    void module.then((x) => {
       if (dialogDead || dialogRun !== run) return
       dialog.show(() => <x.DialogSettings />)
     })
@@ -1333,11 +1329,11 @@ export default function Layout(props: ParentProps) {
     )
     if (known) return known[0]
 
-    const [child] = serverSync.child(directory, { bootstrap: false })
+    const [child] = serverSync().child(directory, { bootstrap: false })
     const id = child.project
     if (!id) return directory
 
-    const meta = serverSync.data.project.find((item) => item.id === id)
+    const meta = serverSync().data.project.find((item) => item.id === id)
     return meta?.worktree ?? directory
   }
 
@@ -1385,8 +1381,8 @@ export default function Layout(props: ParentProps) {
     }
     const refreshDirs = async (target?: string) => {
       if (!target || target === root || canOpen(target)) return canOpen(target)
-      const listed = await serverSDK.client.worktree
-        .list({ directory: root })
+      const listed = await serverSDK()
+        .client.worktree.list({ directory: root })
         .then((x) => x.data ?? [])
         .catch(() => [] as string[])
       dirs = effectiveWorkspaceOrder(root, [root, ...listed], store.workspaceOrder[root])
@@ -1394,14 +1390,14 @@ export default function Layout(props: ParentProps) {
     }
     const openSession = async (target: { directory: string; id: string }) => {
       if (!canOpen(target.directory)) return false
-      const [data] = serverSync.child(target.directory, { bootstrap: false })
+      const [data] = serverSync().child(target.directory, { bootstrap: false })
       if (data.session.some((item) => item.id === target.id)) {
         setStore("lastProjectSession", root, { directory: target.directory, id: target.id, at: Date.now() })
         navigateWithSidebarReset(`/${base64Encode(target.directory)}/session/${target.id}`)
         return true
       }
-      const resolved = await serverSDK.client.session
-        .get({ sessionID: target.id })
+      const resolved = await serverSDK()
+        .client.session.get({ sessionID: target.id })
         .then((x) => x.data)
         .catch(() => undefined)
       if (!resolved?.directory) return false
@@ -1420,7 +1416,7 @@ export default function Layout(props: ParentProps) {
     }
 
     const latest = latestRootSession(
-      dirs.map((item) => serverSync.child(item, { bootstrap: false })[0]),
+      dirs.map((item) => serverSync().child(item, { bootstrap: false })[0]),
       Date.now(),
     )
     if (latest && (await openSession(latest))) {
@@ -1431,8 +1427,8 @@ export default function Layout(props: ParentProps) {
       await Promise.all(
         dirs.map(async (item) => ({
           path: { directory: item },
-          session: await serverSDK.client.session
-            .list({ directory: item })
+          session: await serverSDK()
+            .client.session.list({ directory: item })
             .then((x) => x.data ?? [])
             .catch(() => []),
         })),
@@ -1467,7 +1463,9 @@ export default function Layout(props: ParentProps) {
       void openProject(link.directory, false)
       const slug = base64Encode(link.directory)
       if (link.prompt) {
-        setSessionHandoff(slug, { prompt: link.prompt })
+        setSessionHandoff(SessionStateKey.from(server.scope(), SessionRouteKey.fromLegacy(slug)), {
+          prompt: link.prompt,
+        })
       }
       const href = link.prompt ? `/${slug}/session?prompt=${encodeURIComponent(link.prompt)}` : `/${slug}/session`
       navigateWithSidebarReset(href)
@@ -1492,11 +1490,11 @@ export default function Layout(props: ParentProps) {
     const name = next === getFilename(project.worktree) ? "" : next
 
     if (project.id && project.id !== "global") {
-      await serverSDK.client.project.update({ projectID: project.id, directory: project.worktree, name })
+      await serverSDK().client.project.update({ projectID: project.id, directory: project.worktree, name })
       return
     }
 
-    serverSync.project.meta(project.worktree, { name })
+    serverSync().project.meta(project.worktree, { name })
   }
 
   const renameWorkspace = (directory: string, next: string, projectId?: string, branch?: string) => {
@@ -1542,15 +1540,17 @@ export default function Layout(props: ParentProps) {
     layout.sidebar.toggleWorkspaces(project.worktree)
   }
 
-  const showEditProjectDialog = (project: LocalProject) => {
+  const showEditProjectDialog = (conn: ServerConnection.Any, project: LocalProject) => {
     const run = ++dialogRun
     void import("@/components/dialog-edit-project").then((x) => {
       if (dialogDead || dialogRun !== run) return
-      dialog.show(() => <x.DialogEditProject project={project} />)
+      dialog.show(() => <x.DialogEditProject server={conn} project={project} />)
     })
   }
 
-  async function chooseProject() {
+  function chooseProject() {
+    const conn = server.current
+    if (!conn) return
     function resolve(result: string | string[] | null) {
       if (Array.isArray(result)) {
         for (const directory of result) {
@@ -1562,22 +1562,12 @@ export default function Layout(props: ParentProps) {
       }
     }
 
-    if (platform.openDirectoryPickerDialog && server.isLocal()) {
-      const result = await platform.openDirectoryPickerDialog?.({
-        title: language.t("command.project.open"),
-        multiple: true,
-      })
-      resolve(result)
-    } else {
-      const run = ++dialogRun
-      void import("@/components/dialog-select-directory").then((x) => {
-        if (dialogDead || dialogRun !== run) return
-        dialog.show(
-          () => <x.DialogSelectDirectory multiple={true} onSelect={resolve} />,
-          () => resolve(null),
-        )
-      })
-    }
+    pickDirectory({
+      server: conn,
+      title: language.t("command.project.open"),
+      multiple: true,
+      onSelect: resolve,
+    })
   }
 
   const deleteWorkspace = async (root: string, directory: string, leaveDeletedWorkspace = false) => {
@@ -1593,8 +1583,8 @@ export default function Layout(props: ParentProps) {
 
     setBusy(directory, true)
 
-    const result = await serverSDK.client.worktree
-      .remove({ directory: root, worktreeRemoveInput: { directory } })
+    const result = await serverSDK()
+      .client.worktree.remove({ directory: root, worktreeRemoveInput: { directory } })
       .then((x) => x.data)
       .catch((err) => {
         showToast({
@@ -1612,7 +1602,7 @@ export default function Layout(props: ParentProps) {
       clearLastProjectSession(root)
     }
 
-    serverSync.set(
+    serverSync().set(
       "project",
       produce((draft) => {
         const project = draft.find((item) => item.worktree === root)
@@ -1651,8 +1641,8 @@ export default function Layout(props: ParentProps) {
     })
     const dismiss = () => toaster.dismiss(progress)
 
-    const sessions: Session[] = await serverSDK.client.session
-      .list({ directory })
+    const sessions: Session[] = await serverSDK()
+      .client.session.list({ directory })
       .then((x) => x.data ?? [])
       .catch(() => [])
 
@@ -1660,12 +1650,14 @@ export default function Layout(props: ParentProps) {
       directory,
       sessions.map((s) => s.id),
       platform,
-      getTerminalServerScope(server.current, server.key),
+      serverSDK().scope,
     )
-    await serverSDK.client.instance.dispose({ directory }).catch(() => undefined)
+    await serverSDK()
+      .client.instance.dispose({ directory })
+      .catch(() => undefined)
 
-    const result = await serverSDK.client.worktree
-      .reset({ directory: root, worktreeResetInput: { directory } })
+    const result = await serverSDK()
+      .client.worktree.reset({ directory: root, worktreeResetInput: { directory } })
       .then((x) => x.data)
       .catch((err) => {
         showToast({
@@ -1686,8 +1678,8 @@ export default function Layout(props: ParentProps) {
       sessions
         .filter((session) => session.time.archived === undefined)
         .map((session) =>
-          serverSDK.client.session
-            .update({
+          serverSDK()
+            .client.session.update({
               sessionID: session.id,
               directory: session.directory,
               time: { archived: archivedAt },
@@ -1727,8 +1719,8 @@ export default function Layout(props: ParentProps) {
     })
 
     onMount(() => {
-      serverSDK.client.file
-        .status({ directory: props.directory })
+      serverSDK()
+        .client.vcs.status({ directory: props.directory })
         .then((x) => {
           const files = x.data ?? []
           const dirty = files.length > 0
@@ -1786,8 +1778,8 @@ export default function Layout(props: ParentProps) {
     })
 
     const refresh = async () => {
-      const sessions = await serverSDK.client.session
-        .list({ directory: props.directory })
+      const sessions = await serverSDK()
+        .client.session.list({ directory: props.directory })
         .then((x) => x.data ?? [])
         .catch(() => [])
       const active = sessions.filter((session) => session.time.archived === undefined)
@@ -1795,8 +1787,8 @@ export default function Layout(props: ParentProps) {
     }
 
     onMount(() => {
-      serverSDK.client.file
-        .status({ directory: props.directory })
+      serverSDK()
+        .client.vcs.status({ directory: props.directory })
         .then((x) => {
           const files = x.data ?? []
           const dirty = files.length > 0
@@ -1929,7 +1921,7 @@ export default function Layout(props: ParentProps) {
         const next = new Set(dirs)
         for (const directory of next) {
           if (loadedSessionDirs.has(directory)) continue
-          void serverSync.project.loadSessions(directory)
+          void serverSync().project.loadSessions(directory)
         }
 
         loadedSessionDirs.clear()
@@ -1974,7 +1966,7 @@ export default function Layout(props: ParentProps) {
       directory && pathKey(directory) !== pathKey(local) && !dirs.some((item) => pathKey(item) === pathKey(directory))
         ? directory
         : undefined
-    const pending = extra ? WorktreeState.get(extra)?.status === "pending" : false
+    const pending = extra ? WorktreeState.get(serverSDK().scope, extra)?.status === "pending" : false
 
     const ordered = effectiveWorkspaceOrder(local, dirs, store.workspaceOrder[project.worktree])
     if (pending && extra) return [local, extra, ...ordered.filter((item) => item !== local)]
@@ -2026,8 +2018,8 @@ export default function Layout(props: ParentProps) {
 
   const createWorkspace = async (project: LocalProject) => {
     clearSidebarHoverState()
-    const created = await serverSDK.client.worktree
-      .create({ directory: project.worktree })
+    const created = await serverSDK()
+      .client.worktree.create({ directory: project.worktree })
       .then((x) => x.data)
       .catch((err) => {
         showToast({
@@ -2046,7 +2038,7 @@ export default function Layout(props: ParentProps) {
     const root = pathKey(local)
 
     setBusy(created.directory, true)
-    WorktreeState.pending(created.directory)
+    WorktreeState.pending(serverSDK().scope, created.directory)
     setStore("workspaceExpanded", key, true)
     if (key !== created.directory) {
       setStore("workspaceExpanded", created.directory, true)
@@ -2060,7 +2052,7 @@ export default function Layout(props: ParentProps) {
       return [created.directory, ...next]
     })
 
-    serverSync.child(created.directory)
+    serverSync().child(created.directory)
     navigateWithSidebarReset(`/${base64Encode(created.directory)}/session`)
   }
 
@@ -2111,7 +2103,7 @@ export default function Layout(props: ParentProps) {
     navigateToProject,
     openSidebar: () => layout.sidebar.open(),
     closeProject,
-    showEditProjectDialog,
+    showEditProjectDialog: (proj) => showEditProjectDialog(server.current!, proj),
     toggleProjectWorkspaces,
     workspacesEnabled: (project) => project.vcs === "git" && layout.sidebar.workspaces(project.worktree)(),
     workspaceIds,
@@ -2173,7 +2165,7 @@ export default function Layout(props: ParentProps) {
       if (!item) return false
       return item.vcs === "git" || layout.sidebar.workspaces(item.worktree)()
     })
-    const homedir = createMemo(() => serverSync.data.path.home)
+    const homedir = createMemo(() => serverSync().data.path.home)
 
     return (
       <div
@@ -2262,7 +2254,7 @@ export default function Layout(props: ParentProps) {
                       <DropdownMenu.Content class="mt-1">
                         <DropdownMenu.Item
                           onSelect={() => {
-                            showEditProjectDialog(project)
+                            showEditProjectDialog(server.current!, project)
                           }}
                         >
                           <DropdownMenu.ItemLabel>{language.t("common.edit")}</DropdownMenu.ItemLabel>
@@ -2518,8 +2510,9 @@ export default function Layout(props: ParentProps) {
               {props.children}
             </Show>
           </main>
-          {import.meta.env.DEV && <DebugBar />}
-          <Toast.Region />
+          {import.meta.env.DEV && import.meta.env.VITE_DISABLE_DEBUG_BAR !== "1" && <DebugBar />}
+          <HelpButton />
+          <ToastRegion v2={newDesign()} />
         </div>
       }
     >
@@ -2670,9 +2663,10 @@ export default function Layout(props: ParentProps) {
               </div>
             </div>
           </div>
-          {import.meta.env.DEV && <DebugBar />}
+          {import.meta.env.DEV && import.meta.env.VITE_DISABLE_DEBUG_BAR !== "1" && <DebugBar />}
         </div>
-        <Toast.Region />
+        <HelpButton />
+        <ToastRegion v2={newDesign()} />
       </div>
     </Show>
   )

@@ -2,7 +2,6 @@ import { afterEach, describe, expect } from "bun:test"
 import { Effect, Layer } from "effect"
 import { HttpRouter } from "effect/unstable/http"
 import path from "path"
-import { AppFileSystem } from "@opencode-ai/core/filesystem"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { createOpencodeClient } from "@opencode-ai/sdk/v2"
 import { InstanceBootstrap } from "../../src/project/bootstrap-service"
@@ -18,7 +17,6 @@ import { testEffect } from "../lib/effect"
 
 const it = testEffect(
   Layer.mergeAll(
-    AppFileSystem.defaultLayer,
     CrossSpawnSpawner.defaultLayer,
     InstanceStore.defaultLayer.pipe(
       Layer.provide(Layer.succeed(InstanceBootstrap.Service, InstanceBootstrap.Service.of({ run: Effect.void }))),

@@ -145,7 +145,7 @@ function resetKey(value: PermissionConfig | undefined) {
 export const SettingsPermissions: Component = () => {
   const language = useLanguage()
   const serverSync = useServerSync()
-  const normalized = normalizePermission(serverSync.data.config.permission)
+  const normalized = normalizePermission(serverSync().data.config.permission)
   const [synced, setSynced] = createSignal(configPreview(normalized.mode, normalized.rules))
 
   const [state, setState] = createStore({
@@ -155,7 +155,7 @@ export const SettingsPermissions: Component = () => {
   })
 
   createEffect(() => {
-    const current = normalizePermission(serverSync.data.config.permission)
+    const current = normalizePermission(serverSync().data.config.permission)
     const currentKey = configPreview(current.mode, current.rules)
     if (state.saving) return
 
@@ -207,7 +207,7 @@ export const SettingsPermissions: Component = () => {
   const selectedMode = () => modeOptions().find((item) => item.value === state.mode) ?? modeOptions()[0]
   const rulesEnabled = () => state.mode === "whitelist" || state.mode === "blacklist"
   const dirty = createMemo(() => {
-    return configPreview(state.mode, state.rules) !== resetKey(serverSync.data.config.permission)
+    return configPreview(state.mode, state.rules) !== resetKey(serverSync().data.config.permission)
   })
 
   const addRule = () => {
@@ -223,11 +223,11 @@ export const SettingsPermissions: Component = () => {
 
   const save = async () => {
     setState("saving", true)
-    const before = serverSync.data.config.permission
+    const before = serverSync().data.config.permission
     const next = configFrom(state.mode, state.rules)
-    serverSync.set("config", "permission", next)
+    serverSync().set("config", "permission", next)
 
-    await serverSync
+    await serverSync()
       .updateConfig({ permission: next })
       .then(() => {
         setSynced(configPreview(state.mode, state.rules))
@@ -239,7 +239,7 @@ export const SettingsPermissions: Component = () => {
         })
       })
       .catch((err: unknown) => {
-        serverSync.set("config", "permission", before)
+        serverSync().set("config", "permission", before)
         const message = err instanceof Error ? err.message : String(err)
         showToast({
           variant: "error",
@@ -362,7 +362,7 @@ export const SettingsPermissions: Component = () => {
             variant="secondary"
             disabled={!dirty() || state.saving}
             onClick={() => {
-              const current = normalizePermission(serverSync.data.config.permission)
+              const current = normalizePermission(serverSync().data.config.permission)
               setState({ mode: current.mode, rules: current.rules, saving: false })
               setSynced(configPreview(current.mode, current.rules))
             }}

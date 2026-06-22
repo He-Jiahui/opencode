@@ -13,6 +13,7 @@
 // version (changes per release), so we'd snapshot a moving target.
 import { describe, expect } from "bun:test"
 import { Effect } from "effect"
+import { EOL } from "os"
 import { cliIt } from "../../lib/cli-process"
 import { normalizeForSnapshot, PATH_SEP } from "../../lib/snapshot"
 
@@ -98,6 +99,14 @@ describe("opencode CLI help-text snapshots", () => {
     "every documented command emits stable help text",
     ({ opencode }) =>
       Effect.gen(function* () {
+        const topLevel = yield* opencode.spawn(["--help"], { env: SNAPSHOT_ENV })
+        expect(topLevel.exitCode).toBe(0)
+        expect(topLevel.stderr.endsWith(EOL)).toBe(true)
+        expect(topLevel.stderr).toContain("--mini")
+        expect(topLevel.stderr).not.toContain("--thinking")
+        expect(topLevel.stderr).not.toContain("--variant")
+        expect(topLevel.stderr).not.toContain("--demo")
+
         const argvs: Array<readonly string[]> = [...TOP_LEVEL.map((c) => [c] as const), ...SUBCOMMANDS]
 
         // Spawn in parallel, then assert in argv order so snapshot output is

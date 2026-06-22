@@ -9,18 +9,24 @@ import { showToast } from "@opencode-ai/ui/toast"
 import { base64Encode } from "@opencode-ai/core/util/encode"
 import { getDirectory, getFilename } from "@opencode-ai/core/util/path"
 import { useNavigate } from "@solidjs/router"
-import { createMemo, createSignal, Match, onCleanup, Show, Switch } from "solid-js"
+import { createMemo, createSignal, lazy, Match, onCleanup, Show, Switch } from "solid-js"
 import { formatKeybind, useCommand, type CommandOption } from "@/context/command"
-import { useServerSDK } from "@/context/server-sdk"
+import { useServerSDK, type ServerSDK } from "@/context/server-sdk"
 import { useServerSync } from "@/context/server-sync"
 import { useLayout } from "@/context/layout"
 import { useFile } from "@/context/file"
 import { useLanguage } from "@/context/language"
 import { usePlatform } from "@/context/platform"
+import { useServer } from "@/context/server"
+import { useSettings } from "@/context/settings"
 import { useSessionLayout } from "@/pages/session/session-layout"
 import { createSessionTabs } from "@/pages/session/helpers"
 import { decode64 } from "@/utils/base64"
 import { getRelativeTime } from "@/utils/time"
+
+const DialogSelectFileV2 = lazy(() =>
+  import("./dialog-select-directory-v2").then((module) => ({ default: module.DialogSelectDirectoryV2 })),
+)
 
 type EntryType = "command" | "file" | "session"
 
@@ -178,7 +184,7 @@ function createFileEntries(props: {
 function createSessionEntries(props: {
   workspaces: () => string[]
   label: (directory: string) => string
-  serverSDK: ReturnType<typeof useServerSDK>
+  serverSDK: ServerSDK
   language: ReturnType<typeof useLanguage>
 }) {
   const state: {
@@ -272,10 +278,12 @@ export function DialogSelectFile(props: {
 }) {
   const command = useCommand()
   const language = useLanguage()
+  const platform = usePlatform()
+  const server = useServer()
+  const settings = useSettings()
   const layout = useLayout()
   const file = useFile()
   const dialog = useDialog()
-  const platform = usePlatform()
   const navigate = useNavigate()
   const serverSDK = useServerSDK()
   const serverSync = useServerSync()
@@ -301,21 +309,21 @@ export function DialogSelectFile(props: {
     if (directory && !dirs.includes(directory)) return [...dirs, directory]
     return dirs
   })
-  const homedir = createMemo(() => serverSync.data.path.home)
+  const homedir = createMemo(() => serverSync().data.path.home)
   const label = (directory: string) => {
     const current = project()
     const kind =
       current && directory === current.worktree
         ? language.t("workspace.type.local")
         : language.t("workspace.type.sandbox")
-    const [store] = serverSync.child(directory, { bootstrap: false })
+    const [store] = serverSync().child(directory, { bootstrap: false })
     const home = homedir()
     const path = home ? directory.replace(home, "~") : directory
     const name = store.vcs?.branch ?? getFilename(directory)
     return `${kind} : ${name || path}`
   }
 
-  const { sessions } = createSessionEntries({ workspaces, label, serverSDK, language })
+  const { sessions } = createSessionEntries({ workspaces, label, serverSDK: serverSDK(), language })
 
   const items = async (text: string) => {
     const query = text.trim()
@@ -375,22 +383,23 @@ export function DialogSelectFile(props: {
   }
 
   const openNativeFilePicker = () => {
-    if (!props.nativeFilePicker || !platform.openFilePickerDialog) return
+    if (!props.nativeFilePicker || !platform.openAttachmentPickerDialog || !platform.getPathForFile) return
 
-    platform
-      .openFilePickerDialog({
-        title: language.t("session.plan.openFromFile"),
-        multiple: false,
-        extensions: [],
-      })
-      .then((result) => {
-        const path = Array.isArray(result) ? result[0] : result
-        if (!path) return
-        state.committed = true
-        state.cleanup = undefined
-        dialog.close()
-        handlePath(path)
-      })
+    void platform
+      .openAttachmentPickerDialog(
+        {
+          title: language.t("session.plan.openFromFile"),
+          multiple: false,
+        },
+        async (file) => {
+          const path = platform.getPathForFile?.(file)
+          if (!path) return
+          state.committed = true
+          state.cleanup = undefined
+          dialog.close()
+          handlePath(path)
+        },
+      )
       .catch(() => {
         showToast({ variant: "error", title: language.t("common.requestFailed") })
       })
@@ -422,9 +431,25 @@ export function DialogSelectFile(props: {
     state.cleanup?.()
   })
 
+  if (filesOnly() && platform.platform === "desktop" && settings.general.newLayoutDesigns() && server.current) {
+    return (
+      <DialogSelectFileV2
+        server={server.current}
+        mode="file"
+        start={projectDirectory()}
+        title={language.t("session.header.searchFiles")}
+        onSelect={(result) => {
+          if (typeof result !== "string") return
+          open(result)
+        }}
+      />
+    )
+  }
+
   return (
     <Dialog class="pt-3 pb-0 !max-h-[480px]" transition>
       <List
+        class="px-3"
         search={{
           placeholder: filesOnly()
             ? language.t("session.header.searchFiles")
@@ -432,7 +457,7 @@ export function DialogSelectFile(props: {
           autofocus: true,
           hideIcon: true,
           action: (
-            <Show when={props.nativeFilePicker && platform.openFilePickerDialog}>
+            <Show when={props.nativeFilePicker && platform.openAttachmentPickerDialog && platform.getPathForFile}>
               <Button
                 type="button"
                 size="small"
@@ -451,6 +476,7 @@ export function DialogSelectFile(props: {
         items={items}
         key={(item) => item.id}
         filterKeys={["title", "description", "category"]}
+        skipFilter={(item) => item.type === "file"}
         groupBy={grouped() ? (item) => item.category : () => ""}
         onMove={handleMove}
         onSelect={handleSelect}

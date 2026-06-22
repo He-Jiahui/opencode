@@ -11,6 +11,7 @@ import type {
   WorkflowInterventionInfo,
   WorkflowMemberInfo,
   WorkflowMilestoneInfo,
+  WorkflowModelWhitelistConfig,
   WorkflowSessionRef,
 } from "./schema"
 import { WorkflowID, WorkflowMilestoneID } from "./schema"
@@ -37,6 +38,7 @@ export const WorkflowTable = sqliteTable(
     status: text().$type<WorkflowInfo["status"]>().notNull(),
     staffing: text({ mode: "json" }).$type<WorkflowInfo["staffing"]>(),
     model: text({ mode: "json" }).$type<WorkflowInfo["model"]>(),
+    model_whitelist: text({ mode: "json" }).$type<WorkflowModelWhitelistConfig>(),
     agent: text(),
     test_path: text(),
     error: text(),

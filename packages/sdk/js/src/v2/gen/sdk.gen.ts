@@ -387,6 +387,7 @@ import type {
   WorkflowInterveneResponses,
   WorkflowListErrors,
   WorkflowListResponses,
+  WorkflowModelWhitelistConfig,
   WorkflowResumeErrors,
   WorkflowResumeResponses,
   WorkflowStaffingConfig,
@@ -5336,6 +5337,7 @@ export class Workflow extends HeyApiClient {
       directory?: string
       workspace?: string
       staffing?: WorkflowStaffingConfig
+      modelWhitelist?: WorkflowModelWhitelistConfig
     },
     options?: Options<never, ThrowOnError>,
   ) {
@@ -5348,6 +5350,7 @@ export class Workflow extends HeyApiClient {
             { in: "query", key: "directory" },
             { in: "query", key: "workspace" },
             { in: "body", key: "staffing" },
+            { in: "body", key: "modelWhitelist" },
           ],
         },
       ],

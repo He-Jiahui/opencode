@@ -49,7 +49,11 @@ export const workflowHandlers = HttpApiBuilder.group(InstanceHttpApi, "workflow"
       payload: typeof UpdateStaffingPayload.Type
     }) {
       return yield* workflow
-        .updateStaffing({ workflowID: ctx.params.workflowID, staffing: ctx.payload.staffing })
+        .updateStaffing({
+          workflowID: ctx.params.workflowID,
+          staffing: ctx.payload.staffing,
+          modelWhitelist: ctx.payload.modelWhitelist,
+        })
         .pipe(Effect.mapError(mapWorkflowError))
     })
 

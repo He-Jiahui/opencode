@@ -44,6 +44,31 @@ export const WorkflowStaffingConfig = Schema.Struct({
 }).annotate({ identifier: "WorkflowStaffingConfig" })
 export type WorkflowStaffingConfig = typeof WorkflowStaffingConfig.Type
 
+const WorkflowModelFields = {
+  providerID: ProviderID,
+  modelID: ModelID,
+  variant: Schema.optional(Schema.String),
+}
+
+const WorkflowModel = Schema.Struct(WorkflowModelFields)
+
+export const WorkflowModelWhitelistItem = Schema.Struct({
+  ...WorkflowModelFields,
+  weight: Schema.Finite.check(Schema.isGreaterThanOrEqualTo(0), Schema.isLessThanOrEqualTo(100)),
+}).annotate({ identifier: "WorkflowModelWhitelistItem" })
+export type WorkflowModelWhitelistItem = typeof WorkflowModelWhitelistItem.Type
+
+export const WorkflowModelWhitelistConfig = Schema.Struct({
+  requester: Schema.optional(Schema.Array(WorkflowModelWhitelistItem)),
+  mainPM: Schema.optional(Schema.Array(WorkflowModelWhitelistItem)),
+  departmentPM: Schema.optional(Schema.Array(WorkflowModelWhitelistItem)),
+  executor: Schema.optional(Schema.Array(WorkflowModelWhitelistItem)),
+  reviewer: Schema.optional(Schema.Array(WorkflowModelWhitelistItem)),
+  tester: Schema.optional(Schema.Array(WorkflowModelWhitelistItem)),
+  expert: Schema.optional(Schema.Array(WorkflowModelWhitelistItem)),
+}).annotate({ identifier: "WorkflowModelWhitelistConfig" })
+export type WorkflowModelWhitelistConfig = typeof WorkflowModelWhitelistConfig.Type
+
 export const WorkflowMemberStatus = Schema.Literals(["active", "paused"])
 export type WorkflowMemberStatus = typeof WorkflowMemberStatus.Type
 
@@ -187,12 +212,6 @@ export const WorkflowMilestone = Schema.Struct({
 }).annotate({ identifier: "WorkflowMilestone" })
 export type WorkflowMilestoneInfo = typeof WorkflowMilestone.Type
 
-const WorkflowModel = Schema.Struct({
-  providerID: ProviderID,
-  modelID: ModelID,
-  variant: Schema.optional(Schema.String),
-})
-
 export const WorkflowInfo = Schema.Struct({
   id: WorkflowID,
   projectID: ProjectID,
@@ -207,6 +226,7 @@ export const WorkflowInfo = Schema.Struct({
   status: WorkflowStatus,
   staffing: Schema.optional(WorkflowStaffingConfig),
   model: Schema.optional(WorkflowModel),
+  modelWhitelist: Schema.optional(WorkflowModelWhitelistConfig),
   agent: Schema.optional(Schema.String),
   testPath: Schema.optional(Schema.String),
   error: Schema.optional(Schema.String),

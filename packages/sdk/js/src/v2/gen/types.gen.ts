@@ -737,6 +737,23 @@ export type WorkflowStaffingConfig = {
   expert?: number
 }
 
+export type WorkflowModelWhitelistItem = {
+  providerID: string
+  modelID: string
+  variant?: string
+  weight: number
+}
+
+export type WorkflowModelWhitelistConfig = {
+  requester?: Array<WorkflowModelWhitelistItem>
+  mainPM?: Array<WorkflowModelWhitelistItem>
+  departmentPM?: Array<WorkflowModelWhitelistItem>
+  executor?: Array<WorkflowModelWhitelistItem>
+  reviewer?: Array<WorkflowModelWhitelistItem>
+  tester?: Array<WorkflowModelWhitelistItem>
+  expert?: Array<WorkflowModelWhitelistItem>
+}
+
 export type Workflow = {
   id: string
   projectID: string
@@ -767,6 +784,7 @@ export type Workflow = {
     modelID: string
     variant?: string
   }
+  modelWhitelist?: WorkflowModelWhitelistConfig
   agent?: string
   testPath?: string
   error?: string
@@ -2907,6 +2925,7 @@ export type WorkflowStartInput = {
   agent?: string
   title?: string
   staffing?: WorkflowStaffingConfig
+  modelWhitelist?: WorkflowModelWhitelistConfig
 }
 
 export type Workspace = {
@@ -3183,6 +3202,7 @@ export type Workflow7 = {
     modelID: string
     variant?: string
   }
+  modelWhitelist?: WorkflowModelWhitelistConfig
   agent?: string
   testPath?: string
   error?: string
@@ -11589,6 +11609,7 @@ export type WorkflowUpdateXmlResponse = WorkflowUpdateXmlResponses[keyof Workflo
 export type WorkflowUpdateStaffingData = {
   body?: {
     staffing: WorkflowStaffingConfig
+    modelWhitelist?: WorkflowModelWhitelistConfig
   }
   path: {
     workflowID: string

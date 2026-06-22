@@ -384,6 +384,7 @@ export const useSessionCommands = (actions: SessionCommandContext) => {
                   model: model ? `${model.provider.id}/${model.id}` : undefined,
                   variant: input.variant,
                   agent: local.agent.current()?.name,
+                  modelWhitelist: input.modelWhitelist,
                 },
               })
               .then(() => {

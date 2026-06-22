@@ -129,6 +129,10 @@ describe("workflow HttpApi", () => {
               tester: 1,
               expert: 1,
             },
+            modelWhitelist: {
+              mainPM: [{ providerID: "github-copilot", modelID: "gpt-5.5", variant: "high", weight: 90 }],
+              executor: [{ providerID: "github-copilot", modelID: "gpt-5.5", variant: "medium", weight: 60 }],
+            },
           },
         }),
       )
@@ -145,6 +149,11 @@ describe("workflow HttpApi", () => {
             tester: 1,
             expert: 1,
           },
+          modelWhitelist: {
+            mainPM: [{ providerID: "github-copilot", modelID: "gpt-5.5", variant: "xhigh", weight: 95 }],
+            executor: [{ providerID: "github-copilot", modelID: "gpt-5.5", variant: "medium", weight: 55 }],
+            tester: [{ providerID: "github-copilot", modelID: "gpt-5.5", weight: 70 }],
+          },
         }),
       )
       if (!updated.data) throw new Error("workflow staffing update returned no data")
@@ -156,6 +165,23 @@ describe("workflow HttpApi", () => {
         reviewer: 1,
         tester: 1,
         expert: 1,
+      })
+      expect(updated.data.modelWhitelist?.mainPM?.[0]).toMatchObject({
+        providerID: "github-copilot",
+        modelID: "gpt-5.5",
+        variant: "xhigh",
+        weight: 95,
+      })
+      expect(updated.data.modelWhitelist?.executor?.[0]).toMatchObject({
+        providerID: "github-copilot",
+        modelID: "gpt-5.5",
+        variant: "medium",
+        weight: 55,
+      })
+      expect(updated.data.modelWhitelist?.tester?.[0]).toMatchObject({
+        providerID: "github-copilot",
+        modelID: "gpt-5.5",
+        weight: 70,
       })
 
       const staffed = yield* Effect.promise(() => sdk.workflow.graph({ workflowID: staffedWorkflow.data!.id }))

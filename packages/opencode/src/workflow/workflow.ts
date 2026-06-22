@@ -34,6 +34,8 @@ import {
   WorkflowRole,
   WorkflowMilestone,
   WorkflowMilestoneID,
+  WorkflowModelWhitelistConfig,
+  type WorkflowModelWhitelistItem,
   WorkflowStaffingConfig,
   type WorkflowConsultationInfo,
   type WorkflowDefinition,
@@ -74,6 +76,7 @@ CREATE TABLE IF NOT EXISTS workflow (
   status text NOT NULL,
   staffing text,
   model text,
+  model_whitelist text,
   agent text,
   test_path text,
   error text,
@@ -191,6 +194,7 @@ CREATE TABLE IF NOT EXISTS workflow_next (
   status text NOT NULL,
   staffing text,
   model text,
+  model_whitelist text,
   agent text,
   test_path text,
   error text,
@@ -202,7 +206,7 @@ CREATE TABLE IF NOT EXISTS workflow_next (
   FOREIGN KEY (tester_session_id) REFERENCES session(id) ON DELETE set null
 );
 INSERT INTO workflow_next
-SELECT id, project_id, root_session_id, pm_session_id, tester_session_id, request, title, directory, path, xml, status, NULL, model, agent, test_path, error, time_created, time_updated, time_completed
+SELECT id, project_id, root_session_id, pm_session_id, tester_session_id, request, title, directory, path, xml, status, NULL, model, NULL, agent, test_path, error, time_created, time_updated, time_completed
 FROM workflow
 WHERE EXISTS (SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'workflow');
 DROP TABLE workflow;
@@ -257,6 +261,7 @@ export const StartInput = Schema.Struct({
   agent: Schema.optional(Schema.String),
   title: Schema.optional(Schema.String),
   staffing: Schema.optional(WorkflowStaffingConfig),
+  modelWhitelist: Schema.optional(WorkflowModelWhitelistConfig),
 }).annotate({ identifier: "WorkflowStartInput" })
 export type StartInput = typeof StartInput.Type
 
@@ -269,6 +274,7 @@ export type UpdateXmlInput = typeof UpdateXmlInput.Type
 export const UpdateStaffingInput = Schema.Struct({
   workflowID: WorkflowID,
   staffing: WorkflowStaffingConfig,
+  modelWhitelist: Schema.optional(WorkflowModelWhitelistConfig),
 }).annotate({ identifier: "WorkflowUpdateStaffingInput" })
 export type UpdateStaffingInput = typeof UpdateStaffingInput.Type
 
@@ -370,6 +376,123 @@ function normalizeStaffing(input: WorkflowStaffingConfig | undefined) {
 function staffLimit(value: number | undefined, fallback: number, minimum: number) {
   if (value === undefined || !Number.isFinite(value)) return fallback
   return Math.max(minimum, Math.min(12, Math.trunc(value)))
+}
+
+const workflowModelRoles = ["requester", "main_pm", "department_pm", "executor", "reviewer", "tester", "expert"] as const
+
+function workflowModelWhitelistKey(role: WorkflowSessionRef["role"]) {
+  if (role === "main_pm") return "mainPM"
+  if (role === "department_pm") return "departmentPM"
+  return role
+}
+
+function workflowModelWeight(value: number | undefined) {
+  if (value === undefined || !Number.isFinite(value)) return 50
+  return Math.max(0, Math.min(100, value))
+}
+
+function normalizeWorkflowModelWhitelist(input: WorkflowModelWhitelistConfig | undefined) {
+  if (!input) return undefined
+  const normalized = Object.fromEntries(
+    workflowModelRoles.flatMap((role) => {
+      const key = workflowModelWhitelistKey(role)
+      const entries = (input[key] ?? [])
+        .filter((item) => item.providerID && item.modelID)
+        .map((item) => ({
+          providerID: item.providerID,
+          modelID: item.modelID,
+          ...(item.variant?.trim() ? { variant: item.variant.trim() } : {}),
+          weight: workflowModelWeight(item.weight),
+        }))
+      return entries.length > 0 ? [[key, entries]] : []
+    }),
+  ) as WorkflowModelWhitelistConfig
+  return Object.keys(normalized).length === 0 ? undefined : normalized
+}
+
+function workflowModelWhitelistForRole(
+  workflow: Pick<WorkflowInfo, "model" | "modelWhitelist">,
+  role: WorkflowSessionRef["role"],
+) {
+  const configured = workflow.modelWhitelist?.[workflowModelWhitelistKey(role)] ?? []
+  if (configured.length > 0) return configured
+  return workflow.model ? [{ ...workflow.model, weight: 50 }] : []
+}
+
+function workflowModelRefText(model: WorkflowInfo["model"] | WorkflowModelWhitelistItem | undefined) {
+  if (!model) return "default session model"
+  return `${model.providerID}/${model.modelID}${model.variant ? ` (${model.variant})` : ""}`
+}
+
+function workflowModelComplexity(text: string) {
+  const lower = text.toLowerCase()
+  const keywords = [
+    "architecture",
+    "migration",
+    "security",
+    "performance",
+    "concurrency",
+    "database",
+    "schema",
+    "integration",
+    "refactor",
+    "workflow",
+    "renderer",
+    "protocol",
+    "复杂",
+    "架构",
+    "迁移",
+    "安全",
+    "性能",
+    "并发",
+    "数据库",
+    "集成",
+    "重构",
+  ]
+  const keywordScore = keywords.filter((keyword) => lower.includes(keyword)).length * 8
+  const lengthScore = Math.min(40, Math.floor(text.length / 180))
+  const checklistScore = Math.min(20, (text.match(/\n[-*]|\n\d+\./g)?.length ?? 0) * 3)
+  const codeScore = Math.min(20, (text.match(/`|\.tsx?|\.jsx?|\.sql|\.json|\.md|class |function |interface /g)?.length ?? 0) * 2)
+  return Math.max(0, Math.min(100, 15 + keywordScore + lengthScore + checklistScore + codeScore))
+}
+
+function selectWorkflowModelFromWhitelist(input: {
+  workflow: Pick<WorkflowInfo, "model" | "modelWhitelist">
+  role: WorkflowSessionRef["role"]
+  prompt: string
+  fallback?: WorkflowInfo["model"]
+}) {
+  const whitelist = workflowModelWhitelistForRole(input.workflow, input.role)
+  if (whitelist.length === 0) return input.fallback
+  const complexity = workflowModelComplexity(input.prompt)
+  return whitelist
+    .toSorted(
+      (a, b) =>
+        Math.abs(workflowModelWeight(a.weight) - complexity) - Math.abs(workflowModelWeight(b.weight) - complexity) ||
+        workflowModelWeight(b.weight) - workflowModelWeight(a.weight),
+    )
+    .at(0)
+}
+
+function workflowModelSelectionPrompt(input: {
+  workflow: Pick<WorkflowInfo, "model" | "modelWhitelist">
+  role: WorkflowSessionRef["role"]
+  selected?: WorkflowInfo["model"] | WorkflowModelWhitelistItem
+  prompt: string
+}) {
+  const whitelist = workflowModelWhitelistForRole(input.workflow, input.role)
+  if (whitelist.length === 0) return []
+  return [
+    "## Workflow Model Selection",
+    "",
+    `Selected model for this turn: ${workflowModelRefText(input.selected)}`,
+    `Estimated task complexity: ${workflowModelComplexity(input.prompt)}/100`,
+    "Role model whitelist; higher weight means stronger reasoning and usually higher token cost:",
+    ...whitelist
+      .toSorted((a, b) => workflowModelWeight(a.weight) - workflowModelWeight(b.weight))
+      .map((item) => `- ${workflowModelRefText(item)} weight=${workflowModelWeight(item.weight)}`),
+    "When you delegate work, prefer cheaper/lower-weight models for narrow routine tasks and higher-weight models for broad, risky, architectural, or ambiguous tasks.",
+  ]
 }
 
 function workflowAutorunEnabled() {
@@ -676,6 +799,7 @@ function ensureSchema() {
   ensureColumn("workflow", "status", "ALTER TABLE workflow ADD COLUMN status text NOT NULL DEFAULT 'planning'")
   ensureColumn("workflow", "staffing", "ALTER TABLE workflow ADD COLUMN staffing text")
   ensureColumn("workflow", "model", "ALTER TABLE workflow ADD COLUMN model text")
+  ensureColumn("workflow", "model_whitelist", "ALTER TABLE workflow ADD COLUMN model_whitelist text")
   ensureColumn("workflow", "agent", "ALTER TABLE workflow ADD COLUMN agent text")
   ensureColumn("workflow", "test_path", "ALTER TABLE workflow ADD COLUMN test_path text")
   ensureColumn("workflow", "error", "ALTER TABLE workflow ADD COLUMN error text")
@@ -716,6 +840,7 @@ function toInfo(row: typeof WorkflowTable.$inferSelect): WorkflowInfo {
     status: row.status,
     staffing: row.staffing ?? undefined,
     model: row.model ?? undefined,
+    modelWhitelist: row.model_whitelist ?? undefined,
     agent: row.agent ?? undefined,
     testPath: row.test_path ?? undefined,
     error: row.error ?? undefined,
@@ -1520,6 +1645,18 @@ function organizationMarkdown(input: {
     `- Reviewer support: ${staffing.reviewer}`,
     `- Tester: ${staffing.tester}`,
     `- Technical advisor: ${staffing.expert}`,
+    "",
+    "## Model Whitelists",
+    "",
+    ...workflowModelRoles.flatMap((role) => {
+      const items = workflowModelWhitelistForRole(input.workflow, role)
+      return [
+        `- ${roleSessionTitle(role)}:`,
+        ...(items.length === 0
+          ? ["  - default session model"]
+          : items.map((item) => `  - ${workflowModelRefText(item)} weight=${workflowModelWeight(item.weight)}`)),
+      ]
+    }),
     "",
     "## Staff",
     "",
@@ -4713,16 +4850,38 @@ export const layer: Layer.Layer<
       options?: { consult?: boolean; expect?: WorkflowPromptExpectation },
     ) {
       const runOnce = Effect.fn("Workflow.runPromptOnce")(function* (nextText: string) {
-        const promptText = archive ? yield* workflowPromptText(sessionID, nextText, archive) : nextText
+        const basePromptText = archive ? yield* workflowPromptText(sessionID, nextText, archive) : nextText
+        const selectionWorkflow = archive ? yield* get(archive.workflowID) : undefined
+        const selectedModel = selectionWorkflow
+          ? selectWorkflowModelFromWhitelist({
+              workflow: selectionWorkflow,
+              role: archive!.role,
+              prompt: basePromptText,
+              fallback: model,
+            })
+          : model
+        const promptText = selectionWorkflow
+          ? [
+              basePromptText,
+              "",
+              ...workflowModelSelectionPrompt({
+                workflow: selectionWorkflow,
+                role: archive!.role,
+                selected: selectedModel,
+                prompt: basePromptText,
+              }),
+            ].join("\n")
+          : basePromptText
         const messageID = MessageID.ascending()
         workflowManagedMessageKeys.add(workflowMessageKey(sessionID, messageID))
         return {
           promptText,
+          model: selectedModel,
           result: yield* prompt.prompt({
             sessionID,
             agent,
-            model: modelRef(model),
-            variant: model?.variant,
+            model: modelRef(selectedModel),
+            variant: selectedModel?.variant,
             messageID,
             parts: [textPart(promptText)],
           }),
@@ -4730,6 +4889,7 @@ export const layer: Layer.Layer<
       })
       const archiveResult = Effect.fn("Workflow.archivePromptResult")(function* (input: {
         promptText: string
+        model?: WorkflowInfo["model"]
         result: MessageV2.WithParts
       }) {
         if (!archive) return
@@ -4754,7 +4914,7 @@ export const layer: Layer.Layer<
             archive.workflowID,
             sessionID,
             agent,
-            model,
+            input.model,
             archive.role,
             archive.milestoneID,
             archive.attempt,
@@ -6724,6 +6884,7 @@ export const layer: Layer.Layer<
         catch: (error) => new Error({ message: error instanceof globalThis.Error ? error.message : String(error) }),
       })
       const staffing = normalizeStaffing(input.staffing)
+      const modelWhitelist = normalizeWorkflowModelWhitelist(input.modelWhitelist)
       const root = requester ?? (yield* session.create({
         title: workflowRequesterTitle(request),
         agent: input.agent,
@@ -6743,6 +6904,7 @@ export const layer: Layer.Layer<
         status: "planning",
         staffing,
         model,
+        modelWhitelist,
         agent: input.agent,
         time: {
           created: time,
@@ -6763,6 +6925,7 @@ export const layer: Layer.Layer<
             status: info.status,
             staffing: info.staffing,
             model: info.model,
+            model_whitelist: info.modelWhitelist,
             agent: info.agent,
             time_created: info.time.created,
             time_updated: info.time.updated,
@@ -6822,10 +6985,12 @@ export const layer: Layer.Layer<
       yield* InstanceState.get(initState)
       const workflow = yield* get(input.workflowID)
       const staffing = normalizeStaffing(input.staffing)
+      const modelWhitelist =
+        input.modelWhitelist === undefined ? workflow.modelWhitelist : normalizeWorkflowModelWhitelist(input.modelWhitelist)
       Database.use((db) =>
         db
           .update(WorkflowTable)
-          .set({ staffing, time_updated: Date.now() })
+          .set({ staffing, model_whitelist: modelWhitelist ?? null, time_updated: Date.now() })
           .where(eq(WorkflowTable.id, input.workflowID))
           .run(),
       )

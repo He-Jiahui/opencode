@@ -52,6 +52,8 @@ import { useServerSDK } from "@/context/server-sdk"
 import { useSettings } from "@/context/settings"
 import { useSync } from "@/context/sync"
 import { useTerminal } from "@/context/terminal"
+import { useModels } from "@/context/models"
+import { listModelVariants } from "@/context/model-variant"
 import { type FollowupDraft, sendFollowupDraft } from "@/components/prompt-input/submit"
 import type { OpencodePlanBlock } from "@/utils/opencode-plan"
 import { createSessionComposerState, SessionComposerRegion } from "@/pages/session/composer"
@@ -131,6 +133,15 @@ const emptyPlanMilestones: PlanMilestone[] = []
 
 const emptyWorkflowList: WorkflowGraph["workflow"][] = []
 type WorkflowStaffing = NonNullable<WorkflowGraph["workflow"]["staffing"]>
+type WorkflowModelWhitelist = NonNullable<WorkflowGraph["workflow"]["modelWhitelist"]>
+type WorkflowModelWhitelistRole = keyof Required<WorkflowModelWhitelist>
+type WorkflowModelWhitelistEntry = {
+  providerID: string
+  modelID: string
+  variant?: string
+  weight: number
+}
+type WorkflowModelWhitelistStore = Record<WorkflowModelWhitelistRole, WorkflowModelWhitelistEntry[]>
 const defaultWorkflowStaffing: Required<WorkflowStaffing> = {
   mainPM: 1,
   departmentPM: 2,
@@ -147,8 +158,22 @@ const workflowStaffingFields = [
   ["tester", "session.workflow.staffing.tester"],
   ["expert", "session.workflow.staffing.expert"],
 ] as const
+const workflowModelWhitelistRoles = [
+  ["requester", "session.workflow.modelWhitelist.requester"],
+  ["mainPM", "session.workflow.staffing.mainPM"],
+  ["departmentPM", "session.workflow.staffing.departmentPM"],
+  ["executor", "session.workflow.staffing.executor"],
+  ["reviewer", "session.workflow.staffing.reviewer"],
+  ["tester", "session.workflow.staffing.tester"],
+  ["expert", "session.workflow.staffing.expert"],
+] as const
 const workflowStaffingValue = (value: number | undefined, fallback: number) =>
   Number.isFinite(value) ? Math.max(1, Math.min(12, Math.trunc(value!))) : fallback
+const workflowModelWeight = (value: unknown) => {
+  const parsed = Number(value)
+  if (!Number.isFinite(parsed)) return 50
+  return Math.max(0, Math.min(100, parsed))
+}
 const normalizeWorkflowStaffing = (input?: WorkflowStaffing): Required<WorkflowStaffing> => ({
   mainPM: workflowStaffingValue(input?.mainPM, defaultWorkflowStaffing.mainPM),
   departmentPM: workflowStaffingValue(input?.departmentPM, defaultWorkflowStaffing.departmentPM),
@@ -157,6 +182,34 @@ const normalizeWorkflowStaffing = (input?: WorkflowStaffing): Required<WorkflowS
   tester: workflowStaffingValue(input?.tester, defaultWorkflowStaffing.tester),
   expert: workflowStaffingValue(input?.expert, defaultWorkflowStaffing.expert),
 })
+const normalizeWorkflowModelWhitelistEntries = (items: WorkflowModelWhitelist[WorkflowModelWhitelistRole] | undefined) =>
+  (items ?? []).map((item) => ({
+    providerID: item.providerID,
+    modelID: item.modelID,
+    ...(item.variant ? { variant: item.variant } : {}),
+    weight: workflowModelWeight(item.weight),
+  }))
+const normalizeWorkflowModelWhitelist = (input?: WorkflowModelWhitelist): WorkflowModelWhitelistStore => ({
+  requester: normalizeWorkflowModelWhitelistEntries(input?.requester),
+  mainPM: normalizeWorkflowModelWhitelistEntries(input?.mainPM),
+  departmentPM: normalizeWorkflowModelWhitelistEntries(input?.departmentPM),
+  executor: normalizeWorkflowModelWhitelistEntries(input?.executor),
+  reviewer: normalizeWorkflowModelWhitelistEntries(input?.reviewer),
+  tester: normalizeWorkflowModelWhitelistEntries(input?.tester),
+  expert: normalizeWorkflowModelWhitelistEntries(input?.expert),
+})
+const workflowModelWhitelistPayload = (input: WorkflowModelWhitelistStore): WorkflowModelWhitelist =>
+  Object.fromEntries(
+    workflowModelWhitelistRoles.flatMap(([role]) => {
+      const entries = input[role].map((entry) => ({
+        providerID: entry.providerID,
+        modelID: entry.modelID,
+        ...(entry.variant ? { variant: entry.variant } : {}),
+        weight: workflowModelWeight(entry.weight),
+      }))
+      return entries.length > 0 ? [[role, entries]] : []
+    }),
+  ) as WorkflowModelWhitelist
 type WorkflowInterventionTiming = "after-task" | "temporary-interrupt" | "interrupt"
 const workflowInterventionTimingOptions: WorkflowInterventionTiming[] = [
   "temporary-interrupt",
@@ -334,6 +387,7 @@ export default function Page() {
   const comments = useComments()
   const terminal = useTerminal()
   const server = useServer()
+  const models = useModels()
   const [searchParams, setSearchParams] = useSearchParams<{ prompt?: string }>()
   const location = useLocation()
   const navigate = useNavigate()
@@ -505,6 +559,49 @@ export default function Page() {
     interventionTiming: "temporary-interrupt" as WorkflowInterventionTiming,
   })
   const [workflowStaffing, setWorkflowStaffing] = createStore(normalizeWorkflowStaffing())
+  const [workflowModelWhitelist, setWorkflowModelWhitelist] = createStore(normalizeWorkflowModelWhitelist())
+  const workflowModelOptions = createMemo(() =>
+    models.list().map((model) => ({
+      providerID: model.provider.id,
+      modelID: model.id,
+      name: `${model.provider.name} / ${model.name}`,
+      variants: listModelVariants({
+        providerID: model.provider.id,
+        modelID: model.id,
+        variants: model.variants,
+      }),
+    })),
+  )
+  const addWorkflowModelWhitelist = (role: WorkflowModelWhitelistRole) => {
+    const model = workflowModelOptions()[0]
+    if (!model) return
+    setWorkflowModelWhitelist(role, workflowModelWhitelist[role].length, {
+      providerID: model.providerID,
+      modelID: model.modelID,
+      weight: 50,
+    })
+  }
+  const selectWorkflowModelWhitelist = (
+    role: WorkflowModelWhitelistRole,
+    index: number,
+    model: ReturnType<typeof workflowModelOptions>[number] | undefined,
+  ) => {
+    if (!model) return
+    const current = workflowModelWhitelist[role][index]
+    if (!current) return
+    setWorkflowModelWhitelist(role, index, {
+      ...current,
+      providerID: model.providerID,
+      modelID: model.modelID,
+      variant: undefined,
+    })
+  }
+  const removeWorkflowModelWhitelist = (role: WorkflowModelWhitelistRole, index: number) => {
+    setWorkflowModelWhitelist(
+      role,
+      workflowModelWhitelist[role].filter((_, itemIndex) => itemIndex !== index),
+    )
+  }
   const [workflowMenu, setWorkflowMenu] = createSignal<WorkflowReactFlowContextTarget>()
   const workflowSessionLog = createMemo(() => {
     const graph = activeWorkflowGraph()
@@ -530,6 +627,15 @@ export default function Page() {
       () => activeWorkflowGraph()?.workflow.staffing ?? activeWorkflow()?.staffing,
       (staffing) => {
         setWorkflowStaffing(normalizeWorkflowStaffing(staffing))
+      },
+    ),
+  )
+
+  createEffect(
+    on(
+      () => activeWorkflowGraph()?.workflow.modelWhitelist ?? activeWorkflow()?.modelWhitelist,
+      (modelWhitelist) => {
+        setWorkflowModelWhitelist(normalizeWorkflowModelWhitelist(modelWhitelist))
       },
     ),
   )
@@ -1618,7 +1724,12 @@ export default function Page() {
   }
 
   const startWorkflowMutation = useMutation(() => ({
-    mutationFn: async (input: { request: string; variant?: string; staffing: WorkflowStaffing }) => {
+    mutationFn: async (input: {
+      request: string
+      variant?: string
+      staffing: WorkflowStaffing
+      modelWhitelist: WorkflowModelWhitelistStore
+    }) => {
       const sessionID = params.id
       const result = await sdk().client.workflow.start({
         workflowStartInput: {
@@ -1628,6 +1739,7 @@ export default function Page() {
           variant: input.variant,
           agent: local.agent.current()?.name,
           staffing: input.staffing,
+          modelWhitelist: workflowModelWhitelistPayload(input.modelWhitelist),
         },
       })
       if (result.data) {
@@ -1692,7 +1804,11 @@ export default function Page() {
       const workflow = activeWorkflow()
       if (!workflow) return
       return sdk().client.workflow
-        .updateStaffing({ workflowID: workflow.id, staffing: { ...workflowStaffing } })
+        .updateStaffing({
+          workflowID: workflow.id,
+          staffing: { ...workflowStaffing },
+          modelWhitelist: workflowModelWhitelistPayload(workflowModelWhitelist),
+        })
         .then((result) => result.data)
     },
     onSuccess: (workflow) => {
@@ -2275,6 +2391,104 @@ export default function Page() {
                                   )
                                 }
                               />
+                            )}
+                          </For>
+                        </div>
+                        <div class="flex flex-col gap-3 border-t border-border-weak-base pt-2">
+                          <div>
+                            <div class="text-12-medium text-text-base">
+                              {language.t("session.workflow.modelWhitelist.title")}
+                            </div>
+                            <div class="text-11-regular text-text-muted">
+                              {language.t("session.workflow.modelWhitelist.description")}
+                            </div>
+                          </div>
+                          <For each={workflowModelWhitelistRoles}>
+                            {([role, label]) => (
+                              <div class="flex flex-col gap-2">
+                                <div class="flex items-center justify-between gap-2">
+                                  <div class="text-12-medium text-text-weak">{language.t(label)}</div>
+                                  <Button
+                                    type="button"
+                                    size="small"
+                                    variant="secondary"
+                                    icon="plus-small"
+                                    disabled={workflowModelOptions().length === 0}
+                                    onClick={() => addWorkflowModelWhitelist(role)}
+                                  >
+                                    {language.t("session.workflow.modelWhitelist.add")}
+                                  </Button>
+                                </div>
+                                <Show
+                                  when={workflowModelWhitelist[role].length > 0}
+                                  fallback={
+                                    <div class="rounded-md border border-border-weak-base px-2 py-1.5 text-12-regular text-text-muted">
+                                      {language.t("session.workflow.modelWhitelist.empty")}
+                                    </div>
+                                  }
+                                >
+                                  <div class="flex flex-col gap-2">
+                                    <For each={workflowModelWhitelist[role]}>
+                                      {(entry, index) => {
+                                        const selectedModel = () =>
+                                          workflowModelOptions().find(
+                                            (model) =>
+                                              model.providerID === entry.providerID && model.modelID === entry.modelID,
+                                          )
+                                        const variantOptions = () => ["default", ...(selectedModel()?.variants ?? [])]
+                                        return (
+                                          <div class="grid grid-cols-1 gap-2 rounded-md border border-border-weak-base p-2 md:grid-cols-[minmax(0,1fr)_140px_96px_auto] md:items-end">
+                                            <Select
+                                              size="small"
+                                              variant="secondary"
+                                              options={workflowModelOptions()}
+                                              current={selectedModel()}
+                                              value={(model) => `${model.providerID}/${model.modelID}`}
+                                              label={(model) => model.name}
+                                              onSelect={(model) => selectWorkflowModelWhitelist(role, index(), model)}
+                                              valueClass="truncate text-12-regular"
+                                            />
+                                            <Select
+                                              size="small"
+                                              variant="secondary"
+                                              options={variantOptions()}
+                                              current={entry.variant ?? "default"}
+                                              label={(value) => (value === "default" ? language.t("common.default") : value)}
+                                              onSelect={(value) =>
+                                                setWorkflowModelWhitelist(
+                                                  role,
+                                                  index(),
+                                                  "variant",
+                                                  value === "default" ? undefined : value,
+                                                )
+                                              }
+                                              valueClass="truncate text-12-regular"
+                                            />
+                                            <TextField
+                                              type="number"
+                                              min="0"
+                                              max="100"
+                                              step="1"
+                                              label={language.t("session.workflow.modelWhitelist.weight")}
+                                              value={String(entry.weight)}
+                                              onChange={(value) =>
+                                                setWorkflowModelWhitelist(role, index(), "weight", workflowModelWeight(value))
+                                              }
+                                            />
+                                            <Button
+                                              type="button"
+                                              size="small"
+                                              variant="ghost"
+                                              icon="close"
+                                              onClick={() => removeWorkflowModelWhitelist(role, index())}
+                                            />
+                                          </div>
+                                        )
+                                      }}
+                                    </For>
+                                  </div>
+                                </Show>
+                              </div>
                             )}
                           </For>
                         </div>

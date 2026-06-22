@@ -20,7 +20,7 @@ import { WorkflowID, WorkflowMilestoneID, type WorkflowInfo, type WorkflowMember
 describe("parseConsultRequests", () => {
   test("parses direct session consultations with timing and reason", () => {
     const requests = parseConsultRequests(`
-        <opencode-workflow-consult target-session="ses_target" timing="temporary-interrupt" reason="needs exact API contract">
+        <opencode-workflow-consult target-session="ses_target" timing="temporary-interrupt" reason="needs exact API contract" model-weight="85">
           What did you decide for the shared plugin contract?
         </opencode-workflow-consult>
       `)
@@ -29,13 +29,14 @@ describe("parseConsultRequests", () => {
     expect(String(requests[0]?.targetSessionID)).toBe("ses_target")
     expect(requests[0]?.timing).toBe("temporary-interrupt")
     expect(requests[0]?.reason).toBe("needs exact API contract")
+    expect(requests[0]?.modelWeight).toBe(85)
     expect(requests[0]?.question).toBe("What did you decide for the shared plugin contract?")
   })
 
   test("parses role-based workflow messages with specialty", () => {
     expect(
       parseConsultRequests(`
-        <opencode-workflow-message to-role="expert" specialty="graphics" timing="interrupt" reason="performance risk">
+        <opencode-workflow-message to-role="expert" specialty="graphics" timing="interrupt" reason="performance risk" model-weight="110">
           Review the GPU particle path before executor continues.
         </opencode-workflow-message>
       `),
@@ -45,6 +46,7 @@ describe("parseConsultRequests", () => {
         targetSpecialty: "graphics",
         timing: "interrupt",
         reason: "performance risk",
+        modelWeight: 100,
         question: "Review the GPU particle path before executor continues.",
       },
     ])

@@ -243,6 +243,7 @@ type WorkflowConsultRequest = {
   targetSpecialty?: string
   timing?: WorkflowConsultationInfo["timing"]
   reason?: string
+  modelWeight?: number
   question: string
 }
 
@@ -391,6 +392,13 @@ function workflowModelWeight(value: number | undefined) {
   return Math.max(0, Math.min(100, value))
 }
 
+function workflowModelWeightHint(value: string | undefined) {
+  if (value === undefined) return undefined
+  const parsed = Number(value)
+  if (!Number.isFinite(parsed)) return undefined
+  return workflowModelWeight(parsed)
+}
+
 function normalizeWorkflowModelWhitelist(input: WorkflowModelWhitelistConfig | undefined) {
   if (!input) return undefined
   const normalized = Object.fromEntries(
@@ -460,15 +468,16 @@ function selectWorkflowModelFromWhitelist(input: {
   workflow: Pick<WorkflowInfo, "model" | "modelWhitelist">
   role: WorkflowSessionRef["role"]
   prompt: string
+  modelWeight?: number
   fallback?: WorkflowInfo["model"]
 }) {
   const whitelist = workflowModelWhitelistForRole(input.workflow, input.role)
   if (whitelist.length === 0) return input.fallback
-  const complexity = workflowModelComplexity(input.prompt)
+  const selectionWeight = input.modelWeight === undefined ? workflowModelComplexity(input.prompt) : workflowModelWeight(input.modelWeight)
   return whitelist
     .toSorted(
       (a, b) =>
-        Math.abs(workflowModelWeight(a.weight) - complexity) - Math.abs(workflowModelWeight(b.weight) - complexity) ||
+        Math.abs(workflowModelWeight(a.weight) - selectionWeight) - Math.abs(workflowModelWeight(b.weight) - selectionWeight) ||
         workflowModelWeight(b.weight) - workflowModelWeight(a.weight),
     )
     .at(0)
@@ -479,14 +488,18 @@ function workflowModelSelectionPrompt(input: {
   role: WorkflowSessionRef["role"]
   selected?: WorkflowInfo["model"] | WorkflowModelWhitelistItem
   prompt: string
+  modelWeight?: number
 }) {
   const whitelist = workflowModelWhitelistForRole(input.workflow, input.role)
   if (whitelist.length === 0) return []
+  const selectedWeight = input.modelWeight === undefined ? workflowModelComplexity(input.prompt) : workflowModelWeight(input.modelWeight)
   return [
     "## Workflow Model Selection",
     "",
     `Selected model for this turn: ${workflowModelRefText(input.selected)}`,
-    `Estimated task complexity: ${workflowModelComplexity(input.prompt)}/100`,
+    input.modelWeight === undefined
+      ? `Estimated task complexity: ${selectedWeight}/100`
+      : `Upstream requested model weight: ${selectedWeight}/100`,
     "Role model whitelist; higher weight means stronger reasoning and usually higher token cost:",
     ...whitelist
       .toSorted((a, b) => workflowModelWeight(a.weight) - workflowModelWeight(b.weight))
@@ -1200,8 +1213,8 @@ function archiveSessionSummaryMarkdown(input: {
     ...(user ? ["## Initial Request To This Session", "", compactMarkdown(messageText(user), 1200), ""] : []),
     "## Consultation",
     "",
-    `Other workflow sessions can consult this session with: <opencode-workflow-consult target-session="${input.session.id}" reason="short reason">question</opencode-workflow-consult>`,
-    `They can also ask by role with: <opencode-workflow-message to-role="${input.role}" timing="temporary-interrupt" reason="short reason">question</opencode-workflow-message>`,
+    `Other workflow sessions can consult this session with: <opencode-workflow-consult target-session="${input.session.id}" reason="short reason" model-weight="0-100">question</opencode-workflow-consult>`,
+    `They can also ask by role with: <opencode-workflow-message to-role="${input.role}" timing="temporary-interrupt" reason="short reason" model-weight="0-100">question</opencode-workflow-message>`,
     "",
   ].join("\n")
 }
@@ -1807,9 +1820,10 @@ function staffMemoryMarkdown(input: {
     "",
     "## Consultation Capabilities",
     "",
-    `- Direct: <opencode-workflow-consult target-session="${input.member.sessionID}" timing="temporary-interrupt" reason="why this employee has context">question</opencode-workflow-consult>`,
-    `- Role based: <opencode-workflow-message to-role="${input.member.role}" specialty="${input.member.specialty}" timing="temporary-interrupt" reason="short reason">question</opencode-workflow-message>`,
+    `- Direct: <opencode-workflow-consult target-session="${input.member.sessionID}" timing="temporary-interrupt" reason="why this employee has context" model-weight="0-100">question</opencode-workflow-consult>`,
+    `- Role based: <opencode-workflow-message to-role="${input.member.role}" specialty="${input.member.specialty}" timing="temporary-interrupt" reason="short reason" model-weight="0-100">question</opencode-workflow-message>`,
     "- Use after-task for normal handoff, temporary-interrupt for a quick answer before continuing, and interrupt only when work should pause.",
+    "- Set model-weight from 0-100 based on task complexity; low values favor cheaper routine work, high values favor broad, risky, architectural, or ambiguous work.",
     "",
     ...(input.member.role === "executor"
       ? [
@@ -1840,8 +1854,8 @@ function staffMemoryMarkdown(input: {
     "",
     "## How Other Employees Should Use This Memory",
     "",
-    `Consult this employee directly with: <opencode-workflow-consult target-session="${input.member.sessionID}" reason="why this employee has context">question</opencode-workflow-consult>`,
-    `Ask by role with: <opencode-workflow-message to-role="${input.member.role}" specialty="${input.member.specialty}" timing="temporary-interrupt" reason="short reason">question</opencode-workflow-message>`,
+    `Consult this employee directly with: <opencode-workflow-consult target-session="${input.member.sessionID}" reason="why this employee has context" model-weight="0-100">question</opencode-workflow-consult>`,
+    `Ask by role with: <opencode-workflow-message to-role="${input.member.role}" specialty="${input.member.specialty}" timing="temporary-interrupt" reason="short reason" model-weight="0-100">question</opencode-workflow-message>`,
     "Read this staff memory before assigning similar work, asking this employee for context, or deciding that a previous investigation needs to be repeated.",
     "",
   ].join("\n")
@@ -1899,7 +1913,7 @@ function requesterMemoryMarkdown(input: {
     "## How Employees Should Use This Memory",
     "",
     "Treat this file as the strategic source of truth before interpreting milestone scope or final acceptance criteria.",
-    `Escalate strategy questions with: <opencode-workflow-message to-role="requester" timing="temporary-interrupt" reason="strategy clarification">question</opencode-workflow-message>`,
+    `Escalate strategy questions with: <opencode-workflow-message to-role="requester" timing="temporary-interrupt" reason="strategy clarification" model-weight="0-100">question</opencode-workflow-message>`,
     "",
   ].join("\n")
 }
@@ -2097,10 +2111,11 @@ export function workflowReferencePrompt(workflow: WorkflowInfo) {
     "The handoff summary should list completed scope, decisions made, files or modules touched, tests or evidence, open risks, and which employee or milestone should use it next.",
     "If you need another employee's context or a technical decision, ask through workflow communication instead of guessing.",
     "For a specific known session, emit:",
-    '<opencode-workflow-consult target-session="ses_xxx" reason="why this session has the answer">question for that session</opencode-workflow-consult>',
+    '<opencode-workflow-consult target-session="ses_xxx" reason="why this session has the answer" model-weight="0-100">question for that session</opencode-workflow-consult>',
     "For role-based communication, emit:",
-    '<opencode-workflow-message to-role="expert|main_pm|department_pm|executor|reviewer|tester|requester" specialty="optional area" timing="after-task|interrupt|temporary-interrupt" reason="short reason">message or question</opencode-workflow-message>',
+    '<opencode-workflow-message to-role="expert|main_pm|department_pm|executor|reviewer|tester|requester" specialty="optional area" timing="after-task|interrupt|temporary-interrupt" reason="short reason" model-weight="0-100">message or question</opencode-workflow-message>',
     "Use timing=\"after-task\" for normal handoff, timing=\"temporary-interrupt\" when you need a quick answer before continuing, and timing=\"interrupt\" when the current task should pause until direction changes.",
+    "Set model-weight=\"0-100\" when delegating; use lower weights for routine/focused tasks and higher weights for complex, risky, architectural, or ambiguous tasks.",
     "If the only valid blocker is a requester/user decision, send it to to-role=\"requester\" with 2-3 explicit options, mark one option as Recommended, and include the tradeoff for each option. Do not stop silently after asking.",
     "Main PM and department PM sessions may revise the workflow graph directly by emitting:",
     '<opencode-workflow-update reason="why the graph changed"><workflow>...</workflow></opencode-workflow-update>',
@@ -2151,9 +2166,10 @@ export function workflowEmployeeContextPrompt(
     "Before answering, read the workflow progress, organization chart, reference index, your staff memory file when listed above, and the relevant plan/review files. If another employee has the answer, use workflow communication XML instead of guessing.",
     workflowProjectMemoryPrompt(),
     "Use this direct consultation XML when a specific employee session owns the missing context:",
-    '<opencode-workflow-consult target-session="ses_xxx" timing="after-task|interrupt|temporary-interrupt" reason="short reason">question</opencode-workflow-consult>',
+    '<opencode-workflow-consult target-session="ses_xxx" timing="after-task|interrupt|temporary-interrupt" reason="short reason" model-weight="0-100">question</opencode-workflow-consult>',
     "Use this role-based communication XML when the workflow should route the message to an employee by function:",
-    '<opencode-workflow-message to-role="expert|main_pm|department_pm|executor|reviewer|tester|requester" specialty="optional area" timing="after-task|interrupt|temporary-interrupt" reason="short reason">message or question</opencode-workflow-message>',
+    '<opencode-workflow-message to-role="expert|main_pm|department_pm|executor|reviewer|tester|requester" specialty="optional area" timing="after-task|interrupt|temporary-interrupt" reason="short reason" model-weight="0-100">message or question</opencode-workflow-message>',
+    "Set model-weight=\"0-100\" to choose the target role's model from its whitelist; higher weights select stronger reasoning profiles.",
     "When asking the requester/user to decide, include 2-3 concrete options in the message body, label the recommended option, and state the impact of each option.",
   ].join("\n")
 }
@@ -2311,6 +2327,9 @@ export function parseConsultRequests(text: string): WorkflowConsultRequest[] {
       target: consultationAttribute(match[1] ?? "", "target-session") ?? consultationAttribute(match[1] ?? "", "targetSessionID"),
       reason: consultationAttribute(match[1] ?? "", "reason"),
       timing: consultationAttribute(match[1] ?? "", "timing"),
+      modelWeight: workflowModelWeightHint(
+        consultationAttribute(match[1] ?? "", "model-weight") ?? consultationAttribute(match[1] ?? "", "modelWeight"),
+      ),
       question: (match[2] ?? "").trim(),
     }))
     .flatMap((item) => {
@@ -2321,6 +2340,7 @@ export function parseConsultRequests(text: string): WorkflowConsultRequest[] {
             targetSessionID: SessionID.make(item.target),
             ...(item.reason ? { reason: item.reason } : {}),
             ...(isWorkflowTiming(item.timing) ? { timing: item.timing } : {}),
+            ...(item.modelWeight !== undefined ? { modelWeight: item.modelWeight } : {}),
             question: item.question,
           },
         ]
@@ -2334,6 +2354,9 @@ export function parseConsultRequests(text: string): WorkflowConsultRequest[] {
       specialty: consultationAttribute(match[1] ?? "", "specialty"),
       reason: consultationAttribute(match[1] ?? "", "reason"),
       timing: consultationAttribute(match[1] ?? "", "timing"),
+      modelWeight: workflowModelWeightHint(
+        consultationAttribute(match[1] ?? "", "model-weight") ?? consultationAttribute(match[1] ?? "", "modelWeight"),
+      ),
       question: (match[2] ?? "").trim(),
     }))
     .flatMap((item) => {
@@ -2344,6 +2367,7 @@ export function parseConsultRequests(text: string): WorkflowConsultRequest[] {
           ...(item.specialty ? { targetSpecialty: item.specialty } : {}),
           ...(item.reason ? { reason: item.reason } : {}),
           ...(isWorkflowTiming(item.timing) ? { timing: item.timing } : {}),
+          ...(item.modelWeight !== undefined ? { modelWeight: item.modelWeight } : {}),
           question: item.question,
         },
       ]
@@ -4624,6 +4648,7 @@ export const layer: Layer.Layer<
             `Asking role: ${roleSessionTitle(sourceRole)}`,
             `Requested timing: ${timing}`,
             ...(request.reason ? [`Reason: ${request.reason}`] : []),
+            ...(request.modelWeight !== undefined ? [`Requested model weight: ${request.modelWeight}/100`] : []),
             "",
             "Question:",
             request.question,
@@ -4635,7 +4660,7 @@ export const layer: Layer.Layer<
             role: targetRole,
             milestoneID: targetMilestoneID,
           },
-          { consult: false },
+          { consult: false, modelWeight: request.modelWeight },
         )
         const answer =
           pauseStatus && sourceMilestoneID
@@ -4847,7 +4872,7 @@ export const layer: Layer.Layer<
         milestoneID?: WorkflowMilestoneID
         attempt?: number
       },
-      options?: { consult?: boolean; expect?: WorkflowPromptExpectation },
+      options?: { consult?: boolean; expect?: WorkflowPromptExpectation; modelWeight?: number },
     ) {
       const runOnce = Effect.fn("Workflow.runPromptOnce")(function* (nextText: string) {
         const basePromptText = archive ? yield* workflowPromptText(sessionID, nextText, archive) : nextText
@@ -4857,6 +4882,7 @@ export const layer: Layer.Layer<
               workflow: selectionWorkflow,
               role: archive!.role,
               prompt: basePromptText,
+              modelWeight: options?.modelWeight,
               fallback: model,
             })
           : model
@@ -4869,6 +4895,7 @@ export const layer: Layer.Layer<
                 role: archive!.role,
                 selected: selectedModel,
                 prompt: basePromptText,
+                modelWeight: options?.modelWeight,
               }),
             ].join("\n")
           : basePromptText

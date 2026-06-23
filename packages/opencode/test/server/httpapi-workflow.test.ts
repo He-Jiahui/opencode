@@ -130,8 +130,8 @@ describe("workflow HttpApi", () => {
               expert: 1,
             },
             modelWhitelist: {
-              mainPM: [{ providerID: "github-copilot", modelID: "gpt-5.5", variant: "high", weight: 90 }],
-              executor: [{ providerID: "github-copilot", modelID: "gpt-5.5", variant: "medium", weight: 60 }],
+              mainPM: [{ providerID: "github-copilot", modelID: "gpt-5.5", variant: "high", weight: 90, cacheMinutes: 480 }],
+              executor: [{ providerID: "github-copilot", modelID: "gpt-5.5", variant: "medium", weight: 60, cacheMinutes: 0 }],
             },
           },
         }),
@@ -150,9 +150,9 @@ describe("workflow HttpApi", () => {
             expert: 1,
           },
           modelWhitelist: {
-            mainPM: [{ providerID: "github-copilot", modelID: "gpt-5.5", variant: "xhigh", weight: 95 }],
-            executor: [{ providerID: "github-copilot", modelID: "gpt-5.5", variant: "medium", weight: 55 }],
-            tester: [{ providerID: "github-copilot", modelID: "gpt-5.5", weight: 70 }],
+            mainPM: [{ providerID: "github-copilot", modelID: "gpt-5.5", variant: "xhigh", weight: 95, cacheMinutes: 720 }],
+            executor: [{ providerID: "github-copilot", modelID: "gpt-5.5", variant: "medium", weight: 55, cacheMinutes: 0 }],
+            tester: [{ providerID: "github-copilot", modelID: "gpt-5.5", weight: 70, cacheMinutes: 120 }],
           },
         }),
       )
@@ -171,17 +171,20 @@ describe("workflow HttpApi", () => {
         modelID: "gpt-5.5",
         variant: "xhigh",
         weight: 95,
+        cacheMinutes: 720,
       })
       expect(updated.data.modelWhitelist?.executor?.[0]).toMatchObject({
         providerID: "github-copilot",
         modelID: "gpt-5.5",
         variant: "medium",
         weight: 55,
+        cacheMinutes: 0,
       })
       expect(updated.data.modelWhitelist?.tester?.[0]).toMatchObject({
         providerID: "github-copilot",
         modelID: "gpt-5.5",
         weight: 70,
+        cacheMinutes: 120,
       })
 
       const staffed = yield* Effect.promise(() => sdk.workflow.graph({ workflowID: staffedWorkflow.data!.id }))

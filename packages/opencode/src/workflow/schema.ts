@@ -55,6 +55,7 @@ const WorkflowModel = Schema.Struct(WorkflowModelFields)
 export const WorkflowModelWhitelistItem = Schema.Struct({
   ...WorkflowModelFields,
   weight: Schema.Finite.check(Schema.isGreaterThanOrEqualTo(0), Schema.isLessThanOrEqualTo(100)),
+  cacheMinutes: Schema.optional(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0), Schema.isLessThanOrEqualTo(43200))),
 }).annotate({ identifier: "WorkflowModelWhitelistItem" })
 export type WorkflowModelWhitelistItem = typeof WorkflowModelWhitelistItem.Type
 
@@ -81,6 +82,9 @@ export const WorkflowMember = Schema.Struct({
   sessionID: SessionID,
   capacity: Schema.Number,
   status: WorkflowMemberStatus,
+  model: Schema.optional(WorkflowModel),
+  modelWeight: Schema.optional(Schema.Finite.check(Schema.isGreaterThanOrEqualTo(0), Schema.isLessThanOrEqualTo(100))),
+  modelCacheUntil: Schema.optional(Schema.Finite),
   time: Schema.Struct({
     created: Schema.Number,
     updated: Schema.Number,

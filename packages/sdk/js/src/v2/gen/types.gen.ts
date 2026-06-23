@@ -742,6 +742,7 @@ export type WorkflowModelWhitelistItem = {
   modelID: string
   variant?: string
   weight: number
+  cacheMinutes?: number
 }
 
 export type WorkflowModelWhitelistConfig = {
@@ -838,6 +839,13 @@ export type WorkflowMember = {
   sessionID: string
   capacity: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
   status: "active" | "paused"
+  model?: {
+    providerID: string
+    modelID: string
+    variant?: string
+  }
+  modelWeight?: number
+  modelCacheUntil?: number
   time: {
     created: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
     updated: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
@@ -3256,6 +3264,13 @@ export type WorkflowMember1 = {
   sessionID: string
   capacity: number | "NaN" | "Infinity" | "-Infinity"
   status: "active" | "paused"
+  model?: {
+    providerID: string
+    modelID: string
+    variant?: string
+  }
+  modelWeight?: number
+  modelCacheUntil?: number
   time: {
     created: number | "NaN" | "Infinity" | "-Infinity"
     updated: number | "NaN" | "Infinity" | "-Infinity"

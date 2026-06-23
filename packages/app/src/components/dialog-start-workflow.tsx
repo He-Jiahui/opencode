@@ -24,6 +24,7 @@ type WorkflowModelWhitelistEntry = {
   modelID: string
   variant?: string
   weight: number
+  cacheMinutes: number
 }
 type WorkflowModelWhitelist = Record<WorkflowModelWhitelistRole, WorkflowModelWhitelistEntry[]>
 
@@ -77,6 +78,12 @@ function normalizeWeight(value: string) {
   return Math.max(0, Math.min(100, parsed))
 }
 
+function normalizeCacheMinutes(value: string) {
+  const parsed = Number(value)
+  if (!Number.isFinite(parsed)) return 240
+  return Math.max(0, Math.min(43200, Math.trunc(parsed)))
+}
+
 export function DialogStartWorkflow(props: {
   initialRequest?: string
   variants?: string[]
@@ -113,6 +120,7 @@ export function DialogStartWorkflow(props: {
       providerID: model.providerID,
       modelID: model.modelID,
       weight: 50,
+      cacheMinutes: 240,
     })
   }
 
@@ -247,7 +255,7 @@ export function DialogStartWorkflow(props: {
                                 )
                               const variantOptions = () => ["default", ...(selectedModel()?.variants ?? [])]
                               return (
-                                <div class="grid grid-cols-1 gap-2 rounded-md border border-border-weak-base p-2 md:grid-cols-[minmax(0,1fr)_140px_96px_auto] md:items-end">
+                                <div class="grid grid-cols-1 gap-2 rounded-md border border-border-weak-base p-2 md:grid-cols-[minmax(0,1fr)_140px_96px_96px_auto] md:items-end">
                                   <Select
                                     size="small"
                                     variant="secondary"
@@ -277,6 +285,17 @@ export function DialogStartWorkflow(props: {
                                     label={language.t("session.workflow.modelWhitelist.weight")}
                                     value={String(entry.weight)}
                                     onChange={(value) => setStore("modelWhitelist", role, index(), "weight", normalizeWeight(value))}
+                                  />
+                                  <TextField
+                                    type="number"
+                                    min="0"
+                                    max="43200"
+                                    step="1"
+                                    label={language.t("session.workflow.modelWhitelist.cacheMinutes")}
+                                    value={String(entry.cacheMinutes)}
+                                    onChange={(value) =>
+                                      setStore("modelWhitelist", role, index(), "cacheMinutes", normalizeCacheMinutes(value))
+                                    }
                                   />
                                   <Button
                                     type="button"

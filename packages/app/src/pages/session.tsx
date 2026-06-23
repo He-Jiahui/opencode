@@ -140,6 +140,7 @@ type WorkflowModelWhitelistEntry = {
   modelID: string
   variant?: string
   weight: number
+  cacheMinutes: number
 }
 type WorkflowModelWhitelistStore = Record<WorkflowModelWhitelistRole, WorkflowModelWhitelistEntry[]>
 const defaultWorkflowStaffing: Required<WorkflowStaffing> = {
@@ -174,6 +175,11 @@ const workflowModelWeight = (value: unknown) => {
   if (!Number.isFinite(parsed)) return 50
   return Math.max(0, Math.min(100, parsed))
 }
+const workflowModelCacheMinutes = (value: unknown) => {
+  const parsed = Number(value)
+  if (!Number.isFinite(parsed)) return 240
+  return Math.max(0, Math.min(43200, Math.trunc(parsed)))
+}
 const normalizeWorkflowStaffing = (input?: WorkflowStaffing): Required<WorkflowStaffing> => ({
   mainPM: workflowStaffingValue(input?.mainPM, defaultWorkflowStaffing.mainPM),
   departmentPM: workflowStaffingValue(input?.departmentPM, defaultWorkflowStaffing.departmentPM),
@@ -188,6 +194,7 @@ const normalizeWorkflowModelWhitelistEntries = (items: WorkflowModelWhitelist[Wo
     modelID: item.modelID,
     ...(item.variant ? { variant: item.variant } : {}),
     weight: workflowModelWeight(item.weight),
+    cacheMinutes: workflowModelCacheMinutes(item.cacheMinutes),
   }))
 const normalizeWorkflowModelWhitelist = (input?: WorkflowModelWhitelist): WorkflowModelWhitelistStore => ({
   requester: normalizeWorkflowModelWhitelistEntries(input?.requester),
@@ -206,6 +213,7 @@ const workflowModelWhitelistPayload = (input: WorkflowModelWhitelistStore): Work
         modelID: entry.modelID,
         ...(entry.variant ? { variant: entry.variant } : {}),
         weight: workflowModelWeight(entry.weight),
+        cacheMinutes: workflowModelCacheMinutes(entry.cacheMinutes),
       }))
       return entries.length > 0 ? [[role, entries]] : []
     }),
@@ -579,6 +587,7 @@ export default function Page() {
       providerID: model.providerID,
       modelID: model.modelID,
       weight: 50,
+      cacheMinutes: 240,
     })
   }
   const selectWorkflowModelWhitelist = (
@@ -2437,7 +2446,7 @@ export default function Page() {
                                           )
                                         const variantOptions = () => ["default", ...(selectedModel()?.variants ?? [])]
                                         return (
-                                          <div class="grid grid-cols-1 gap-2 rounded-md border border-border-weak-base p-2 md:grid-cols-[minmax(0,1fr)_140px_96px_auto] md:items-end">
+                                          <div class="grid grid-cols-1 gap-2 rounded-md border border-border-weak-base p-2 md:grid-cols-[minmax(0,1fr)_140px_96px_96px_auto] md:items-end">
                                             <Select
                                               size="small"
                                               variant="secondary"
@@ -2473,6 +2482,22 @@ export default function Page() {
                                               value={String(entry.weight)}
                                               onChange={(value) =>
                                                 setWorkflowModelWhitelist(role, index(), "weight", workflowModelWeight(value))
+                                              }
+                                            />
+                                            <TextField
+                                              type="number"
+                                              min="0"
+                                              max="43200"
+                                              step="1"
+                                              label={language.t("session.workflow.modelWhitelist.cacheMinutes")}
+                                              value={String(entry.cacheMinutes)}
+                                              onChange={(value) =>
+                                                setWorkflowModelWhitelist(
+                                                  role,
+                                                  index(),
+                                                  "cacheMinutes",
+                                                  workflowModelCacheMinutes(value),
+                                                )
                                               }
                                             />
                                             <Button

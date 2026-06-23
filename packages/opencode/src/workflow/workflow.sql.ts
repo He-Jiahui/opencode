@@ -69,6 +69,9 @@ export const WorkflowMemberTable = sqliteTable(
       .references(() => SessionTable.id, { onDelete: "cascade" }),
     capacity: integer().notNull().default(1),
     status: text().$type<WorkflowMemberInfo["status"]>().notNull(),
+    model: text({ mode: "json" }).$type<WorkflowInfo["model"]>(),
+    model_weight: integer(),
+    model_cache_until: integer(),
     ...Timestamps,
   },
   (table) => [

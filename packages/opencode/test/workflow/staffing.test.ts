@@ -1,11 +1,15 @@
 import { describe, expect, test } from "bun:test"
 
+import { ModelID, ProviderID } from "@/provider/schema"
 import { SessionID } from "@/session/schema"
-import { WorkflowMilestoneID, type WorkflowMemberInfo, type WorkflowMilestoneInfo } from "@/workflow"
+import { WorkflowMilestoneID, type WorkflowInfo, type WorkflowMemberInfo, type WorkflowMilestoneInfo } from "@/workflow"
 import { selectWorkflowMember, workflowSessionAssignment } from "@/workflow/workflow"
 
 const sessionID = SessionID.make
 const milestoneID = WorkflowMilestoneID.make
+const providerID = ProviderID.make("test")
+const lowModelID = ModelID.make("low")
+const highModelID = ModelID.make("high")
 
 function member(input: {
   role: WorkflowMemberInfo["role"]
@@ -13,6 +17,9 @@ function member(input: {
   sessionID: string
   created?: number
   status?: WorkflowMemberInfo["status"]
+  model?: WorkflowMemberInfo["model"]
+  modelWeight?: number
+  modelCacheUntil?: number
 }): WorkflowMemberInfo {
   return {
     id: `${input.role}-${input.specialty}`,
@@ -23,6 +30,9 @@ function member(input: {
     sessionID: sessionID(input.sessionID),
     capacity: 1,
     status: input.status ?? "active",
+    model: input.model,
+    modelWeight: input.modelWeight,
+    modelCacheUntil: input.modelCacheUntil,
     time: {
       created: input.created ?? 1,
       updated: 1,
@@ -220,6 +230,93 @@ describe("selectWorkflowMember", () => {
         limit: 2,
       })?.sessionID,
     ).toBe(sessionID("ses_exec_2"))
+  })
+
+  test("prefers an idle member with a matching active model cache", () => {
+    const now = Date.now()
+    const workflow = {
+      modelWhitelist: {
+        executor: [
+          { providerID, modelID: lowModelID, weight: 20, cacheMinutes: 240 },
+          { providerID, modelID: highModelID, weight: 90, cacheMinutes: 240 },
+        ],
+      },
+    } satisfies Pick<WorkflowInfo, "modelWhitelist">
+
+    expect(
+      selectWorkflowMember({
+        role: "executor",
+        specialty: "engineering",
+        workflow,
+        prompt: "Plan a risky architecture migration with concurrency hazards.",
+        modelWeight: 90,
+        now,
+        members: [
+          member({
+            role: "executor",
+            specialty: "engineering",
+            sessionID: "ses_exec_low",
+            created: 1,
+            model: { providerID, modelID: lowModelID },
+            modelWeight: 20,
+            modelCacheUntil: now + 60_000,
+          }),
+          member({
+            role: "executor",
+            specialty: "engineering-2",
+            sessionID: "ses_exec_high",
+            created: 2,
+            model: { providerID, modelID: highModelID },
+            modelWeight: 90,
+            modelCacheUntil: now + 60_000,
+          }),
+        ],
+        milestones: [],
+      })?.sessionID,
+    ).toBe(sessionID("ses_exec_high"))
+  })
+
+  test("ignores expired model caches when assigning staff", () => {
+    const now = Date.now()
+    const workflow = {
+      modelWhitelist: {
+        executor: [
+          { providerID, modelID: lowModelID, weight: 20, cacheMinutes: 240 },
+          { providerID, modelID: highModelID, weight: 90, cacheMinutes: 0 },
+        ],
+      },
+    } satisfies Pick<WorkflowInfo, "modelWhitelist">
+
+    expect(
+      selectWorkflowMember({
+        role: "executor",
+        specialty: "engineering",
+        workflow,
+        modelWeight: 90,
+        now,
+        members: [
+          member({
+            role: "executor",
+            specialty: "engineering",
+            sessionID: "ses_exec_low",
+            created: 1,
+            model: { providerID, modelID: lowModelID },
+            modelWeight: 20,
+            modelCacheUntil: now + 60_000,
+          }),
+          member({
+            role: "executor",
+            specialty: "engineering-2",
+            sessionID: "ses_exec_high",
+            created: 2,
+            model: { providerID, modelID: highModelID },
+            modelWeight: 90,
+            modelCacheUntil: now,
+          }),
+        ],
+        milestones: [],
+      })?.sessionID,
+    ).toBe(sessionID("ses_exec_low"))
   })
 
   test("uses the current active assignment for a reused long-lived employee session", () => {

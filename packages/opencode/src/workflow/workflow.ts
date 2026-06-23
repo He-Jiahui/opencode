@@ -99,6 +99,9 @@ CREATE TABLE IF NOT EXISTS workflow_member (
   session_id text NOT NULL,
   capacity integer DEFAULT 1 NOT NULL,
   status text NOT NULL,
+  model text,
+  model_weight integer,
+  model_cache_until integer,
   time_created integer NOT NULL,
   time_updated integer NOT NULL,
   PRIMARY KEY (workflow_id, id),
@@ -392,6 +395,36 @@ function workflowModelWeight(value: number | undefined) {
   return Math.max(0, Math.min(100, value))
 }
 
+const workflowDefaultModelCacheMinutes = 240
+const workflowStickySwitchMargin = 25
+
+function workflowModelCacheMinutes(value: number | undefined) {
+  if (value === undefined || !Number.isFinite(value)) return workflowDefaultModelCacheMinutes
+  return Math.max(0, Math.min(43200, Math.trunc(value)))
+}
+
+function workflowModelCacheUntil(model: WorkflowInfo["model"] | WorkflowModelWhitelistItem | undefined, now: number) {
+  if (!model) return undefined
+  const minutes = workflowModelCacheMinutes(model.cacheMinutes)
+  return minutes === 0 ? now : now + minutes * 60_000
+}
+
+function workflowModelSame(
+  a: WorkflowInfo["model"] | WorkflowModelWhitelistItem | undefined,
+  b: WorkflowInfo["model"] | WorkflowModelWhitelistItem | undefined,
+) {
+  return !!a && !!b && a.providerID === b.providerID && a.modelID === b.modelID && (a.variant ?? "") === (b.variant ?? "")
+}
+
+function workflowModelRef(model: WorkflowInfo["model"] | WorkflowModelWhitelistItem | undefined) {
+  if (!model) return undefined
+  return {
+    providerID: model.providerID,
+    modelID: model.modelID,
+    ...(model.variant ? { variant: model.variant } : {}),
+  }
+}
+
 function workflowModelWeightHint(value: string | undefined) {
   if (value === undefined) return undefined
   const parsed = Number(value)
@@ -411,6 +444,7 @@ function normalizeWorkflowModelWhitelist(input: WorkflowModelWhitelistConfig | u
           modelID: item.modelID,
           ...(item.variant?.trim() ? { variant: item.variant.trim() } : {}),
           weight: workflowModelWeight(item.weight),
+          cacheMinutes: workflowModelCacheMinutes(item.cacheMinutes),
         }))
       return entries.length > 0 ? [[key, entries]] : []
     }),
@@ -425,6 +459,21 @@ function workflowModelWhitelistForRole(
   const configured = workflow.modelWhitelist?.[workflowModelWhitelistKey(role)] ?? []
   if (configured.length > 0) return configured
   return workflow.model ? [{ ...workflow.model, weight: 50 }] : []
+}
+
+function workflowModelEntryForModel(input: {
+  workflow: Pick<WorkflowInfo, "model" | "modelWhitelist">
+  role: WorkflowSessionRef["role"]
+  model?: WorkflowInfo["model"] | WorkflowModelWhitelistItem
+  modelWeight?: number
+}) {
+  if (!input.model) return undefined
+  return (
+    workflowModelWhitelistForRole(input.workflow, input.role).find((item) => workflowModelSame(item, input.model)) ??
+    (workflowModelSame(input.workflow.model, input.model)
+      ? { ...input.model, weight: workflowModelWeight(input.modelWeight) }
+      : undefined)
+  )
 }
 
 function workflowModelRefText(model: WorkflowInfo["model"] | WorkflowModelWhitelistItem | undefined) {
@@ -470,17 +519,31 @@ function selectWorkflowModelFromWhitelist(input: {
   prompt: string
   modelWeight?: number
   fallback?: WorkflowInfo["model"]
+  member?: WorkflowMemberInfo
+  now?: number
 }) {
   const whitelist = workflowModelWhitelistForRole(input.workflow, input.role)
   if (whitelist.length === 0) return input.fallback
   const selectionWeight = input.modelWeight === undefined ? workflowModelComplexity(input.prompt) : workflowModelWeight(input.modelWeight)
-  return whitelist
+  const best = whitelist
     .toSorted(
       (a, b) =>
         Math.abs(workflowModelWeight(a.weight) - selectionWeight) - Math.abs(workflowModelWeight(b.weight) - selectionWeight) ||
         workflowModelWeight(b.weight) - workflowModelWeight(a.weight),
     )
     .at(0)
+  const current = workflowModelEntryForModel({
+    workflow: input.workflow,
+    role: input.role,
+    model: input.member?.model,
+    modelWeight: input.member?.modelWeight,
+  })
+  if (!current) return best
+  const now = input.now ?? Date.now()
+  if ((input.member?.modelCacheUntil ?? 0) <= now || workflowModelCacheMinutes(current.cacheMinutes) === 0) return best
+  const currentDistance = Math.abs(workflowModelWeight(current.weight) - selectionWeight)
+  const bestDistance = Math.abs(workflowModelWeight(best?.weight) - selectionWeight)
+  return bestDistance + workflowStickySwitchMargin < currentDistance ? best : current
 }
 
 function workflowModelSelectionPrompt(input: {
@@ -489,6 +552,7 @@ function workflowModelSelectionPrompt(input: {
   selected?: WorkflowInfo["model"] | WorkflowModelWhitelistItem
   prompt: string
   modelWeight?: number
+  member?: WorkflowMemberInfo
 }) {
   const whitelist = workflowModelWhitelistForRole(input.workflow, input.role)
   if (whitelist.length === 0) return []
@@ -500,10 +564,14 @@ function workflowModelSelectionPrompt(input: {
     input.modelWeight === undefined
       ? `Estimated task complexity: ${selectedWeight}/100`
       : `Upstream requested model weight: ${selectedWeight}/100`,
+    input.member?.model
+      ? `Current session cached model: ${workflowModelRefText(input.member.model)}${input.member.modelCacheUntil ? ` until ${new Date(input.member.modelCacheUntil).toISOString()}` : " with no active cache window"}`
+      : "Current session cached model: none",
+    "Prefer the cached model while its cache is valid unless task difficulty is clearly mismatched. A cache value of 0 minutes means switching cost is ignored.",
     "Role model whitelist; higher weight means stronger reasoning and usually higher token cost:",
     ...whitelist
       .toSorted((a, b) => workflowModelWeight(a.weight) - workflowModelWeight(b.weight))
-      .map((item) => `- ${workflowModelRefText(item)} weight=${workflowModelWeight(item.weight)}`),
+      .map((item) => `- ${workflowModelRefText(item)} weight=${workflowModelWeight(item.weight)} cache=${workflowModelCacheMinutes(item.cacheMinutes)}m`),
     "When you delegate work, prefer cheaper/lower-weight models for narrow routine tasks and higher-weight models for broad, risky, architectural, or ambiguous tasks.",
   ]
 }
@@ -589,6 +657,38 @@ function roleBusyForMilestoneStatus(role: WorkflowSessionRef["role"], status: Wo
   return false
 }
 
+function workflowMemberModelScore(input: {
+  member: WorkflowMemberInfo
+  workflow?: Pick<WorkflowInfo, "model" | "modelWhitelist">
+  role: WorkflowSessionRef["role"]
+  prompt?: string
+  modelWeight?: number
+  now?: number
+}) {
+  if (!input.workflow || !input.member.model) return 0
+  const now = input.now ?? Date.now()
+  const target = selectWorkflowModelFromWhitelist({
+    workflow: input.workflow,
+    role: input.role,
+    prompt: input.prompt ?? input.member.specialty,
+    modelWeight: input.modelWeight,
+    fallback: input.workflow.model,
+  })
+  const cacheActive = (input.member.modelCacheUntil ?? 0) > now
+  if (workflowModelSame(input.member.model, target) && cacheActive) return 4
+  const sticky = selectWorkflowModelFromWhitelist({
+    workflow: input.workflow,
+    role: input.role,
+    prompt: input.prompt ?? input.member.specialty,
+    modelWeight: input.modelWeight,
+    fallback: input.workflow.model,
+    member: input.member,
+    now,
+  })
+  if (workflowModelSame(input.member.model, sticky) && cacheActive) return 3
+  return 0
+}
+
 export function selectWorkflowMember(input: {
   role: WorkflowSessionRef["role"]
   specialty: string
@@ -596,6 +696,10 @@ export function selectWorkflowMember(input: {
   milestones: WorkflowMilestoneInfo[]
   excludeMilestoneID?: WorkflowMilestoneID
   limit?: number
+  workflow?: Pick<WorkflowInfo, "model" | "modelWhitelist">
+  prompt?: string
+  modelWeight?: number
+  now?: number
 }) {
   const busySessions = new Set(
     input.milestones
@@ -627,6 +731,24 @@ export function selectWorkflowMember(input: {
     .filter((ref) => ref.role === input.role)
     .forEach((ref) => assignments.set(ref.sessionID, (assignments.get(ref.sessionID) ?? 0) + 1))
   return available.toSorted((a, b) => {
+    const model =
+      workflowMemberModelScore({
+        member: b,
+        workflow: input.workflow,
+        role: input.role,
+        prompt: input.prompt,
+        modelWeight: input.modelWeight,
+        now: input.now,
+      }) -
+      workflowMemberModelScore({
+        member: a,
+        workflow: input.workflow,
+        role: input.role,
+        prompt: input.prompt,
+        modelWeight: input.modelWeight,
+        now: input.now,
+      })
+    if (model !== 0) return model
     const load = (assignments.get(a.sessionID) ?? 0) - (assignments.get(b.sessionID) ?? 0)
     if (load !== 0) return load
     const specialty = Number(b.specialty === input.specialty) - Number(a.specialty === input.specialty)
@@ -821,6 +943,9 @@ function ensureSchema() {
   ensureColumn("workflow", "time_completed", "ALTER TABLE workflow ADD COLUMN time_completed integer")
   ensureColumn("workflow_member", "capacity", "ALTER TABLE workflow_member ADD COLUMN capacity integer NOT NULL DEFAULT 1")
   ensureColumn("workflow_member", "status", "ALTER TABLE workflow_member ADD COLUMN status text NOT NULL DEFAULT 'active'")
+  ensureColumn("workflow_member", "model", "ALTER TABLE workflow_member ADD COLUMN model text")
+  ensureColumn("workflow_member", "model_weight", "ALTER TABLE workflow_member ADD COLUMN model_weight integer")
+  ensureColumn("workflow_member", "model_cache_until", "ALTER TABLE workflow_member ADD COLUMN model_cache_until integer")
   ensureColumn("workflow_member", "time_created", "ALTER TABLE workflow_member ADD COLUMN time_created integer NOT NULL DEFAULT 0")
   ensureColumn("workflow_member", "time_updated", "ALTER TABLE workflow_member ADD COLUMN time_updated integer NOT NULL DEFAULT 0")
   ensureColumn("workflow_milestone", "attempt", "ALTER TABLE workflow_milestone ADD COLUMN attempt integer NOT NULL DEFAULT 0")
@@ -899,6 +1024,9 @@ function toMember(row: typeof WorkflowMemberTable.$inferSelect): WorkflowMemberI
     sessionID: row.session_id,
     capacity: row.capacity,
     status: row.status,
+    model: row.model ?? undefined,
+    modelWeight: row.model_weight ?? undefined,
+    modelCacheUntil: row.model_cache_until ?? undefined,
     time: {
       created: row.time_created,
       updated: row.time_updated,
@@ -1603,7 +1731,10 @@ function progressMarkdown(input: {
     "",
     ...(input.members.length === 0
       ? ["_No company staff sessions have been created yet._"]
-      : input.members.map((member) => `- ${member.title} [${member.status}] session: ${member.sessionID}`)),
+      : input.members.map(
+          (member) =>
+            `- ${member.title} [${member.status}] session: ${member.sessionID} model: ${workflowModelRefText(member.model)}${member.modelCacheUntil ? ` cached-until: ${new Date(member.modelCacheUntil).toISOString()}` : ""}`,
+        )),
     "",
     "## Recent Requester Interventions",
     "",
@@ -1667,7 +1798,10 @@ function organizationMarkdown(input: {
         `- ${roleSessionTitle(role)}:`,
         ...(items.length === 0
           ? ["  - default session model"]
-          : items.map((item) => `  - ${workflowModelRefText(item)} weight=${workflowModelWeight(item.weight)}`)),
+          : items.map(
+              (item) =>
+                `  - ${workflowModelRefText(item)} weight=${workflowModelWeight(item.weight)} cache=${workflowModelCacheMinutes(item.cacheMinutes)}m`,
+            )),
       ]
     }),
     "",
@@ -1682,6 +1816,7 @@ function organizationMarkdown(input: {
             `  - specialty: ${member.specialty}`,
             `  - session: ${member.sessionID}`,
             `  - status: ${member.status}`,
+            `  - cached model: ${workflowModelRefText(member.model)}${member.modelWeight === undefined ? "" : ` weight=${workflowModelWeight(member.modelWeight)}`}${member.modelCacheUntil ? ` until=${new Date(member.modelCacheUntil).toISOString()}` : ""}`,
             `  - current/previous assignments: ${(assignments.get(member.sessionID) ?? ["none"]).join("; ")}`,
           ].join("\n"),
         )),
@@ -1698,6 +1833,7 @@ function organizationMarkdown(input: {
     "- Technical advisors guide architecture, technology choices, performance, and optimization risk.",
     "- Every substantial session output is archived into the reference library for later staff to reuse.",
     "- Use workflow communication XML for cross-session consultation and escalation.",
+    "- Prefer employees whose cached model already matches the task. Switch a long-lived employee to another model only when the task difficulty is clearly mismatched or the configured cache duration is 0 minutes.",
     "",
   ].join("\n")
 }
@@ -3143,7 +3279,7 @@ function graphFrom(
       role: member.role,
       sessionID: member.sessionID,
       status: member.status === "paused" ? ("blocked" as const) : undefined,
-      summary: `${roleSessionTitle(member.role)} / ${member.specialty} / capacity ${member.capacity}`,
+      summary: `${roleSessionTitle(member.role)} / ${member.specialty} / capacity ${member.capacity} / model ${workflowModelRefText(member.model)}`,
     })),
     ...milestones.flatMap((milestone) => [
       {
@@ -3268,6 +3404,7 @@ function promptMainPm(input: { workflow: WorkflowInfo }) {
     "",
     "Create and supervise an implementation-scale workflow plan for this request. Treat requester strategy as adjustable during the project, and keep the organization aligned when direction changes.",
     "Do not treat staff sessions as disposable. The requester, main PM, department PMs, executors, testers, and technical advisors are long-lived employees who should accumulate context and collaborate across milestones.",
+    "When assigning or consulting staff, prefer the employee whose cached model and specialty already fit the task. Increase model-weight only when the remaining work is clearly harder than the employee's current cached model profile.",
     "Do not hide a complex feature behind a single broad milestone. Every milestone must be small enough for one executor session to finish, one department PM session to functionally review, and the tester to verify for completeness.",
     "PM roles must not edit implementation code or perform code changes. PMs may write workflow, plan, decomposition, reference, organization, and review documents under the workflow directory; implementation belongs to executor sessions.",
     `Write the canonical XML to ${workflowArtifactPath(input.workflow, "workflow.xml")}.`,
@@ -4590,6 +4727,8 @@ export const layer: Layer.Layer<
                   workflow,
                   role: request.targetRole,
                   specialty: request.targetSpecialty,
+                  prompt: request.question,
+                  modelWeight: request.modelWeight,
                 }))?.sessionID
             : undefined)
         if (!targetSessionID || targetSessionID === sourceSessionID) continue
@@ -4861,6 +5000,58 @@ export const layer: Layer.Layer<
       )
     })
 
+    const workflowMemberForSession = Effect.fn("Workflow.workflowMemberForSession")(function* (
+      workflowID: WorkflowID,
+      sessionID: SessionID,
+      role: WorkflowSessionRef["role"],
+    ) {
+      const row = Database.use((db) =>
+        db
+          .select()
+          .from(WorkflowMemberTable)
+          .where(
+            and(
+              eq(WorkflowMemberTable.workflow_id, workflowID),
+              eq(WorkflowMemberTable.session_id, sessionID),
+              eq(WorkflowMemberTable.role, role),
+            ),
+          )
+          .orderBy(asc(WorkflowMemberTable.time_created))
+          .all()
+          .at(-1),
+      )
+      return row ? toMember(row) : undefined
+    })
+
+    const rememberWorkflowMemberModel = Effect.fn("Workflow.rememberWorkflowMemberModel")(function* (input: {
+      workflowID: WorkflowID
+      sessionID: SessionID
+      role: WorkflowSessionRef["role"]
+      model?: WorkflowInfo["model"] | WorkflowModelWhitelistItem
+      modelWeight?: number
+    }) {
+      if (!input.model) return
+      const now = Date.now()
+      Database.use((db) =>
+        db
+          .update(WorkflowMemberTable)
+          .set({
+            model: workflowModelRef(input.model),
+            model_weight: Math.trunc(workflowModelWeight(input.model.weight ?? input.modelWeight)),
+            model_cache_until: workflowModelCacheUntil(input.model, now) ?? null,
+            time_updated: now,
+          })
+          .where(
+            and(
+              eq(WorkflowMemberTable.workflow_id, input.workflowID),
+              eq(WorkflowMemberTable.session_id, input.sessionID),
+              eq(WorkflowMemberTable.role, input.role),
+            ),
+          )
+          .run(),
+      )
+    })
+
     const runPrompt = Effect.fn("Workflow.runPrompt")(function* (
       sessionID: SessionID,
       agent: string,
@@ -4877,6 +5068,11 @@ export const layer: Layer.Layer<
       const runOnce = Effect.fn("Workflow.runPromptOnce")(function* (nextText: string) {
         const basePromptText = archive ? yield* workflowPromptText(sessionID, nextText, archive) : nextText
         const selectionWorkflow = archive ? yield* get(archive.workflowID) : undefined
+        const selectionMember = selectionWorkflow
+          ? yield* workflowMemberForSession(archive!.workflowID, sessionID, archive!.role)
+          : undefined
+        const selectionWeight =
+          options?.modelWeight === undefined ? workflowModelComplexity(basePromptText) : workflowModelWeight(options.modelWeight)
         const selectedModel = selectionWorkflow
           ? selectWorkflowModelFromWhitelist({
               workflow: selectionWorkflow,
@@ -4884,8 +5080,18 @@ export const layer: Layer.Layer<
               prompt: basePromptText,
               modelWeight: options?.modelWeight,
               fallback: model,
+              member: selectionMember,
             })
           : model
+        if (selectionWorkflow) {
+          yield* rememberWorkflowMemberModel({
+            workflowID: archive!.workflowID,
+            sessionID,
+            role: archive!.role,
+            model: selectedModel,
+            modelWeight: selectionWeight,
+          }).pipe(Effect.ignore)
+        }
         const promptText = selectionWorkflow
           ? [
               basePromptText,
@@ -4896,6 +5102,7 @@ export const layer: Layer.Layer<
                 selected: selectedModel,
                 prompt: basePromptText,
                 modelWeight: options?.modelWeight,
+                member: selectionMember,
               }),
             ].join("\n")
           : basePromptText
@@ -5183,6 +5390,7 @@ export const layer: Layer.Layer<
             role: "main_pm",
             specialty: "strategy",
             title: workflowSessionTitle("Main PM", workflow.title),
+            prompt: input.message,
           })
       if (!target?.sessionID) return
       const id = `intervention_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`
@@ -5638,11 +5846,14 @@ export const layer: Layer.Layer<
       title?: string
       milestoneID?: WorkflowMilestoneID
       strictSpecialty?: boolean
+      prompt?: string
+      modelWeight?: number
     }) {
       const specialty = roleSpecialty(input.role, input.specialty)
       const staff = yield* members(input.workflow.id)
       const limit = staffLimitForRole(input.workflow.staffing, input.role)
       const all = staff.filter((member) => member.role === input.role)
+      const selectorPrompt = input.prompt ?? specialty
       const selected = selectWorkflowMember({
         role: input.role,
         specialty,
@@ -5650,6 +5861,9 @@ export const layer: Layer.Layer<
         milestones: yield* milestones(input.workflow.id),
         excludeMilestoneID: input.milestoneID,
         limit,
+        workflow: input.workflow,
+        prompt: selectorPrompt,
+        modelWeight: input.modelWeight,
       })
       if (selected && (!input.strictSpecialty || selected.specialty === specialty)) {
         if (input.workflow.rootSessionID) {
@@ -5665,12 +5879,19 @@ export const layer: Layer.Layer<
       const index = all.length + 1
       const nextSpecialty = all.some((member) => member.specialty === specialty) ? `${specialty}-${index}` : specialty
       const title = input.title ?? workflowMemberTitle(input.role, nextSpecialty, index)
+      const initialModel = selectWorkflowModelFromWhitelist({
+        workflow: input.workflow,
+        role: input.role,
+        prompt: selectorPrompt,
+        modelWeight: input.modelWeight,
+        fallback: input.workflow.model,
+      })
       const created = yield* createAgentSession({
         title,
         agent: workflowAgentForRole(input.role),
         parentID: input.workflow.rootSessionID,
         permission: memberPermission(input.role),
-        model: input.workflow.model,
+        model: initialModel,
       })
       const now = Date.now()
       const member = {
@@ -5682,6 +5903,9 @@ export const layer: Layer.Layer<
         session_id: created.id,
         capacity: 1,
         status: "active" as const,
+        model: workflowModelRef(initialModel) ?? null,
+        model_weight: initialModel ? Math.trunc(workflowModelWeight(initialModel.weight ?? input.modelWeight)) : null,
+        model_cache_until: workflowModelCacheUntil(initialModel, now) ?? null,
         time_created: now,
         time_updated: now,
       }
@@ -5840,6 +6064,7 @@ export const layer: Layer.Layer<
         specialty: milestone.department ?? "product",
         title: workflowSessionTitle("Department PM", milestone.title ?? String(milestone.id)),
         milestoneID: milestone.id,
+        prompt: milestone.prompt,
       })
       if (!pm) return yield* blockWorkflow(workflow, `No department PM is available for milestone ${milestone.id}`)
       yield* updateMilestone(workflow.id, milestone.id, {
@@ -5885,6 +6110,7 @@ export const layer: Layer.Layer<
         specialty: milestone.department ?? "technical-advisory",
         title: workflowSessionTitle("Technical Advisor", milestone.title ?? String(milestone.id)),
         milestoneID: milestone.id,
+        prompt: milestone.prompt,
       })
       const expertPath = expert ? workflowArtifactPath(workflow, workflowExpertNotePath(milestone.id, attempt)) : undefined
       if (expert) {
@@ -5923,6 +6149,7 @@ export const layer: Layer.Layer<
         specialty: milestone.department ?? "engineering",
         title: workflowSessionTitle("Executor", milestone.title ?? String(milestone.id)),
         milestoneID: milestone.id,
+        prompt: milestone.prompt,
       })
       if (!executor) return yield* blockWorkflow(workflow, `No executor is available for milestone ${milestone.id}`)
       const afterExpert = (yield* milestones(workflow.id)).find((item) => item.id === milestone.id) ?? executing
@@ -6066,6 +6293,7 @@ export const layer: Layer.Layer<
         role: "tester",
         specialty: "quality",
         title: workflowSessionTitle("Tester", workflow.title),
+        prompt: workflow.request,
       })
       if (!tester) return yield* blockWorkflow(workflow, "No tester is available for workflow completion review")
       const testerPrompt = promptTester({ workflow, milestones: items })
@@ -6102,6 +6330,7 @@ export const layer: Layer.Layer<
         role: "expert",
         specialty: "performance-and-architecture",
         title: workflowSessionTitle("Technical Advisor", workflow.title),
+        prompt: workflow.request,
       })
       const technicalPath = workflowArtifactPath(workflow, "technical-assessment.md")
       if (!expert) {
@@ -6694,6 +6923,7 @@ export const layer: Layer.Layer<
         role: "main_pm",
         specialty: "strategy",
         title: workflowSessionTitle("Main PM", workflow.title),
+        prompt: workflow.request,
       })
       if (!main) return yield* blockWorkflow(workflow, "Workflow has no available main product manager")
       yield* setMainProductManagerSession(workflowID, main.sessionID)
@@ -7136,6 +7366,7 @@ export const layer: Layer.Layer<
               workflow,
               role: targetRole,
               specialty: roleSpecialty(targetRole),
+              prompt: input.message,
             }))?.sessionID)
       if (!target) return yield* new Error({ message: `No ${roleSessionTitle(targetRole)} session is available` })
 

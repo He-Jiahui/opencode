@@ -1,7 +1,7 @@
 // @ts-nocheck
 import path from "path"
 import { appendFileSync, mkdirSync } from "fs"
-import { appendFile, cp, mkdir, readFile, stat, writeFile } from "fs/promises"
+import { appendFile, cp, mkdir, readFile, readdir, stat, writeFile } from "fs/promises"
 
 import { serviceUse } from "@opencode-ai/core/effect/service-use"
 import { Bus } from "@/bus"
@@ -16,10 +16,19 @@ import { Session } from "@/session/session"
 import { SessionStatus } from "@/session/status"
 import { MessageV2 } from "@/session/message-v2"
 import { SessionPrompt } from "@/session/prompt"
-import { MessageID, SessionID } from "@/session/schema"
-import { Database, and, asc, eq, inArray, or } from "@/storage/db"
+import { MessageID, PartID, SessionID } from "@/session/schema"
+import { Database, and, asc, eq, inArray, or, sql } from "@/storage/db"
 import { BackgroundJob } from "@/background/job"
 import { Cause, Effect, Context, Layer, Schema, Stream } from "effect"
+import {
+  MessageTable,
+  PartTable,
+  SessionContextEpochTable,
+  SessionInputTable,
+  SessionMessageTable,
+  SessionTable,
+} from "@opencode-ai/core/session/sql"
+import { InstallationVersion } from "@opencode-ai/core/installation/version"
 
 import { parseWorkflowXml } from "./parse"
 import { readyMilestones } from "./scheduler"
@@ -54,6 +63,7 @@ import {
 } from "./workflow.sql"
 
 const workflowDir = path.join(".opencode", "workflows")
+const workflowStateFileName = "workflow-state.json"
 const defaultXml = `<workflow>
   <ordered>
     <milestone id="requirements" title="Clarify requirements" department="product">Clarify the user request, constraints, and acceptance criteria.</milestone>
@@ -3858,6 +3868,460 @@ function toConsultation(row: typeof WorkflowConsultationTable.$inferSelect): Wor
   }
 }
 
+function workflowStatePath(workflow: Pick<WorkflowInfo, "id" | "path">) {
+  return workflowArtifactPath(workflow, workflowStateFileName)
+}
+
+function isWorkflowStatePath(file: string) {
+  const normalized = path.normalize(file)
+  return path.basename(normalized) === workflowStateFileName && path.dirname(path.dirname(normalized)) === workflowDir
+}
+
+function workflowInstanceSessionPath(worktree: string, directory: string) {
+  return path.relative(path.resolve(worktree), directory).replaceAll("\\", "/")
+}
+
+function workflowModelSessionRef(model: WorkflowInfo["model"] | undefined) {
+  if (!model) return undefined
+  return { id: model.modelID, providerID: model.providerID, ...(model.variant ? { variant: model.variant } : {}) }
+}
+
+function workflowStateDirectory(workflow: WorkflowInfo) {
+  return { ...workflow, directory: "." }
+}
+
+function workflowStateFileDirectory(ctx: { directory: string }, file: string) {
+  const relative = normalizedRelativePath(ctx.directory, path.dirname(file))
+  if (!relative) return
+  const normalized = path.normalize(relative)
+  if (path.dirname(normalized) === workflowDir) return normalized.replaceAll("\\", "/")
+}
+
+function workflowStateStoredPath(pathname: string | undefined, fallback: string | undefined) {
+  const normalized = path.normalize(pathname ?? "")
+  if (normalized === workflowDir || normalized.startsWith(workflowDir + path.sep)) return pathname
+  return fallback
+}
+
+function workflowStateSessionRefs(input: {
+  workflow: WorkflowInfo
+  milestones: WorkflowMilestoneInfo[]
+  members: WorkflowMemberInfo[]
+  consultations: WorkflowConsultationInfo[]
+  interventions: WorkflowInterventionInfo[]
+}) {
+  const titles = workflowSessionTitles(input.workflow, input.milestones)
+  const refs = new Map<SessionID, { sessionID: SessionID; role: WorkflowSessionRef["role"]; title?: string }>()
+  const add = (sessionID: SessionID | undefined, role: WorkflowSessionRef["role"], title?: string) => {
+    if (!sessionID || refs.has(sessionID)) return
+    refs.set(sessionID, { sessionID, role, title: title ?? titles.get(sessionID) })
+  }
+  add(input.workflow.rootSessionID, "requester", workflowRequesterTitle(input.workflow.request))
+  add(input.workflow.pmSessionID, "main_pm", workflowSessionTitle("Main PM", input.workflow.title))
+  add(input.workflow.testerSessionID, "tester", workflowSessionTitle("Tester", input.workflow.title))
+  input.members.forEach((member) => add(member.sessionID, member.role, member.title))
+  input.milestones.forEach((milestone) => milestone.session.forEach((ref) => add(ref.sessionID, ref.role, titles.get(ref.sessionID))))
+  input.consultations.forEach((consultation) => {
+    add(consultation.fromSessionID, consultation.fromRole)
+    add(consultation.toSessionID, consultation.toRole)
+  })
+  input.interventions.forEach((intervention) => {
+    add(intervention.fromSessionID, "requester")
+    add(intervention.targetSessionID, intervention.targetRole)
+  })
+  return [...refs.values()]
+}
+
+function workflowStateSessionSnapshot(input: {
+  workflow: WorkflowInfo
+  ref: { sessionID: SessionID; role: WorkflowSessionRef["role"]; title?: string }
+  info?: Session.Info
+}) {
+  return {
+    id: input.ref.sessionID,
+    role: input.ref.role,
+    title: input.info?.title ?? input.ref.title ?? roleSessionTitle(input.ref.role),
+    parentID:
+      input.info?.parentID ??
+      (input.workflow.rootSessionID && input.ref.sessionID !== input.workflow.rootSessionID
+        ? input.workflow.rootSessionID
+        : undefined),
+    agent: input.info?.agent ?? workflowAgentForRole(input.ref.role),
+    model: input.info?.model ?? workflowModelSessionRef(input.workflow.model),
+    metadata: {
+      ...(input.info?.metadata ?? {}),
+      restoredWorkflow: {
+        id: input.workflow.id,
+        path: input.workflow.path,
+        role: input.ref.role,
+        archive: workflowSessionArchivePath(input.ref.sessionID),
+        summary: workflowSessionSummaryPath(input.ref.sessionID),
+      },
+    },
+    permission: input.info?.permission,
+    time: input.info?.time ?? {
+      created: input.workflow.time.created,
+      updated: input.workflow.time.updated,
+    },
+  }
+}
+
+function workflowStateSessionRow(input: {
+  ctx: { directory: string; worktree: string; project: { id: string } }
+  workflow: WorkflowInfo
+  session: ReturnType<typeof workflowStateSessionSnapshot>
+}) {
+  return {
+    id: input.session.id,
+    project_id: input.ctx.project.id,
+    workspace_id: null,
+    parent_id: input.session.parentID ?? null,
+    slug: `restored-${String(input.session.id).replace(/[^a-zA-Z0-9._-]+/g, "-")}`,
+    directory: input.ctx.directory,
+    path: workflowInstanceSessionPath(input.ctx.worktree, input.ctx.directory),
+    title: input.session.title,
+    version: InstallationVersion,
+    share_url: null,
+    summary_additions: null,
+    summary_deletions: null,
+    summary_files: null,
+    summary_diffs: null,
+    metadata: input.session.metadata,
+    cost: 0,
+    tokens_input: 0,
+    tokens_output: 0,
+    tokens_reasoning: 0,
+    tokens_cache_read: 0,
+    tokens_cache_write: 0,
+    revert: null,
+    permission: input.session.permission ?? null,
+    agent: input.session.agent ?? null,
+    model: input.session.model ?? null,
+    time_created: input.session.time?.created ?? input.workflow.time.created,
+    time_updated: input.session.time?.updated ?? input.workflow.time.updated,
+    time_compacting: input.session.time?.compacting ?? null,
+    time_archived: input.session.time?.archived ?? null,
+  }
+}
+
+function workflowRestoreMessageID(sessionID: SessionID) {
+  return MessageID.ascending(`msg_workflow_restore_${String(sessionID).replace(/[^a-zA-Z0-9._-]+/g, "_")}`)
+}
+
+function workflowRestorePartID(sessionID: SessionID) {
+  return PartID.ascending(`prt_workflow_restore_${String(sessionID).replace(/[^a-zA-Z0-9._-]+/g, "_")}`)
+}
+
+function workflowRestoreMessageText(workflow: WorkflowInfo, session: ReturnType<typeof workflowStateSessionSnapshot>) {
+  return [
+    "This session was restored from a project-local workflow snapshot.",
+    "",
+    `Workflow: ${workflow.id}`,
+    `Workflow root: ${workflow.path}`,
+    `Session: ${session.id}`,
+    `Role: ${roleSessionTitle(session.role)}`,
+    `Full session archive: ${workflowArtifactPath(workflow, workflowSessionArchivePath(session.id))}`,
+    `Session summary: ${workflowArtifactPath(workflow, workflowSessionSummaryPath(session.id))}`,
+    "",
+    "Use the workflow root, reference library, and archived session files as the recovered conversation history before continuing work.",
+  ].join("\n")
+}
+
+function workflowRestoreMessageRows(workflow: WorkflowInfo, sessions: ReturnType<typeof workflowStateSessionSnapshot>[]) {
+  return sessions.map((session) => {
+    const id = workflowRestoreMessageID(session.id)
+    const time = session.time?.created ?? workflow.time.created
+    const model = session.model ?? workflowModelSessionRef(workflow.model) ?? { providerID: "opencode", id: "workflow-restore" }
+    return {
+      message: {
+        id,
+        session_id: session.id,
+        time_created: time,
+        time_updated: time,
+        data: {
+          role: "user" as const,
+          time: { created: time },
+          agent: session.agent ?? workflowAgentForRole(session.role),
+          model: {
+            providerID: model.providerID,
+            modelID: model.id ?? model.modelID,
+            ...(model.variant ? { variant: model.variant } : {}),
+          },
+        },
+      },
+      part: {
+        id: workflowRestorePartID(session.id),
+        message_id: id,
+        session_id: session.id,
+        time_created: time,
+        time_updated: time,
+        data: {
+          type: "text" as const,
+          text: workflowRestoreMessageText(workflow, session),
+          synthetic: true,
+          metadata: {
+            restoredWorkflow: {
+              id: workflow.id,
+              path: workflow.path,
+              archive: workflowSessionArchivePath(session.id),
+              summary: workflowSessionSummaryPath(session.id),
+            },
+          },
+        },
+      },
+    }
+  })
+}
+
+function workflowStateMessageRows(sessions: ReturnType<typeof workflowStateSessionSnapshot>[]) {
+  return sessions.flatMap((session) =>
+    (Array.isArray(session.messages) ? session.messages : []).flatMap((message) => {
+      if (!message?.info?.id || !message.info.sessionID || !Array.isArray(message.parts)) return []
+      const messageData = { ...message.info }
+      delete messageData.id
+      delete messageData.sessionID
+      const row = {
+        message: {
+          id: message.info.id,
+          session_id: message.info.sessionID,
+          time_created: message.info.time?.created ?? session.time?.created ?? Date.now(),
+          time_updated: message.info.time?.completed ?? message.info.time?.created ?? session.time?.updated ?? Date.now(),
+          data: messageData,
+        },
+        parts: message.parts
+          .filter((part) => part?.id && part.messageID && part.sessionID)
+          .map((part) => {
+            const partData = { ...part }
+            delete partData.id
+            delete partData.messageID
+            delete partData.sessionID
+            return {
+              id: part.id,
+              message_id: part.messageID,
+              session_id: part.sessionID,
+              time_created: part.time?.start ?? message.info.time?.created ?? session.time?.created ?? Date.now(),
+              time_updated: part.time?.end ?? part.time?.start ?? message.info.time?.completed ?? message.info.time?.created ?? Date.now(),
+              data: partData,
+            }
+          }),
+      }
+      return [row]
+    }),
+  )
+}
+
+function workflowStateDurableMessageRows(sessions: ReturnType<typeof workflowStateSessionSnapshot>[]) {
+  return sessions.flatMap((session) =>
+    (Array.isArray(session.durableMessages) ? session.durableMessages : []).flatMap((row) => {
+      if (!row?.id || !row.type || row.seq === undefined || !row.data) return []
+      return [
+        {
+          id: row.id,
+          session_id: session.id,
+          type: row.type,
+          seq: row.seq,
+          time_created: row.time_created ?? session.time?.created ?? Date.now(),
+          time_updated: row.time_updated ?? row.time_created ?? session.time?.updated ?? Date.now(),
+          data: row.data,
+        },
+      ]
+    }),
+  )
+}
+
+function workflowStateDurableInputRows(sessions: ReturnType<typeof workflowStateSessionSnapshot>[]) {
+  return sessions.flatMap((session) =>
+    (Array.isArray(session.durableInputs) ? session.durableInputs : []).flatMap((row) => {
+      if (!row?.id || !row.prompt || !row.delivery || row.admitted_seq === undefined) return []
+      return [
+        {
+          id: row.id,
+          session_id: session.id,
+          prompt: row.prompt,
+          delivery: row.delivery,
+          admitted_seq: row.admitted_seq,
+          promoted_seq: row.promoted_seq ?? null,
+          time_created: row.time_created ?? session.time?.created ?? Date.now(),
+        },
+      ]
+    }),
+  )
+}
+
+function workflowStateContextEpochRows(sessions: ReturnType<typeof workflowStateSessionSnapshot>[]) {
+  return sessions.flatMap((session) => {
+    const row = session.contextEpoch
+    if (!row?.baseline || !row.snapshot || row.baseline_seq === undefined) return []
+    return [
+      {
+        session_id: session.id,
+        baseline: row.baseline,
+        snapshot: row.snapshot,
+        baseline_seq: row.baseline_seq,
+      },
+    ]
+  })
+}
+
+function workflowDurableSessionSnapshot(sessionID: SessionID) {
+  return Effect.sync(() =>
+    Database.use((db) => ({
+      durableMessages: db
+        .select()
+        .from(SessionMessageTable)
+        .where(eq(SessionMessageTable.session_id, sessionID))
+        .orderBy(asc(SessionMessageTable.seq))
+        .all(),
+      durableInputs: db
+        .select()
+        .from(SessionInputTable)
+        .where(eq(SessionInputTable.session_id, sessionID))
+        .orderBy(asc(SessionInputTable.admitted_seq))
+        .all(),
+      contextEpoch: db
+        .select()
+        .from(SessionContextEpochTable)
+        .where(eq(SessionContextEpochTable.session_id, sessionID))
+        .get(),
+    })),
+  ).pipe(
+    Effect.catchCause(() =>
+      Effect.succeed({
+        durableMessages: [],
+        durableInputs: [],
+        contextEpoch: undefined,
+      }),
+    ),
+  )
+}
+
+function workflowStateWorkflowRow(workflow: WorkflowInfo) {
+  return {
+    id: workflow.id,
+    project_id: workflow.projectID,
+    root_session_id: workflow.rootSessionID ?? null,
+    pm_session_id: workflow.pmSessionID ?? null,
+    tester_session_id: workflow.testerSessionID ?? null,
+    request: workflow.request,
+    title: workflow.title,
+    directory: workflow.directory,
+    path: workflow.path,
+    xml: workflow.xml,
+    status: workflow.status,
+    staffing: workflow.staffing ?? null,
+    model: workflow.model ?? null,
+    model_whitelist: workflow.modelWhitelist ?? null,
+    agent: workflow.agent ?? null,
+    test_path: workflow.testPath ?? null,
+    error: workflow.error ?? null,
+    time_created: workflow.time.created,
+    time_updated: workflow.time.updated,
+    time_completed: workflow.time.completed ?? null,
+  }
+}
+
+function workflowStateMilestoneRow(workflow: WorkflowInfo, milestone: WorkflowMilestoneInfo) {
+  return {
+    workflow_id: workflow.id,
+    id: milestone.id,
+    title: milestone.title,
+    department: milestone.department,
+    prompt: milestone.prompt,
+    depends_on: milestone.dependsOn ?? [],
+    status: milestone.status,
+    attempt: milestone.attempt ?? 0,
+    plan_path: workflowStoredPath(workflow, milestone.planPath, milestone.id, "plan.md"),
+    review_path: milestone.reviewPath ? rewriteWorkflowStoredPath(workflow, milestone.reviewPath) : undefined,
+    session: milestone.session ?? [],
+    time_created: workflow.time.created,
+    time_updated: workflow.time.updated,
+  }
+}
+
+function workflowStateMemberRow(member: WorkflowMemberInfo) {
+  return {
+    workflow_id: member.workflowID,
+    id: member.id,
+    role: member.role,
+    specialty: member.specialty,
+    title: member.title,
+    session_id: member.sessionID,
+    capacity: member.capacity,
+    status: member.status,
+    model: member.model ?? null,
+    model_weight: member.modelWeight ?? null,
+    model_cache_until: member.modelCacheUntil ?? null,
+    time_created: member.time.created,
+    time_updated: member.time.updated,
+  }
+}
+
+function workflowStateConsultationRow(consultation: WorkflowConsultationInfo) {
+  return {
+    workflow_id: consultation.workflowID,
+    id: consultation.id,
+    from_session_id: consultation.fromSessionID,
+    to_session_id: consultation.toSessionID,
+    from_role: consultation.fromRole,
+    to_role: consultation.toRole,
+    milestone_id: consultation.milestoneID,
+    reason: consultation.reason,
+    timing: consultation.timing,
+    question: consultation.question,
+    answer: consultation.answer,
+    status: consultation.status,
+    time_created: consultation.time.created,
+    time_updated: consultation.time.updated,
+  }
+}
+
+function workflowStateInterventionRow(intervention: WorkflowInterventionInfo) {
+  return {
+    workflow_id: intervention.workflowID,
+    id: intervention.id,
+    from_session_id: intervention.fromSessionID ?? null,
+    target_session_id: intervention.targetSessionID ?? null,
+    target_role: intervention.targetRole,
+    timing: intervention.timing,
+    message: intervention.message,
+    response: intervention.response ?? null,
+    path: intervention.path,
+    status: intervention.status,
+    time_created: intervention.time.created,
+    time_updated: intervention.time.updated,
+  }
+}
+
+function workflowStateEdgeRows(workflowID: WorkflowID, edges: WorkflowGraphEdge[]) {
+  return edges.map((edge) => ({
+    workflow_id: workflowID,
+    from_id: WorkflowMilestoneID.make(edge.from),
+    to_id: WorkflowMilestoneID.make(edge.to),
+    data: edge,
+  }))
+}
+
+async function writeWorkflowStateFile(file: string, state: unknown) {
+  const content = `${JSON.stringify(state, null, 2)}\n`
+  const existing = await readFile(file, "utf8").catch(() => undefined)
+  if (existing === content) return
+  await writeFileEnsured(file, content)
+}
+
+async function readWorkflowStateFile(file: string) {
+  const parsed = JSON.parse(await readFile(file, "utf8"))
+  if (parsed?.version !== 1 || !parsed.workflow?.id) return
+  return parsed
+}
+
+async function workflowStateFiles(directory: string) {
+  const root = path.join(directory, workflowDir)
+  const entries = await readdir(root, { withFileTypes: true }).catch(() => [])
+  return entries
+    .filter((entry) => entry.isDirectory())
+    .map((entry) => path.join(root, entry.name, workflowStateFileName))
+}
+
 export const layer: Layer.Layer<
   Service,
   never,
@@ -3877,8 +4341,348 @@ export const layer: Layer.Layer<
     const observedWorkflowFiles = new Map<string, string>()
     const workflowMessageKey = (sessionID: SessionID, messageID: MessageID) => `${sessionID}:${messageID}`
 
+    const syncWorkflowStateFile = Effect.fn("Workflow.syncWorkflowStateFile")(function* (file: string) {
+      const ctx = yield* InstanceState.context
+      const state = yield* Effect.promise(() => readWorkflowStateFile(file)).pipe(
+        Effect.catchCause(() => Effect.succeed(undefined)),
+      )
+      if (!state) return false
+      const storedPath = workflowStateStoredPath(state.workflow.path, workflowStateFileDirectory(ctx, file))
+      if (!storedPath) return false
+      const stateTimeCreated = state.workflow.time?.created ?? Date.now()
+      const stateTimeUpdated = state.workflow.time?.updated ?? stateTimeCreated
+      const workflow: WorkflowInfo = {
+        ...state.workflow,
+        projectID: ProjectID.make(ctx.project.id),
+        directory: ctx.directory,
+        path: storedPath,
+        time: {
+          created: stateTimeCreated,
+          updated: stateTimeUpdated,
+          completed: state.workflow.time?.completed,
+        },
+      }
+      const milestoneItems = (Array.isArray(state.milestones) ? state.milestones : []).map((milestone) => ({
+        ...milestone,
+        planPath: workflowStateStoredPath(milestone.planPath, workflowArtifactPath(workflow, milestone.id, "plan.md")),
+        reviewPath: workflowStateStoredPath(milestone.reviewPath, undefined),
+        session: Array.isArray(milestone.session) ? milestone.session : [],
+      }))
+      const memberItems = (Array.isArray(state.members) ? state.members : []).map((member) => ({
+        ...member,
+        workflowID: workflow.id,
+        time: member.time ?? { created: workflow.time.created, updated: workflow.time.updated },
+      }))
+      const consultationItems = (Array.isArray(state.consultations) ? state.consultations : []).map((consultation) => ({
+        ...consultation,
+        workflowID: workflow.id,
+        time: consultation.time ?? { created: workflow.time.created, updated: workflow.time.updated },
+      }))
+      const interventionItems = (Array.isArray(state.interventions) ? state.interventions : []).map((intervention) => ({
+        ...intervention,
+        workflowID: workflow.id,
+        path: workflowStateStoredPath(intervention.path, workflowArtifactPath(workflow, workflowInterventionPath(intervention.id))),
+        time: intervention.time ?? { created: workflow.time.created, updated: workflow.time.updated },
+      }))
+      const sessionByID = new Map(
+        (Array.isArray(state.sessions) ? state.sessions : [])
+          .filter((item) => item?.id)
+          .map((item) => [item.id, item]),
+      )
+      const sessionRefs = workflowStateSessionRefs({
+        workflow,
+        milestones: milestoneItems,
+        members: memberItems,
+        consultations: consultationItems,
+        interventions: interventionItems,
+      })
+      const sessionRows = sessionRefs.map((ref) =>
+        workflowStateSessionRow({
+          ctx,
+          workflow,
+          session: {
+            ...workflowStateSessionSnapshot({ workflow, ref }),
+            ...(sessionByID.get(ref.sessionID) ?? {}),
+            id: ref.sessionID,
+            role: ref.role,
+          },
+        }),
+      )
+      const sessionStates = sessionRows.map((row, index) => {
+        const state = sessionByID.get(row.id) ?? {}
+        const ref = sessionRefs[index]
+        return {
+          id: row.id,
+          role: state.role ?? ref?.role ?? "requester",
+          title: row.title,
+          parentID: row.parent_id ?? undefined,
+          agent: row.agent ?? undefined,
+          model: row.model ?? undefined,
+          metadata: row.metadata ?? undefined,
+          permission: row.permission ?? undefined,
+          time: {
+            created: row.time_created,
+            updated: row.time_updated,
+            compacting: row.time_compacting ?? undefined,
+            archived: row.time_archived ?? undefined,
+          },
+          messages: Array.isArray(state.messages) ? state.messages : [],
+          durableMessages: Array.isArray(state.durableMessages) ? state.durableMessages : [],
+          durableInputs: Array.isArray(state.durableInputs) ? state.durableInputs : [],
+          contextEpoch: state.contextEpoch,
+        }
+      })
+      const persistedMessages = workflowStateMessageRows(sessionStates)
+      const persistedParts = persistedMessages.flatMap((item) => item.parts)
+      const persistedSessionIDs = new Set(persistedMessages.map((item) => item.message.session_id))
+      const restoreMessages = workflowRestoreMessageRows(
+        workflow,
+        sessionStates.filter((sessionState) => !persistedSessionIDs.has(sessionState.id)),
+      )
+      const durableMessages = workflowStateDurableMessageRows(sessionStates)
+      const durableInputs = workflowStateDurableInputRows(sessionStates)
+      const contextEpochs = workflowStateContextEpochRows(sessionStates)
+      const messageIDs = [...persistedMessages.map((item) => item.message.id), ...restoreMessages.map((item) => item.message.id)]
+      const partIDs = [...persistedParts.map((item) => item.id), ...restoreMessages.map((item) => item.part.id)]
+      const durableMessageIDs = durableMessages.map((row) => row.id)
+      const durableInputIDs = durableInputs.map((row) => row.id)
+      const contextEpochSessionIDs = contextEpochs.map((row) => row.session_id)
+      const storedMessageTimes = new Map(
+        messageIDs.length === 0
+          ? []
+          : Database.use((db) =>
+              db
+                .select({ id: MessageTable.id, timeUpdated: MessageTable.time_updated })
+                .from(MessageTable)
+                .where(inArray(MessageTable.id, messageIDs))
+                .all(),
+            ).map((row) => [row.id, row.timeUpdated]),
+      )
+      const storedPartTimes = new Map(
+        partIDs.length === 0
+          ? []
+          : Database.use((db) =>
+              db
+                .select({ id: PartTable.id, timeUpdated: PartTable.time_updated })
+                .from(PartTable)
+                .where(inArray(PartTable.id, partIDs))
+                .all(),
+            ).map((row) => [row.id, row.timeUpdated]),
+      )
+      const storedDurableMessageTimes = new Map(
+        durableMessageIDs.length === 0
+          ? []
+          : Database.use((db) =>
+              db
+                .select({ id: SessionMessageTable.id, timeUpdated: SessionMessageTable.time_updated })
+                .from(SessionMessageTable)
+                .where(inArray(SessionMessageTable.id, durableMessageIDs))
+                .all(),
+            ).map((row) => [row.id, row.timeUpdated]),
+      )
+      const storedDurableInputs = new Map(
+        durableInputIDs.length === 0
+          ? []
+          : Database.use((db) =>
+              db
+                .select({
+                  id: SessionInputTable.id,
+                  prompt: SessionInputTable.prompt,
+                  delivery: SessionInputTable.delivery,
+                  admittedSeq: SessionInputTable.admitted_seq,
+                  promotedSeq: SessionInputTable.promoted_seq,
+                  timeCreated: SessionInputTable.time_created,
+                })
+                .from(SessionInputTable)
+                .where(inArray(SessionInputTable.id, durableInputIDs))
+                .all(),
+            ).map((row) => [row.id, row]),
+      )
+      const storedContextEpochs = new Map(
+        contextEpochSessionIDs.length === 0
+          ? []
+          : Database.use((db) =>
+              db
+                .select({
+                  sessionID: SessionContextEpochTable.session_id,
+                  baselineSeq: SessionContextEpochTable.baseline_seq,
+                })
+                .from(SessionContextEpochTable)
+                .where(inArray(SessionContextEpochTable.session_id, contextEpochSessionIDs))
+                .all(),
+            ).map((row) => [row.sessionID, row]),
+      )
+      const existing = Database.use((db) => db.select().from(WorkflowTable).where(eq(WorkflowTable.id, workflow.id)).get())
+      const missingSessions =
+        sessionRows.length === 0
+          ? 0
+          : sessionRows.length -
+            Database.use((db) =>
+              db
+                .select({ id: SessionTable.id })
+                .from(SessionTable)
+                .where(inArray(SessionTable.id, sessionRows.map((row) => row.id)))
+                .all(),
+            ).length
+      const staleMessages =
+        persistedMessages.filter((item) => (storedMessageTimes.get(item.message.id) ?? -1) < item.message.time_updated).length +
+        restoreMessages.filter((item) => !storedMessageTimes.has(item.message.id)).length
+      const staleParts =
+        persistedParts.filter((row) => (storedPartTimes.get(row.id) ?? -1) < row.time_updated).length +
+        restoreMessages.filter((item) => !storedPartTimes.has(item.part.id)).length
+      const staleDurableMessages = durableMessages.filter(
+        (row) => (storedDurableMessageTimes.get(row.id) ?? -1) < row.time_updated,
+      ).length
+      const staleDurableInputs = durableInputs.filter((row) => {
+        const stored = storedDurableInputs.get(row.id)
+        if (!stored) return true
+        if (stored.delivery !== row.delivery || stored.admittedSeq !== row.admitted_seq) return true
+        if ((stored.promotedSeq ?? null) !== (row.promoted_seq ?? null)) return true
+        if (stored.timeCreated < row.time_created) return true
+        return JSON.stringify(stored.prompt) !== JSON.stringify(row.prompt)
+      }).length
+      const staleContextEpochs = contextEpochs.filter(
+        (row) => (storedContextEpochs.get(row.session_id)?.baselineSeq ?? -1) < row.baseline_seq,
+      ).length
+      if (
+        existing &&
+        missingSessions === 0 &&
+        staleMessages === 0 &&
+        staleParts === 0 &&
+        staleDurableMessages === 0 &&
+        staleDurableInputs === 0 &&
+        staleContextEpochs === 0 &&
+        existing.time_updated >= workflow.time.updated &&
+        existing.directory === ctx.directory &&
+        path.normalize(existing.path) === path.normalize(workflow.path)
+      ) {
+        return false
+      }
+      const edgeRows = workflowStateEdgeRows(
+        workflow.id,
+        (Array.isArray(state.edges) ? state.edges : []).filter((edge) => edge?.from && edge?.to),
+      )
+      Database.transaction((tx) => {
+        if (sessionRows.length > 0) tx.insert(SessionTable).values(sessionRows).onConflictDoNothing().run()
+        if (persistedMessages.length > 0) {
+          tx.insert(MessageTable)
+            .values(persistedMessages.map((item) => item.message))
+            .onConflictDoUpdate({
+              target: MessageTable.id,
+              set: {
+                session_id: sql`excluded.session_id`,
+                time_created: sql`excluded.time_created`,
+                time_updated: sql`excluded.time_updated`,
+                data: sql`excluded.data`,
+              },
+            })
+            .run()
+          if (persistedParts.length > 0) {
+            tx.insert(PartTable)
+              .values(persistedParts)
+              .onConflictDoUpdate({
+                target: PartTable.id,
+                set: {
+                  message_id: sql`excluded.message_id`,
+                  session_id: sql`excluded.session_id`,
+                  time_created: sql`excluded.time_created`,
+                  time_updated: sql`excluded.time_updated`,
+                  data: sql`excluded.data`,
+                },
+              })
+              .run()
+          }
+        }
+        if (restoreMessages.length > 0) {
+          tx.insert(MessageTable).values(restoreMessages.map((item) => item.message)).onConflictDoNothing().run()
+          tx.insert(PartTable).values(restoreMessages.map((item) => item.part)).onConflictDoNothing().run()
+        }
+        if (durableMessages.length > 0) {
+          tx.insert(SessionMessageTable)
+            .values(durableMessages)
+            .onConflictDoUpdate({
+              target: SessionMessageTable.id,
+              set: {
+                session_id: sql`excluded.session_id`,
+                type: sql`excluded.type`,
+                seq: sql`excluded.seq`,
+                time_created: sql`excluded.time_created`,
+                time_updated: sql`excluded.time_updated`,
+                data: sql`excluded.data`,
+              },
+            })
+            .run()
+        }
+        if (durableInputs.length > 0) {
+          tx.insert(SessionInputTable)
+            .values(durableInputs)
+            .onConflictDoUpdate({
+              target: SessionInputTable.id,
+              set: {
+                session_id: sql`excluded.session_id`,
+                prompt: sql`excluded.prompt`,
+                delivery: sql`excluded.delivery`,
+                admitted_seq: sql`excluded.admitted_seq`,
+                promoted_seq: sql`excluded.promoted_seq`,
+                time_created: sql`excluded.time_created`,
+              },
+            })
+            .run()
+        }
+        if (contextEpochs.length > 0) {
+          tx.insert(SessionContextEpochTable)
+            .values(contextEpochs)
+            .onConflictDoUpdate({
+              target: SessionContextEpochTable.session_id,
+              set: {
+                baseline: sql`excluded.baseline`,
+                snapshot: sql`excluded.snapshot`,
+                baseline_seq: sql`excluded.baseline_seq`,
+              },
+            })
+            .run()
+        }
+        tx.insert(WorkflowTable)
+          .values(workflowStateWorkflowRow(workflow))
+          .onConflictDoUpdate({
+            target: WorkflowTable.id,
+            set: workflowStateWorkflowRow(workflow),
+          })
+          .run()
+        tx.delete(WorkflowMilestoneTable).where(eq(WorkflowMilestoneTable.workflow_id, workflow.id)).run()
+        tx.delete(WorkflowMemberTable).where(eq(WorkflowMemberTable.workflow_id, workflow.id)).run()
+        tx.delete(WorkflowConsultationTable).where(eq(WorkflowConsultationTable.workflow_id, workflow.id)).run()
+        tx.delete(WorkflowInterventionTable).where(eq(WorkflowInterventionTable.workflow_id, workflow.id)).run()
+        tx.delete(WorkflowEdgeTable).where(eq(WorkflowEdgeTable.workflow_id, workflow.id)).run()
+        if (milestoneItems.length > 0) {
+          tx.insert(WorkflowMilestoneTable).values(milestoneItems.map((item) => workflowStateMilestoneRow(workflow, item))).run()
+        }
+        if (memberItems.length > 0) tx.insert(WorkflowMemberTable).values(memberItems.map(workflowStateMemberRow)).run()
+        if (consultationItems.length > 0) {
+          tx.insert(WorkflowConsultationTable).values(consultationItems.map(workflowStateConsultationRow)).run()
+        }
+        if (interventionItems.length > 0) {
+          tx.insert(WorkflowInterventionTable).values(interventionItems.map(workflowStateInterventionRow)).run()
+        }
+        if (edgeRows.length > 0) tx.insert(WorkflowEdgeTable).values(edgeRows).run()
+      })
+      yield* events.publish(Event.Created, { workflowID: workflow.id, info: workflow }).pipe(Effect.ignore)
+      return true
+    })
+
+    const syncWorkflowStatesFromDisk = Effect.fn("Workflow.syncWorkflowStatesFromDisk")(function* () {
+      const ctx = yield* InstanceState.context
+      const files = yield* Effect.promise(() => workflowStateFiles(ctx.directory))
+      const results = yield* Effect.all(
+        files.map((file) => syncWorkflowStateFile(file).pipe(Effect.catchCause(() => Effect.succeed(false)))),
+        { concurrency: 1 },
+      )
+      return results.some(Boolean)
+    })
+
     const publishUpdated = Effect.fn("Workflow.publishUpdated")(function* (workflowID: WorkflowID) {
       const info = yield* get(workflowID)
+      yield* writeWorkflowState(workflowID, info).pipe(Effect.ignore)
       yield* events.publish(Event.Updated, { workflowID, info })
       yield* events.publish(Event.GraphUpdated, { workflowID })
       return info
@@ -3901,8 +4705,11 @@ export const layer: Layer.Layer<
 
     const get = Effect.fn("Workflow.get")(function* (workflowID: WorkflowID) {
       const row = Database.use((db) => db.select().from(WorkflowTable).where(eq(WorkflowTable.id, workflowID)).get())
-      if (!row) return yield* new Error({ message: `Workflow not found: ${workflowID}` })
-      return yield* ensureAuditablePath(toInfo(row))
+      if (row) return yield* ensureAuditablePath(toInfo(row))
+      yield* syncWorkflowStatesFromDisk().pipe(Effect.ignore)
+      const restored = Database.use((db) => db.select().from(WorkflowTable).where(eq(WorkflowTable.id, workflowID)).get())
+      if (!restored) return yield* new Error({ message: `Workflow not found: ${workflowID}` })
+      return yield* ensureAuditablePath(toInfo(restored))
     })
 
     const ensureRequesterSession = Effect.fn("Workflow.ensureRequesterSession")(function* (workflow: WorkflowInfo) {
@@ -4051,6 +4858,7 @@ export const layer: Layer.Layer<
           standupDocs: standupDocsFromIndex(workflow, standupIndex),
         }),
       )
+      yield* writeWorkflowState(workflowID, workflow).pipe(Effect.ignore)
     })
 
     const writeDeliverySummary = Effect.fn("Workflow.writeDeliverySummary")(function* (
@@ -4077,6 +4885,7 @@ export const layer: Layer.Layer<
 
     const list = Effect.fn("Workflow.list")(function* (input?: ListInput) {
       const ctx = yield* InstanceState.context
+      yield* syncWorkflowStatesFromDisk().pipe(Effect.ignore)
       const rows = Database.use((db) =>
         db
           .select()
@@ -4179,6 +4988,72 @@ export const layer: Layer.Layer<
           .orderBy(asc(WorkflowMemberTable.time_created))
           .all()
           .map(toMember),
+      )
+    })
+
+    const workflowEdges = Effect.fn("Workflow.workflowEdges")(function* (workflowID: WorkflowID) {
+      return Database.use((db) =>
+        db
+          .select()
+          .from(WorkflowEdgeTable)
+          .where(eq(WorkflowEdgeTable.workflow_id, workflowID))
+          .all()
+          .map((row) => row.data ?? { id: `${row.from_id}->${row.to_id}`, from: String(row.from_id), to: String(row.to_id) }),
+      )
+    })
+
+    const writeWorkflowState = Effect.fn("Workflow.writeWorkflowState")(function* (
+      workflowID: WorkflowID,
+      workflowOverride?: WorkflowInfo,
+    ) {
+      const ctx = yield* InstanceState.context
+      const workflow = workflowOverride ?? (yield* get(workflowID))
+      const milestoneItems = yield* milestones(workflowID)
+      const memberItems = yield* members(workflowID)
+      const consultationItems = yield* consultations(workflowID)
+      const interventionItems = yield* interventions(workflowID)
+      const sessionRefs = workflowStateSessionRefs({
+        workflow,
+        milestones: milestoneItems,
+        members: memberItems,
+        consultations: consultationItems,
+        interventions: interventionItems,
+      })
+      const sessions = yield* Effect.all(
+        sessionRefs.map((ref) =>
+          session.get(ref.sessionID).pipe(
+            Effect.flatMap((info) =>
+              Effect.all({
+                messages: MessageV2.stream(ref.sessionID).pipe(Effect.catchCause(() => Effect.succeed([]))),
+                durable: workflowDurableSessionSnapshot(ref.sessionID),
+              }).pipe(
+                Effect.map(({ messages, durable }) => ({
+                  ...workflowStateSessionSnapshot({ workflow, ref, info }),
+                  messages,
+                  ...durable,
+                })),
+              ),
+            ),
+            Effect.catchCause(() => Effect.succeed(workflowStateSessionSnapshot({ workflow, ref }))),
+          ),
+        ),
+        { concurrency: 4 },
+      )
+      const edges = yield* workflowEdges(workflowID)
+      yield* Effect.promise(() =>
+        writeWorkflowStateFile(
+          path.join(ctx.directory, workflowStatePath(workflow)),
+          {
+            version: 1,
+            workflow: workflowStateDirectory(workflow),
+            milestones: milestoneItems,
+            members: memberItems,
+            consultations: consultationItems,
+            interventions: interventionItems,
+            edges,
+            sessions,
+          },
+        ),
       )
     })
 
@@ -5725,6 +6600,7 @@ export const layer: Layer.Layer<
           messages,
         }),
       )
+      yield* writeWorkflowState(input.workflowID, workflow).pipe(Effect.ignore)
     })
 
     const archiveWorkflowSessions = Effect.fn("Workflow.archiveWorkflowSessions")(function* (workflowID: WorkflowID) {
@@ -6872,6 +7748,10 @@ export const layer: Layer.Layer<
         yield* refreshActiveWorkflowsForContextFile()
         return
       }
+      if (isWorkflowStatePath(relative)) {
+        yield* syncWorkflowStateFile(file).pipe(Effect.ignore)
+        return
+      }
 
       const workflow = yield* workflowForFile(file)
       if (!workflow) return
@@ -6971,6 +7851,7 @@ export const layer: Layer.Layer<
 
     const initState = yield* InstanceState.make(
       Effect.fn("Workflow.initState")(function* () {
+        yield* syncWorkflowStatesFromDisk().pipe(Effect.ignore)
         yield* (yield* bus.subscribe(WorkflowToolCommandEvent)).pipe(
           Stream.runForEach((payload) =>
             applyWorkflowToolCommand(payload.properties).pipe(Effect.catchCause(() => Effect.void)),
@@ -7204,6 +8085,8 @@ export const layer: Layer.Layer<
       yield* writeProgress(id).pipe(Effect.ignore)
       yield* writeInterventionArtifacts(id).pipe(Effect.ignore)
       yield* ensureStandupIndex(id).pipe(Effect.ignore)
+      const initialized = yield* get(id)
+      yield* writeWorkflowState(id, initialized).pipe(Effect.ignore)
       yield* events.publish(Event.Created, { workflowID: id, info })
       if (!workflowAutorunEnabled()) return info
       yield* background.start({

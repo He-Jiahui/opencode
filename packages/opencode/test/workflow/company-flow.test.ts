@@ -7,11 +7,14 @@ import { BackgroundJob } from "@/background/job"
 import { Bus } from "@/bus"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { ModelID, ProviderID } from "@/provider/schema"
+import { Database, eq } from "@/storage/db"
 import { MessageV2 } from "@/session/message-v2"
 import { MessageID, PartID, SessionID } from "@/session/schema"
 import { Session } from "@/session/session"
 import { SessionPrompt } from "@/session/prompt"
 import { Workflow } from "@/workflow/workflow"
+import { WorkflowTable } from "@/workflow/workflow.sql"
+import { SessionTable } from "@opencode-ai/core/session/sql"
 import { TestInstance } from "../fixture/fixture"
 import { pollWithTimeout, testEffect } from "../lib/effect"
 
@@ -99,6 +102,68 @@ const it = testEffect(
 )
 
 describe("company workflow execution", () => {
+  it.instance(
+    "restores workflow state from the project-local workflow folder",
+    () =>
+      Effect.gen(function* () {
+        const previousAutorun = process.env.OPENCODE_WORKFLOW_AUTORUN
+        process.env.OPENCODE_WORKFLOW_AUTORUN = "0"
+        yield* Effect.addFinalizer(() =>
+          Effect.sync(() => {
+            if (previousAutorun === undefined) {
+              delete process.env.OPENCODE_WORKFLOW_AUTORUN
+              return
+            }
+            process.env.OPENCODE_WORKFLOW_AUTORUN = previousAutorun
+          }),
+        )
+
+        const instance = yield* TestInstance
+        const workflow = yield* Workflow.Service
+        const sessions = yield* Session.Service
+        const started = yield* workflow.start({
+          prompt: "Portable workflow restore",
+          agent: "build",
+          model: `${testProviderID}/${testModelID}`,
+          staffing: {
+            mainPM: 0,
+            departmentPM: 0,
+            executor: 0,
+            reviewer: 0,
+            tester: 0,
+            expert: 0,
+          },
+        })
+        const rootSessionID = started.rootSessionID
+        if (!rootSessionID) throw new Error("workflow did not create a requester session")
+
+        const statePath = path.join(instance.directory, started.path, "workflow-state.json")
+        const state = yield* Effect.promise(() => Bun.file(statePath).json())
+        expect(state.workflow.directory).toBe(".")
+        expect(state.workflow.path).toBe(started.path)
+
+        Database.use((db) => {
+          db.delete(WorkflowTable).where(eq(WorkflowTable.id, started.id)).run()
+          db.delete(SessionTable).where(eq(SessionTable.id, rootSessionID)).run()
+        })
+
+        const restored = yield* workflow.get(started.id)
+        const restoredRoot = yield* sessions.get(rootSessionID)
+
+        expect(restored.id).toBe(started.id)
+        expect(restored.directory).toBe(instance.directory)
+        expect(restored.path).toBe(started.path)
+        expect(restoredRoot.id).toBe(rootSessionID)
+        expect(restoredRoot.title).toContain("Portable workflow restore")
+        expect(
+          (yield* sessions.messages({ sessionID: rootSessionID, limit: 5 })).some((message) =>
+            message.parts.some((part) => part.type === "text" && part.text.includes("project-local workflow snapshot")),
+          ),
+        ).toBe(true)
+        expect((yield* workflow.list()).map((item) => item.id)).toContain(started.id)
+      }),
+  )
+
   it.instance(
     "automatically advances through PM, execution, review, testing, technical assessment, and acceptance",
     () =>

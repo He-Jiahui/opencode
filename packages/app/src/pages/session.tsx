@@ -1,8 +1,9 @@
-import type { AssistantMessage, Project, UserMessage, WorkflowGraph } from "@opencode-ai/sdk/v2"
+import type { Project, UserMessage } from "@opencode-ai/sdk/v2"
 import { useDialog } from "@opencode-ai/ui/context/dialog"
 import { createQuery, skipToken, useMutation, useQueryClient } from "@tanstack/solid-query"
 import {
   batch,
+  ErrorBoundary,
   onCleanup,
   Show,
   Match,
@@ -10,373 +11,328 @@ import {
   createMemo,
   createEffect,
   createComputed,
-  createSignal,
   on,
   onMount,
+  type ParentProps,
   untrack,
-  createResource,
-  For,
-  type JSX,
 } from "solid-js"
-import { Portal } from "solid-js/web"
 import { makeEventListener } from "@solid-primitives/event-listener"
 import { createMediaQuery } from "@solid-primitives/media"
 import { createResizeObserver } from "@solid-primitives/resize-observer"
 import { debounce } from "@solid-primitives/scheduled"
 import { useLocal } from "@/context/local"
-import { selectionFromLines, useFile, type FileSelection, type SelectedLineRange } from "@/context/file"
+import { FileProvider, selectionFromLines, useFile, type FileSelection, type SelectedLineRange } from "@/context/file"
 import { createStore } from "solid-js/store"
+import type { SessionReviewLineComment } from "@opencode-ai/session-ui/session-review"
 import { ResizeHandle } from "@opencode-ai/ui/resize-handle"
 import { Select } from "@opencode-ai/ui/select"
+import { SelectV2 } from "@opencode-ai/ui/v2/select-v2"
+import { isScrollKeyTarget, scrollKey, scrollKeyOwner } from "@opencode-ai/ui/scroll-view"
 import { Tabs } from "@opencode-ai/ui/tabs"
+import { ButtonV2 } from "@opencode-ai/ui/v2/button-v2"
 import { createAutoScroll } from "@opencode-ai/ui/hooks"
-import { previewSelectedLines } from "@opencode-ai/ui/pierre/selection-bridge"
+import { previewSelectedLines } from "@opencode-ai/session-ui/pierre/selection-bridge"
 import { Button } from "@opencode-ai/ui/button"
-import { IconButton } from "@opencode-ai/ui/icon-button"
-import { TextField } from "@opencode-ai/ui/text-field"
-import { Tooltip } from "@opencode-ai/ui/tooltip"
 import { showToast } from "@/utils/toast"
-import { checksum } from "@opencode-ai/core/util/encode"
-import { getFilename } from "@opencode-ai/core/util/path"
-import { useLocation, useNavigate, useSearchParams } from "@solidjs/router"
-import { NewSessionDesignView, NewSessionView, SessionHeader } from "@/components/session"
-import { FilePathContextMenu } from "@/components/file-path-context-menu"
-import { useComments } from "@/context/comments"
+import { base64Encode, checksum } from "@opencode-ai/core/util/encode"
+import { Navigate, useLocation, useNavigate, useParams, useSearchParams } from "@solidjs/router"
+import { NewSessionView, SessionHeader } from "@/components/session"
+import { ErrorPage } from "@/pages/error"
+import { CommentsProvider, useComments } from "@/context/comments"
+import { DirectoryDataProvider } from "@/pages/directory-layout"
 import { useServerSync } from "@/context/server-sync"
 import { useLanguage } from "@/context/language"
 import { useLayout } from "@/context/layout"
-import { usePrompt } from "@/context/prompt"
+import { ModelsProvider } from "@/context/models"
+import { useNotification } from "@/context/notification"
+import { PermissionProvider } from "@/context/permission"
+import { PromptProvider, usePrompt } from "@/context/prompt"
 import { usePlatform } from "@/context/platform"
-import { useSDK } from "@/context/sdk"
+import { SDKProvider, useSDK } from "@/context/sdk"
 import { useServerSDK } from "@/context/server-sdk"
+import { ServerConnection, serverName, useServer } from "@/context/server"
 import { useSettings } from "@/context/settings"
 import { useSync } from "@/context/sync"
-import { useTerminal } from "@/context/terminal"
-import { useModels } from "@/context/models"
-import { listModelVariants } from "@/context/model-variant"
+import { useTabs } from "@/context/tabs"
+import { TerminalProvider, useTerminal } from "@/context/terminal"
+import { PromptInput } from "@/components/prompt-input"
+import { useSettingsCommand } from "@/components/settings-dialog"
 import { type FollowupDraft, sendFollowupDraft } from "@/components/prompt-input/submit"
-import type { OpencodePlanBlock } from "@/utils/opencode-plan"
-import { createSessionComposerState, SessionComposerRegion } from "@/pages/session/composer"
 import {
-  createOpenReviewFile,
-  createSessionTabs,
-  createSizing,
-  focusTerminalById,
-  shouldFocusTerminalOnKeyDown,
-  shouldShowFileTree,
-} from "@/pages/session/helpers"
+  createPromptInputController,
+  createSessionComposerController,
+  createSessionComposerRegionController,
+  SessionComposerRegion,
+} from "@/pages/session/composer"
+import { createOpenReviewFile, createSessionTabs, createSizing, shouldShowFileTree } from "@/pages/session/helpers"
 import { MessageTimeline } from "@/pages/session/timeline/message-timeline"
 import { createTimelineModel } from "@/pages/session/timeline/model"
 import { type DiffStyle, SessionReviewTab, type SessionReviewTabProps } from "@/pages/session/review-tab"
 import { useSessionLayout } from "@/pages/session/session-layout"
-import { useServer } from "@/context/server"
 import { syncSessionModel } from "@/pages/session/session-model-helpers"
 import { SessionSidePanel } from "@/pages/session/session-side-panel"
+import { sessionPanelLayout } from "@/pages/session/session-panel-layout"
+import { SessionReviewEmptyChangesV2 } from "@opencode-ai/session-ui/v2/session-review-empty-changes-v2"
+import { SessionReviewEmptyNoGitV2 } from "@opencode-ai/session-ui/v2/session-review-empty-no-git-v2"
+import { ReviewPanelV2 } from "@/pages/session/v2/review-panel-v2"
+import { createReviewPanelV2State } from "@/pages/session/v2/review-panel-v2-state"
 import { TerminalPanel } from "@/pages/session/terminal-panel"
+import { TerminalPanelV2 } from "@/pages/session/terminal-panel-v2"
+import { useComposerCommands } from "@/pages/session/use-composer-commands"
 import { useSessionCommands } from "@/pages/session/use-session-commands"
 import { useSessionHashScroll } from "@/pages/session/use-session-hash-scroll"
-import {
-  mountWorkflowReactFlow,
-  type WorkflowReactFlowContextTarget,
-  type WorkflowReactFlowInstance,
-  type WorkflowReactFlowProps,
-  type WorkflowReactFlowSessionState,
-  type WorkflowReactFlowTarget,
-} from "@/components/workflow-react-flow"
 import { Identifier } from "@/utils/id"
 import { diffs as list } from "@/utils/diffs"
 import { Persist, persisted } from "@/utils/persist"
 import { extractPromptFromParts } from "@/utils/prompt"
-import { formatServerError } from "@/utils/server-errors"
+import { formatServerError, isLocalSessionNotFoundError, isSessionNotFoundError } from "@/utils/server-errors"
+import { legacySessionHref, requireServerKey, sessionHref } from "@/utils/session-route"
 import { useUsageExceededDialogs } from "./session/usage-exceeded-dialogs"
+import { createSessionOwnership } from "./session/session-ownership"
+import { createSessionLineage } from "./session/session-lineage"
 
 type FollowupItem = FollowupDraft & { id: string }
 type FollowupEdit = Pick<FollowupItem, "id" | "prompt" | "context">
 const emptyFollowups: FollowupItem[] = []
-const PLAN_COMPLETE_MARKER = "OPENCODE_PLAN_COMPLETE"
-const PLAN_MILESTONE_TAG = "opencode-plan-milestone"
-const PLAN_MILESTONE_OPEN = `<${PLAN_MILESTONE_TAG}>`
-const PLAN_MILESTONE_CLOSE = `</${PLAN_MILESTONE_TAG}>`
-const PLAN_MILESTONE_PATTERN = /<opencode-plan-milestone>([\s\S]*?)<\/opencode-plan-milestone>/g
-const PLAN_FOLLOWUP_PREFIX = "plan:"
-const PLAN_FOLLOWUP_CONTENT = [
-  "Continue plan mode.",
-  "",
-  "Re-read the attached plan file and compare it against the work completed in this session.",
-  "At the start of every response, report the current plan milestone in this exact block:",
-  PLAN_MILESTONE_OPEN,
-  "completed: <what you completed in this response, or none>",
-  "current: <current milestone or feature task>",
-  "remaining: <what planned work remains after this response>",
-  PLAN_MILESTONE_CLOSE,
-  "Do not omit this block; the desktop app reads it to show plan progress.",
-  "Then return a concise status update, including whether any planned work remains.",
-  "If any planned work remains incomplete, continue with the next unfinished item now.",
-  `If the entire plan is complete, reply with ${PLAN_COMPLETE_MARKER} on its own line and do not start new work.`,
-].join("\n")
-
-type PlanMilestone = {
-  id: string
-  messageID: string
-  parentID: string
-  at: number
-  text: string
-}
-
-type PlanSessionState = {
-  enabled: Record<string, boolean | undefined>
-  file: Record<string, string | undefined>
-  lastAssistant: Record<string, string | undefined>
-  milestones: Record<string, PlanMilestone[] | undefined>
-}
-const emptyPlanMilestones: PlanMilestone[] = []
-
-const emptyWorkflowList: WorkflowGraph["workflow"][] = []
-type WorkflowStaffing = NonNullable<WorkflowGraph["workflow"]["staffing"]>
-type WorkflowModelWhitelist = NonNullable<WorkflowGraph["workflow"]["modelWhitelist"]>
-type WorkflowModelWhitelistRole = keyof Required<WorkflowModelWhitelist>
-type WorkflowModelWhitelistEntry = {
-  providerID: string
-  modelID: string
-  variant?: string
-  weight: number
-  cacheMinutes: number
-}
-type WorkflowModelWhitelistStore = Record<WorkflowModelWhitelistRole, WorkflowModelWhitelistEntry[]>
-const defaultWorkflowStaffing: Required<WorkflowStaffing> = {
-  mainPM: 1,
-  departmentPM: 2,
-  executor: 4,
-  reviewer: 2,
-  tester: 1,
-  expert: 1,
-}
-const workflowStaffingFields = [
-  ["mainPM", "session.workflow.staffing.mainPM"],
-  ["departmentPM", "session.workflow.staffing.departmentPM"],
-  ["executor", "session.workflow.staffing.executor"],
-  ["reviewer", "session.workflow.staffing.reviewer"],
-  ["tester", "session.workflow.staffing.tester"],
-  ["expert", "session.workflow.staffing.expert"],
-] as const
-const workflowModelWhitelistRoles = [
-  ["requester", "session.workflow.modelWhitelist.requester"],
-  ["mainPM", "session.workflow.staffing.mainPM"],
-  ["departmentPM", "session.workflow.staffing.departmentPM"],
-  ["executor", "session.workflow.staffing.executor"],
-  ["reviewer", "session.workflow.staffing.reviewer"],
-  ["tester", "session.workflow.staffing.tester"],
-  ["expert", "session.workflow.staffing.expert"],
-] as const
-const workflowStaffingValue = (value: number | undefined, fallback: number) =>
-  Number.isFinite(value) ? Math.max(1, Math.min(64, Math.trunc(value!))) : fallback
-const workflowModelWeight = (value: unknown) => {
-  const parsed = Number(value)
-  if (!Number.isFinite(parsed)) return 50
-  return Math.max(0, Math.min(100, parsed))
-}
-const workflowModelCacheMinutes = (value: unknown) => {
-  const parsed = Number(value)
-  if (!Number.isFinite(parsed)) return 240
-  return Math.max(0, Math.min(43200, Math.trunc(parsed)))
-}
-const normalizeWorkflowStaffing = (input?: WorkflowStaffing): Required<WorkflowStaffing> => ({
-  mainPM: workflowStaffingValue(input?.mainPM, defaultWorkflowStaffing.mainPM),
-  departmentPM: workflowStaffingValue(input?.departmentPM, defaultWorkflowStaffing.departmentPM),
-  executor: workflowStaffingValue(input?.executor, defaultWorkflowStaffing.executor),
-  reviewer: workflowStaffingValue(input?.reviewer, defaultWorkflowStaffing.reviewer),
-  tester: workflowStaffingValue(input?.tester, defaultWorkflowStaffing.tester),
-  expert: workflowStaffingValue(input?.expert, defaultWorkflowStaffing.expert),
-})
-const normalizeWorkflowModelWhitelistEntries = (items: WorkflowModelWhitelist[WorkflowModelWhitelistRole] | undefined) =>
-  (items ?? []).map((item) => ({
-    providerID: item.providerID,
-    modelID: item.modelID,
-    ...(item.variant ? { variant: item.variant } : {}),
-    weight: workflowModelWeight(item.weight),
-    cacheMinutes: workflowModelCacheMinutes(item.cacheMinutes),
-  }))
-const normalizeWorkflowModelWhitelist = (input?: WorkflowModelWhitelist): WorkflowModelWhitelistStore => ({
-  requester: normalizeWorkflowModelWhitelistEntries(input?.requester),
-  mainPM: normalizeWorkflowModelWhitelistEntries(input?.mainPM),
-  departmentPM: normalizeWorkflowModelWhitelistEntries(input?.departmentPM),
-  executor: normalizeWorkflowModelWhitelistEntries(input?.executor),
-  reviewer: normalizeWorkflowModelWhitelistEntries(input?.reviewer),
-  tester: normalizeWorkflowModelWhitelistEntries(input?.tester),
-  expert: normalizeWorkflowModelWhitelistEntries(input?.expert),
-})
-const workflowModelWhitelistPayload = (input: WorkflowModelWhitelistStore): WorkflowModelWhitelist =>
-  Object.fromEntries(
-    workflowModelWhitelistRoles.flatMap(([role]) => {
-      const entries = input[role].map((entry) => ({
-        providerID: entry.providerID,
-        modelID: entry.modelID,
-        ...(entry.variant ? { variant: entry.variant } : {}),
-        weight: workflowModelWeight(entry.weight),
-        cacheMinutes: workflowModelCacheMinutes(entry.cacheMinutes),
-      }))
-      return entries.length > 0 ? [[role, entries]] : []
-    }),
-  ) as WorkflowModelWhitelist
-type WorkflowInterventionTiming = "after-task" | "temporary-interrupt" | "interrupt"
-const workflowInterventionTimingOptions: WorkflowInterventionTiming[] = [
-  "temporary-interrupt",
-  "after-task",
-  "interrupt",
-]
-type WorkflowInterventionTargetRole = "main_pm" | "department_pm" | "executor" | "reviewer" | "tester" | "expert"
-const workflowInterventionTargetRoleOptions: WorkflowInterventionTargetRole[] = [
-  "main_pm",
-  "department_pm",
-  "executor",
-  "reviewer",
-  "tester",
-  "expert",
-]
-
-const workflowStatusTone = (status: WorkflowGraph["workflow"]["status"] | WorkflowGraph["milestones"][number]["status"]) => {
-  if (status === "approved" || status === "completed" || status === "done") return "bg-success/10 text-success"
-  if (status === "rejected" || status === "blocked" || status === "failed" || status === "cancelled")
-    return "bg-danger/10 text-danger"
-  if (status === "pending") return "bg-surface-element text-text-weak"
-  return "bg-accent/10 text-accent"
-}
-
-type WorkflowSessionLogRole = NonNullable<WorkflowGraph["nodes"][number]["role"]>
-type WorkflowSessionLogSource = "workflow" | "trigger" | "staff"
-type WorkflowSessionLogEntry = {
-  role: WorkflowSessionLogRole
-  source: WorkflowSessionLogSource
-  title: string
-  status: string
-  sessionID?: string
-  specialty?: string
-  milestoneID?: string
-  milestoneTitle?: string
-  attempt?: number
-  current: boolean
-}
-type WorkflowSessionLogGroup = {
-  role: WorkflowSessionLogRole
-  entries: WorkflowSessionLogEntry[]
-}
-const workflowSessionLogRoleOrder: WorkflowSessionLogRole[] = [
-  "requester",
-  "main_pm",
-  "department_pm",
-  "expert",
-  "executor",
-  "reviewer",
-  "tester",
-]
-const workflowSessionRefKey = (role: WorkflowSessionLogRole, sessionID: string) => `${role}:${sessionID}`
-const workflowSessionLogStatusTone = (status: string) => {
-  if (status === "approved" || status === "completed" || status === "done" || status === "active")
-    return "bg-success/10 text-success"
-  if (
-    status === "rejected" ||
-    status === "blocked" ||
-    status === "failed" ||
-    status === "cancelled" ||
-    status === "paused"
-  )
-    return "bg-danger/10 text-danger"
-  if (status === "pending" || status === "untriggered") return "bg-surface-element text-text-weak"
-  return "bg-accent/10 text-accent"
-}
-const workflowSessionLogAttempt = (attempt: WorkflowGraph["milestones"][number]["attempt"] | undefined) =>
-  typeof attempt === "number" ? attempt : undefined
-const workflowSessionLogGroups = (
-  graph: WorkflowGraph,
-  currentSessionID: string | undefined,
-  sessionRunning: (sessionID: string) => boolean,
-): WorkflowSessionLogGroup[] => {
-  const memberBySessionRole = new Map(
-    graph.members.map((member) => [workflowSessionRefKey(member.role, member.sessionID), member] as const),
-  )
-  const baseEntryCandidates: (WorkflowSessionLogEntry | undefined)[] = [
-    graph.workflow.rootSessionID
-      ? {
-          role: "requester" as const,
-          source: "workflow" as const,
-          title: graph.workflow.title,
-          status: sessionRunning(graph.workflow.rootSessionID) ? "running" : graph.workflow.status,
-          sessionID: graph.workflow.rootSessionID,
-          current: graph.workflow.rootSessionID === currentSessionID,
-        }
-      : undefined,
-    graph.workflow.pmSessionID
-      ? {
-          role: "main_pm" as const,
-          source: "workflow" as const,
-          title:
-            memberBySessionRole.get(workflowSessionRefKey("main_pm", graph.workflow.pmSessionID))?.title ??
-            "Main product manager",
-          status: sessionRunning(graph.workflow.pmSessionID) ? "running" : graph.workflow.status,
-          sessionID: graph.workflow.pmSessionID,
-          current: graph.workflow.pmSessionID === currentSessionID,
-        }
-      : undefined,
-    graph.workflow.testerSessionID
-      ? {
-          role: "tester" as const,
-          source: "workflow" as const,
-          title:
-            memberBySessionRole.get(workflowSessionRefKey("tester", graph.workflow.testerSessionID))?.title ??
-            "Workflow tester",
-          status: sessionRunning(graph.workflow.testerSessionID) ? "running" : graph.workflow.status,
-          sessionID: graph.workflow.testerSessionID,
-          current: graph.workflow.testerSessionID === currentSessionID,
-        }
-      : undefined,
-  ]
-  const baseEntries = baseEntryCandidates.filter((entry): entry is WorkflowSessionLogEntry => !!entry)
-  const triggerEntries = graph.milestones.flatMap((milestone) =>
-    milestone.session.map((ref): WorkflowSessionLogEntry => {
-      const member = memberBySessionRole.get(workflowSessionRefKey(ref.role, ref.sessionID))
-      return {
-        role: ref.role,
-        source: "trigger",
-        title: member?.title ?? `${ref.role} ${milestone.title ?? milestone.id}`,
-        status: sessionRunning(ref.sessionID) ? "running" : milestone.status,
-        sessionID: ref.sessionID,
-        specialty: member?.specialty ?? milestone.department,
-        milestoneID: String(ref.milestoneID ?? milestone.id),
-        milestoneTitle: milestone.title,
-        attempt: workflowSessionLogAttempt(ref.attempt ?? milestone.attempt),
-        current: ref.sessionID === currentSessionID,
-      }
-    }),
-  )
-  const usedSessions = new Set(
-    [...baseEntries, ...triggerEntries]
-      .filter((entry): entry is WorkflowSessionLogEntry & { sessionID: string } => !!entry.sessionID)
-      .map((entry) => workflowSessionRefKey(entry.role, entry.sessionID)),
-  )
-  const staffEntries = graph.members
-    .filter((member) => !usedSessions.has(workflowSessionRefKey(member.role, member.sessionID)))
-    .map(
-      (member): WorkflowSessionLogEntry => ({
-        role: member.role,
-        source: "staff",
-        title: member.title,
-        status: sessionRunning(member.sessionID) ? "running" : "untriggered",
-        sessionID: member.sessionID,
-        specialty: member.specialty,
-        current: member.sessionID === currentSessionID,
-      }),
-    )
-  const entries = [...baseEntries, ...triggerEntries, ...staffEntries]
-  return workflowSessionLogRoleOrder
-    .map((role) => ({
-      role,
-      entries: entries.filter((entry) => entry.role === role),
-    }))
-    .filter((group) => group.entries.length > 0)
-}
 
 type ChangeMode = "git" | "branch" | "turn"
 type VcsMode = "git" | "branch"
+
+const sessionViewState = () => ({
+  messageId: undefined as string | undefined,
+  mobileTab: "session" as "session" | "changes",
+  changes: "git" as ChangeMode,
+})
+
+function isCurrentSessionNotFoundError(error: unknown, sessionID: string | undefined) {
+  if (!sessionID) return false
+  return isSessionNotFoundError(error, sessionID) || isLocalSessionNotFoundError(error, sessionID)
+}
+
+async function runPromptRollbackMutation<T, R>(input: {
+  capturePrompt: () => { current: () => T[]; set: (value: T[]) => void; reset: () => void }
+  optimistic: (prompt: { set: (value: T[]) => void; reset: () => void }) => void
+  request: () => Promise<R>
+  complete: (result: R) => void
+  rollback: () => void
+  fail: (error: unknown) => void
+}) {
+  const prompt = input.capturePrompt()
+  const previous = prompt.current().slice()
+  batch(() => input.optimistic(prompt))
+  await input
+    .request()
+    .then(input.complete)
+    .catch((error) => {
+      batch(() => {
+        input.rollback()
+        prompt.set(previous)
+      })
+      input.fail(error)
+    })
+}
+
+export function SessionPage() {
+  return (
+    <SessionProviders>
+      <Page />
+    </SessionProviders>
+  )
+}
+
+// Rendered under app.tsx's TargetSessionRoute, which owns the per-server keyed
+// remount around the server-scoped providers. Nothing here may key on the
+// session ID: session tabs on the same server share this route instance, and
+// workspace-scoped state (terminal, directory providers) lives below.
+export function TargetSessionRouteContent() {
+  const params = useParams<{ serverKey: string; id: string }>()
+  return (
+    <SessionRouteErrorBoundary sessionID={params.id} serverKey={requireServerKey(params.serverKey)} padded>
+      <ResolvedTargetSessionRoute />
+    </SessionRouteErrorBoundary>
+  )
+}
+
+function SessionRouteErrorBoundary(
+  props: ParentProps<{ sessionID?: string; serverKey?: ServerConnection.Key; padded?: boolean }>,
+) {
+  const settings = useSettings()
+  return (
+    <ErrorBoundary
+      fallback={(error) =>
+        settings.general.newLayoutDesigns() ? (
+          <SessionRouteFrame padded={props.padded}>
+            <SessionPanelFrame newLayout raised={!!props.sessionID}>
+              <SessionErrorFallback error={error} sessionID={props.sessionID} serverKey={props.serverKey} />
+            </SessionPanelFrame>
+          </SessionRouteFrame>
+        ) : (
+          <ErrorPage error={error} />
+        )
+      }
+    >
+      {props.children}
+    </ErrorBoundary>
+  )
+}
+
+function SessionErrorFallback(props: { error: unknown; sessionID?: string; serverKey?: ServerConnection.Key }) {
+  const language = useLanguage()
+  const server = useServer()
+  const tabs = useTabs()
+  const displayServer = createMemo(() => {
+    const key = props.serverKey ?? server.key
+    const conn = server.list.find((item) => ServerConnection.key(item) === key)
+    return conn ? serverName(conn) : key
+  })
+  const closeTab = () => {
+    if (!props.sessionID) return
+    tabs.removeSessionTab({ server: props.serverKey ?? server.key, sessionId: props.sessionID })
+  }
+  if (isCurrentSessionNotFoundError(props.error, props.sessionID)) {
+    return (
+      <div class="flex-1 min-h-0 overflow-hidden">
+        <div class="h-full px-6 pb-42 -mt-4 flex flex-col items-center justify-center text-center gap-4">
+          <div class="flex flex-col items-center gap-2">
+            <div class="text-16-medium text-text max-w-md">{language.t("session.error.notFound")}</div>
+            <div class="text-13-regular text-text-weak max-w-md">
+              {language.t("session.error.notFound.description")}
+            </div>
+          </div>
+          <Show when={props.sessionID}>
+            {(sessionID) => (
+              <div class="max-w-full flex flex-col items-center gap-1">
+                <div class="max-w-full text-11-regular text-text-faint break-all">{displayServer()}</div>
+                <code class="max-w-full rounded-[4px] px-1 py-0.5 font-mono text-xs font-medium leading-4 text-text-base break-all bg-[color-mix(in_oklch,var(--v2-text-text-base)_8%,transparent)]">
+                  {sessionID()}
+                </code>
+              </div>
+            )}
+          </Show>
+          <ButtonV2 variant="neutral" size="normal" icon="xmark-small" onClick={closeTab}>
+            {language.t("session.error.notFound.closeTab")}
+          </ButtonV2>
+        </div>
+      </div>
+    )
+  }
+  return <ErrorPage error={props.error} />
+}
+
+function ResolvedTargetSessionRoute() {
+  const params = useParams<{ serverKey: string; id: string }>()
+  const settings = useSettings()
+  const tabs = useTabs()
+  const sync = useServerSync()
+  const serverKey = createMemo(() => requireServerKey(params.serverKey))
+  const current = createSessionLineage(
+    () => params.id,
+    () => sync().session.lineage,
+  )
+  const directory = createMemo(() => current()?.session.directory)
+  const targetDirectory = () => directory()!
+
+  createEffect(() => {
+    const session = current()
+    if (!session) return
+    tabs.addSessionTab({
+      server: serverKey(),
+      sessionId: session.root.id,
+    })
+  })
+
+  return (
+    <TargetServerScopedProviders directory={directory} sessionID={() => params.id}>
+      {/* Non-keyed: closes only while the target's directory is unknown (uncached
+          lineage mid-resolution), which tears down the workspace subtree including
+          the terminal. Same-workspace tab switches keep it open because warm
+          targets resolve synchronously from the sync cache. */}
+      <Show when={directory()}>
+        <Show
+          when={settings.general.newLayoutDesigns()}
+          fallback={<Navigate href={legacySessionHref(directory()!, params.id)} />}
+        >
+          <SDKProvider directory={targetDirectory}>
+            <DirectoryDataProvider directory={targetDirectory} server={serverKey}>
+              <TargetSessionPage />
+            </DirectoryDataProvider>
+          </SDKProvider>
+        </Show>
+      </Show>
+    </TargetServerScopedProviders>
+  )
+}
+
+// Owns the workspace-identity remount. Must not include the session ID in the
+// key: SessionPage handles session changes reactively, and remounting here
+// destroys workspace-scoped state (terminal PTYs, file/prompt providers).
+function TargetSessionPage() {
+  const sdk = useSDK()
+  const serverSDK = useServerSDK()
+  return (
+    <Show when={`${serverSDK().scope}\0${sdk().directory}`} keyed>
+      <SessionPage />
+    </Show>
+  )
+}
+
+function TargetServerScopedProviders(
+  props: ParentProps<{ directory?: () => string | undefined; sessionID?: () => string | undefined }>,
+) {
+  return (
+    <PermissionProvider directory={props.directory}>
+      <MarkSessionNotificationsViewed sessionID={props.sessionID} />
+      <ModelsProvider directory={props.directory}>{props.children}</ModelsProvider>
+    </PermissionProvider>
+  )
+}
+
+function MarkSessionNotificationsViewed(props: { sessionID?: () => string | undefined }) {
+  const notification = useNotification()
+  createEffect(() => {
+    const sessionID = props.sessionID?.()
+    if (!notification.ready() || !sessionID) return
+    if (notification.session.unseenCount(sessionID) === 0) return
+    notification.session.markViewed(sessionID)
+  })
+  return null
+}
+
+function SessionProviders(props: ParentProps) {
+  return (
+    <TerminalProvider>
+      <FileProvider>
+        <PromptProvider>
+          <CommentsProvider>{props.children}</CommentsProvider>
+        </PromptProvider>
+      </FileProvider>
+    </TerminalProvider>
+  )
+}
+
+function SessionRouteFrame(props: ParentProps<{ padded?: boolean }>) {
+  return (
+    <div class="relative size-full overflow-hidden flex flex-col" classList={{ "p-2": props.padded }}>
+      {props.children}
+    </div>
+  )
+}
+
+function SessionPanelFrame(props: ParentProps<{ newLayout: boolean; raised?: boolean }>) {
+  return (
+    <div
+      classList={{
+        "flex-1 min-h-0 flex flex-col": true,
+        "bg-v2-background-bg-base": props.newLayout,
+        "bg-background-stronger": !props.newLayout,
+        "rounded-[10px] overflow-hidden": props.newLayout,
+        "shadow-[var(--v2-elevation-raised)]": props.newLayout && props.raised,
+      }}
+    >
+      {props.children}
+    </div>
+  )
+}
 
 export default function Page() {
   const serverSync = useServerSync()
@@ -394,12 +350,11 @@ export default function Page() {
   const prompt = usePrompt()
   const comments = useComments()
   const terminal = useTerminal()
-  const server = useServer()
-  const models = useModels()
   const [searchParams, setSearchParams] = useSearchParams<{ prompt?: string }>()
   const location = useLocation()
   const navigate = useNavigate()
   const { params, sessionKey, workspaceKey, tabs, view } = useSessionLayout()
+  const sessionOwnership = createSessionOwnership(sessionKey)
   const newSessionDesign = createMemo(() => settings.general.newLayoutDesigns())
 
   createEffect(() => {
@@ -424,9 +379,15 @@ export default function Page() {
     },
   })
 
-  const composer = createSessionComposerState()
+  const composer = createSessionComposerController()
+  const inputController = createPromptInputController({
+    sessionKey,
+    sessionID: () => params.id,
+    queryOptions: serverSync().queryOptions,
+  })
 
   const workspaceTabs = createMemo(() => layout.tabs(workspaceKey))
+  const sessionPanelKey = createMemo(() => (params.id ? `${serverSDK().scope}\0${params.id}` : undefined))
 
   createEffect(
     on(
@@ -441,11 +402,11 @@ export default function Page() {
           layout.handoff.clearTabs()
           return
         }
-        if (pending.scope !== server.scope()) return
+        if (pending.scope !== serverSDK().scope) return
 
         if (pending.id !== id) return
         layout.handoff.clearTabs()
-        if (pending.dir !== (params.dir ?? "")) return
+        if (pending.dir !== base64Encode(sdk().directory)) return
 
         const from = workspaceTabs().tabs()
         if (from.all.length === 0 && !from.active) return
@@ -468,6 +429,12 @@ export default function Page() {
   const isDesktop = createMediaQuery("(min-width: 768px)")
   const size = createSizing()
   const desktopReviewOpen = createMemo(() => isDesktop() && view().reviewPanel.opened())
+  const desktopV2ReviewOpen = createMemo(() => newSessionDesign() && desktopReviewOpen() && !!params.id)
+  const terminalOpen = createMemo(() => view().terminal.opened())
+  const desktopTerminalOpen = createMemo(() => isDesktop() && terminalOpen())
+  const desktopInlineTerminalOnlyOpen = createMemo(
+    () => newSessionDesign() && desktopTerminalOpen() && !desktopV2ReviewOpen(),
+  )
   const desktopFileTreeOpen = createMemo(
     () =>
       isDesktop() &&
@@ -476,13 +443,23 @@ export default function Page() {
         opened: layout.fileTree.opened(),
       }),
   )
-  const desktopSidePanelOpen = createMemo(() => desktopReviewOpen() || desktopFileTreeOpen())
+  const desktopSessionResizeOpen = createMemo(() =>
+    newSessionDesign() ? desktopV2ReviewOpen() || desktopTerminalOpen() : desktopReviewOpen(),
+  )
+  const desktopSidePanelOpen = createMemo(() => desktopSessionResizeOpen() || desktopFileTreeOpen())
   const sessionPanelWidth = createMemo(() => {
     if (!desktopSidePanelOpen()) return "100%"
-    if (desktopReviewOpen()) return `${layout.session.width()}px`
+    if (desktopSessionResizeOpen()) return `${layout.session.width()}px`
     return `calc(100% - ${layout.fileTree.width()}px)`
   })
   const centered = createMemo(() => isDesktop() && !desktopReviewOpen())
+  const desktopV2PanelLayout = createMemo(() =>
+    sessionPanelLayout({
+      review: desktopV2ReviewOpen(),
+      terminal: desktopTerminalOpen(),
+      files: desktopFileTreeOpen(),
+    }),
+  )
 
   function normalizeTab(tab: string) {
     if (!tab.startsWith("file://")) return tab
@@ -529,125 +506,6 @@ export default function Page() {
   const sessionSync = timeline.resource
   const userMessages = timeline.userMessages
   const visibleUserMessages = timeline.visibleUserMessages
-  const workflowReferencesSession = (workflow: WorkflowGraph["workflow"], sessionID: string) => {
-    if (workflow.rootSessionID === sessionID || workflow.pmSessionID === sessionID || workflow.testerSessionID === sessionID)
-      return true
-    if (sync().data.workflow_session[sessionID]?.includes(workflow.id)) return true
-    const graph = sync().data.workflow_graph[workflow.id]
-    return (
-      graph?.members?.some((member) => member.sessionID === sessionID) ||
-      graph?.milestones?.some((milestone) => milestone.session?.some((ref) => ref.sessionID === sessionID)) ||
-      false
-    )
-  }
-  const sessionWorkflows = createMemo(() => {
-    if (!params.id) return emptyWorkflowList
-    return sync().data.workflow.filter((workflow) => workflowReferencesSession(workflow, params.id!))
-  })
-  const activeWorkflow = createMemo(() => sessionWorkflows().at(-1))
-  const activeWorkflowGraph = createMemo(() => {
-    const workflow = activeWorkflow()
-    if (!workflow) return
-    return sync().data.workflow_graph[workflow.id]
-  })
-  const sessionBelongsToWorkflow = createMemo(() => {
-    const id = params.id
-    const workflow = activeWorkflow()
-    if (!id || !workflow) return false
-    return workflow.rootSessionID !== id && workflowReferencesSession(workflow, id)
-  })
-  const [workflowUi, setWorkflowUi] = createStore({
-    expanded: false,
-    fullscreen: false,
-    sessionLog: false,
-    xml: "",
-    editingXml: false,
-    interventionMessage: "",
-    interventionTargetRole: "main_pm" as WorkflowInterventionTargetRole,
-    interventionTiming: "temporary-interrupt" as WorkflowInterventionTiming,
-  })
-  const [workflowStaffing, setWorkflowStaffing] = createStore(normalizeWorkflowStaffing())
-  const [workflowModelWhitelist, setWorkflowModelWhitelist] = createStore(normalizeWorkflowModelWhitelist())
-  const workflowModelOptions = createMemo(() =>
-    models.list().map((model) => ({
-      providerID: model.provider.id,
-      modelID: model.id,
-      name: `${model.provider.name} / ${model.name}`,
-      variants: listModelVariants({
-        providerID: model.provider.id,
-        modelID: model.id,
-        variants: model.variants,
-      }),
-    })),
-  )
-  const addWorkflowModelWhitelist = (role: WorkflowModelWhitelistRole) => {
-    const model = workflowModelOptions()[0]
-    if (!model) return
-    setWorkflowModelWhitelist(role, workflowModelWhitelist[role].length, {
-      providerID: model.providerID,
-      modelID: model.modelID,
-      weight: 50,
-      cacheMinutes: 240,
-    })
-  }
-  const selectWorkflowModelWhitelist = (
-    role: WorkflowModelWhitelistRole,
-    index: number,
-    model: ReturnType<typeof workflowModelOptions>[number] | undefined,
-  ) => {
-    if (!model) return
-    const current = workflowModelWhitelist[role][index]
-    if (!current) return
-    setWorkflowModelWhitelist(role, index, {
-      ...current,
-      providerID: model.providerID,
-      modelID: model.modelID,
-      variant: undefined,
-    })
-  }
-  const removeWorkflowModelWhitelist = (role: WorkflowModelWhitelistRole, index: number) => {
-    setWorkflowModelWhitelist(
-      role,
-      workflowModelWhitelist[role].filter((_, itemIndex) => itemIndex !== index),
-    )
-  }
-  const [workflowMenu, setWorkflowMenu] = createSignal<WorkflowReactFlowContextTarget>()
-  const workflowSessionLog = createMemo(() => {
-    const graph = activeWorkflowGraph()
-    if (!graph) return []
-    return workflowSessionLogGroups(graph, params.id, (sessionID) => sync().data.session_working(sessionID))
-  })
-  const lastCompletedAssistant = createMemo(
-    () => messages().findLast((m) => m.role === "assistant" && m.time.completed) as AssistantMessage | undefined,
-  )
-
-  createEffect(
-    on(
-      () => activeWorkflowGraph()?.workflow.xml ?? activeWorkflow()?.xml,
-      (xml) => {
-        if (!xml || workflowUi.editingXml) return
-        setWorkflowUi("xml", xml)
-      },
-    ),
-  )
-
-  createEffect(
-    on(
-      () => activeWorkflowGraph()?.workflow.staffing ?? activeWorkflow()?.staffing,
-      (staffing) => {
-        setWorkflowStaffing(normalizeWorkflowStaffing(staffing))
-      },
-    ),
-  )
-
-  createEffect(
-    on(
-      () => activeWorkflowGraph()?.workflow.modelWhitelist ?? activeWorkflow()?.modelWhitelist,
-      (modelWhitelist) => {
-        setWorkflowModelWhitelist(normalizeWorkflowModelWhitelist(modelWhitelist))
-      },
-    ),
-  )
 
   createEffect(() => {
     const tab = activeFileTab()
@@ -670,67 +528,7 @@ export default function Page() {
 
   createEffect(
     on(
-      () => [sdk().directory, params.id] as const,
-      ([, id]) => {
-        if (!id) return
-        void sync().session.workflow(id).catch((error) => {
-          console.debug("[workflow] failed to load workflows", error)
-        })
-      },
-    ),
-  )
-
-  createEffect(
-    on(
-      () => activeWorkflow()?.id,
-      (workflowID) => {
-        if (!workflowID) return
-        void sync().session.workflowGraph(workflowID).catch((error) => {
-          console.debug("[workflow] failed to load graph", error)
-        })
-      },
-    ),
-  )
-
-  const refreshWorkflowList = debounce((sessionID: string) => {
-    void sync().session.workflow(sessionID, { force: true }).catch((error) => {
-      console.debug("[workflow] failed to refresh workflows", error)
-    })
-  }, 350)
-  const refreshWorkflowGraph = debounce((workflowID: string) => {
-    void sync().session.workflowGraph(workflowID, { force: true }).catch((error) => {
-      console.debug("[workflow] failed to refresh graph", error)
-    })
-  }, 600)
-  const refreshWorkflowSessions = debounce(() => {
-    void sync().session.fetch(0).catch((error) => {
-      console.debug("[workflow] failed to refresh sessions", error)
-    })
-  }, 800)
-
-  const stopWorkflowEvents = sdk().event.listen((event) => {
-    const type = event.details.type
-    if (
-      type !== "workflow.created" &&
-      type !== "workflow.updated" &&
-      type !== "workflow.node.updated" &&
-      type !== "workflow.graph.updated"
-    )
-      return
-    const id = params.id
-    if (!id) return
-    if (type === "workflow.created" || type === "workflow.updated") refreshWorkflowList(id)
-    refreshWorkflowSessions()
-    const workflowID =
-      "workflowID" in event.details.properties ? event.details.properties.workflowID : activeWorkflow()?.id
-    if (workflowID && (type === "workflow.node.updated" || type === "workflow.graph.updated"))
-      refreshWorkflowGraph(workflowID)
-  })
-  onCleanup(stopWorkflowEvents)
-
-  createEffect(
-    on(
-      () => ({ dir: params.dir, id: params.id }),
+      () => ({ dir: sdk().directory, id: params.id }),
       (next, prev) => {
         if (!prev) return
         if (next.dir === prev.dir && next.id === prev.id) return
@@ -741,9 +539,7 @@ export default function Page() {
   )
 
   const [store, setStore] = createStore({
-    messageId: undefined as string | undefined,
-    mobileTab: "session" as "session" | "changes",
-    changes: "git" as ChangeMode,
+    ...sessionViewState(),
     newSessionWorktree: "main",
     deferRender: false,
   })
@@ -763,26 +559,17 @@ export default function Page() {
     }),
   )
 
-  const [planSession, setPlanSession] = persisted(
-    Persist.workspace(sdk().directory, "session-plan", ["session-plan.v1"]),
-    createStore<PlanSessionState>({
-      enabled: {},
-      file: {},
-      lastAssistant: {},
-      milestones: {},
-    }),
-  )
-
   createComputed((prev) => {
     const key = sessionKey()
     if (key !== prev) {
       setStore("deferRender", true)
+      const owner = sessionOwnership.capture()
       requestAnimationFrame(() => {
-        setTimeout(() => setStore("deferRender", false), 0)
+        setTimeout(() => owner.run(() => setStore("deferRender", false)), 0)
       })
     }
     return key
-  }, sessionKey())
+  })
 
   let reviewFrame: number | undefined
   let todoFrame: number | undefined
@@ -820,15 +607,6 @@ export default function Page() {
     return list
   })
   const mobileChanges = createMemo(() => !isDesktop() && store.mobileTab === "changes")
-  const planFile = createMemo(() => {
-    const id = params.id
-    if (!id) return
-    return planSession.file[id]
-  })
-  const planActive = createMemo(() => {
-    const id = params.id
-    return !!id && !!planSession.enabled[id] && !!planSession.file[id]
-  })
   const wantsReview = createMemo(() =>
     isDesktop()
       ? desktopFileTreeOpen() || (desktopReviewOpen() && activeTab() === "review")
@@ -1020,9 +798,7 @@ export default function Page() {
         todoTimer = undefined
         if (!id) return
         if (status === "idle" && !blocked) return
-        const cached = untrack(
-          () => sync().data.todo[id] !== undefined || serverSync().data.session_todo[id] !== undefined,
-        )
+        const cached = untrack(() => sync().data.todo[id] !== undefined)
 
         todoFrame = requestAnimationFrame(() => {
           todoFrame = undefined
@@ -1055,8 +831,7 @@ export default function Page() {
     on(
       sessionKey,
       () => {
-        setStore("messageId", undefined)
-        setStore("changes", "git")
+        setStore(sessionViewState())
         setUi("pendingMessage", undefined)
       },
       { defer: true },
@@ -1077,7 +852,7 @@ export default function Page() {
 
   createEffect(
     on(
-      () => params.dir,
+      () => sdk().directory,
       (dir) => {
         if (!dir) return
         setStore("newSessionWorktree", "main")
@@ -1178,25 +953,22 @@ export default function Page() {
       return
     }
 
-    // Prefer the open terminal over the composer when it can take focus
-    if (view().terminal.opened()) {
-      const id = terminal.active()
-      if (id && shouldFocusTerminalOnKeyDown(event) && focusTerminalById(id)) return
-    }
-
-    // Only treat explicit scroll keys as potential "user scroll" gestures.
-    if (event.key === "PageUp" || event.key === "PageDown" || event.key === "Home" || event.key === "End") {
-      markScrollGesture()
+    const key = scrollKey(event)
+    if (key) {
+      if (!scroller || !isScrollKeyTarget(target ?? null, key)) return
+      if (scrollKeyOwner(scroller, target ?? null, key) !== scroller) return
+      markScrollGesture(scroller)
       return
     }
 
     if (event.key.length === 1 && event.key !== "Unidentified" && !(event.ctrlKey || event.metaKey)) {
-      if (composer.blocked()) return
+      if (composer.blocked() || isChildSession()) return
       inputRef?.focus()
     }
   }
 
   createEffect(() => {
+    if (!sync().project) return
     const list = changesOptions()
     if (list.includes(store.changes)) return
     const next = list[0]
@@ -1244,9 +1016,12 @@ export default function Page() {
   }
 
   const focusInput = () => {
+    if (isChildSession()) return
     inputRef?.focus()
   }
 
+  useComposerCommands()
+  useSettingsCommand()
   useSessionCommands({
     navigateMessageByOffset,
     setActiveMessage,
@@ -1262,26 +1037,44 @@ export default function Page() {
     loadFile: file.load,
   })
 
+  const changesLabel = (option: ChangeMode) => {
+    if (option === "git") return language.t("ui.sessionReview.title.git")
+    if (option === "branch") return language.t("ui.sessionReview.title.branch")
+    return language.t("ui.sessionReview.title.lastTurn")
+  }
+
   const changesTitle = () => {
     if (!canReview()) {
       return null
-    }
-
-    const label = (option: ChangeMode) => {
-      if (option === "git") return language.t("ui.sessionReview.title.git")
-      if (option === "branch") return language.t("ui.sessionReview.title.branch")
-      return language.t("ui.sessionReview.title.lastTurn")
     }
 
     return (
       <Select
         options={changesOptions()}
         current={store.changes}
-        label={label}
+        label={changesLabel}
         onSelect={(option) => option && setStore("changes", option)}
         variant="ghost"
         size="small"
         valueClass="text-14-medium"
+      />
+    )
+  }
+
+  const changesTitleV2 = () => {
+    if (!canReview()) {
+      return null
+    }
+
+    return (
+      <SelectV2
+        appearance="inline"
+        options={changesOptions()}
+        current={store.changes}
+        label={changesLabel}
+        placement="bottom-start"
+        gutter={6}
+        onSelect={(option) => option && setStore("changes", option)}
       />
     )
   }
@@ -1332,6 +1125,16 @@ export default function Page() {
     )
   }
 
+  const reviewEmptyV2 = () => {
+    if ((store.changes === "git" || store.changes === "branch") && !reviewReady()) {
+      return <div class="px-6 py-4 text-text-weak">{language.t("session.review.loadingChanges")}</div>
+    }
+    if (store.changes === "turn" && nogit()) {
+      return <SessionReviewEmptyNoGitV2 pending={gitMutation.isPending} onInitGit={initGit} />
+    }
+    return <SessionReviewEmptyChangesV2 />
+  }
+
   const reviewContent = (input: {
     diffStyle: DiffStyle
     onDiffStyleChange?: (style: DiffStyle) => void
@@ -1365,8 +1168,74 @@ export default function Page() {
     </Show>
   )
 
-  const reviewPanel = () => (
+  const reviewV2State = createReviewPanelV2State()
+
+  // Getters defer reactive reads to the consuming scope. Eager reads here ran inside
+  // the side panel's Show children and remounted the whole review panel on unrelated
+  // updates such as session switches.
+  const reviewPanelV2Props = () => ({
+    get title() {
+      return changesTitleV2()
+    },
+    get empty() {
+      return reviewEmptyV2()
+    },
+    diffs: reviewDiffs,
+    diffsReady: reviewReady,
+    get activeFile() {
+      return tree.activeDiff
+    },
+    onSelectFile: focusReviewDiff,
+    get diffStyle() {
+      return layout.review.diffStyle()
+    },
+    onDiffStyleChange: layout.review.setDiffStyle,
+    state: reviewV2State,
+    onLineComment: (comment: SessionReviewLineComment) => addCommentToContext({ ...comment, origin: "review" }),
+    onLineCommentUpdate: updateCommentInContext,
+    onLineCommentDelete: removeCommentFromContext,
+    get lineCommentActions() {
+      return reviewCommentActions()
+    },
+    get comments() {
+      return comments.all()
+    },
+    get focusedComment() {
+      return comments.focus()
+    },
+    onFocusedCommentChange: (focus: { file: string; id: string } | null) => {
+      // The preview clears the focus once it has opened the comment; persist the
+      // focused file as the active selection so the preview stays on it. Skip
+      // files outside the current diff set (their focus is cleared unhandled).
+      if (!focus) {
+        const current = comments.focus()
+        if (current && reviewDiffs().some((diff) => diff.file === current.file)) focusReviewDiff(current.file)
+      }
+      comments.setFocus(focus)
+    },
+  })
+
+  // Latch: defer only the first diff render off the mount critical path. This Page
+  // stays mounted across same-workspace session tab switches, so gating on every
+  // deferRender flip tore down and remounted the whole review pane on tab switch.
+  const reviewPanelV2Rendered = createMemo<boolean>((prev) => prev || !store.deferRender, false)
+
+  const reviewPanelV2 = () => (
     <div class="flex flex-col h-full overflow-hidden bg-background-stronger contain-strict">
+      <Show when={reviewPanelV2Rendered()}>
+        <ReviewPanelV2 {...reviewPanelV2Props()} />
+      </Show>
+    </div>
+  )
+
+  const reviewPanel = () => (
+    <div
+      classList={{
+        "flex flex-col h-full overflow-hidden contain-strict": true,
+        "bg-v2-background-bg-base": settings.general.newLayoutDesigns(),
+        "bg-background-stronger": !settings.general.newLayoutDesigns(),
+      }}
+    >
       <div class="relative pt-2 flex-1 min-h-0 overflow-hidden">
         {reviewContent({
           diffStyle: layout.review.diffStyle(),
@@ -1631,12 +1500,44 @@ export default function Page() {
 
   let captureHistoryAnchor = () => {}
   let restoreHistoryAnchor = (_done: boolean) => {}
-  const loadOlder = () =>
-    timeline.history.loadOlder({ before: () => captureHistoryAnchor(), after: restoreHistoryAnchor })
+  const historyRequests = new Set<string>()
+  let historyContinuationFrame: number | undefined
+  const loadOlder = async () => {
+    const owner = sessionOwnership.capture()
+    if (historyLoading() || historyRequests.has(owner.key)) return
+    historyRequests.add(owner.key)
+    const before = timeline.messages().length
+    try {
+      await timeline.history.loadOlder({
+        before: () => owner.run(captureHistoryAnchor),
+        after: (done) => owner.run(() => restoreHistoryAnchor(done)),
+      })
+    } finally {
+      historyRequests.delete(owner.key)
+    }
+    if (!owner.current() || timeline.messages().length <= before) return
+    if (!autoScroll.userScrolled() || !scroller || scroller.scrollTop >= 200 || !historyMore()) return
+    if (historyContinuationFrame !== undefined) cancelAnimationFrame(historyContinuationFrame)
+    historyContinuationFrame = requestAnimationFrame(() => {
+      historyContinuationFrame = undefined
+      owner.run(onHistoryScroll)
+    })
+  }
   const onHistoryScroll = () => {
-    if (!autoScroll.userScrolled() || !scroller || scroller.scrollTop >= 200) return
+    if (
+      historyRequests.has(sessionOwnership.key()) ||
+      historyLoading() ||
+      !autoScroll.userScrolled() ||
+      !scroller ||
+      scroller.scrollTop >= 200
+    )
+      return
     void loadOlder()
   }
+
+  onCleanup(() => {
+    if (historyContinuationFrame !== undefined) cancelAnimationFrame(historyContinuationFrame)
+  })
 
   fill = () => {
     if (fillFrame !== undefined) return
@@ -1700,907 +1601,13 @@ export default function Page() {
     })
   }
 
-  const workflowPrompt = () => {
-    const message = lastUserMessage()
-    if (message) {
-      const text = extractPromptFromParts(sync().data.part[message.id] ?? [], {
-        directory: sdk().directory,
-        attachmentName: language.t("common.attachment"),
-      })
-        .map((part) => {
-          if (part.type === "image") return `[image:${part.filename}]`
-          if (part.type === "file") return `@${part.path}`
-          if (part.type === "agent") return `@${part.name}`
-          return part.content
-        })
-        .join("")
-        .trim()
-      if (text) return text
-    }
-    return info()?.title ?? ""
+  const merge = (next: NonNullable<ReturnType<typeof info>>, target = sync()) => target.session.remember(next)
+
+  const roll = (sessionID: string, next: NonNullable<ReturnType<typeof info>>["revert"], target = sync()) => {
+    const session = target.session.get(sessionID)
+    if (!session) return
+    target.session.remember({ ...session, revert: next })
   }
-
-  const workflowModel = () => {
-    const model = local.model.current()
-    if (!model) return
-    return `${model.provider.id}/${model.id}`
-  }
-
-  const workflowVariants = () => {
-    const variants = local.model.variant.list()
-    if (variants.length === 0) return []
-    return variants.includes("default") ? variants : ["default", ...variants]
-  }
-
-  const startWorkflowMutation = useMutation(() => ({
-    mutationFn: async (input: {
-      request: string
-      variant?: string
-      staffing: WorkflowStaffing
-      modelWhitelist: WorkflowModelWhitelistStore
-    }) => {
-      const sessionID = params.id
-      const result = await sdk().client.workflow.start({
-        workflowStartInput: {
-          ...(sessionID ? { sessionID } : {}),
-          prompt: input.request,
-          model: workflowModel(),
-          variant: input.variant,
-          agent: local.agent.current()?.name,
-          staffing: input.staffing,
-          modelWhitelist: workflowModelWhitelistPayload(input.modelWhitelist),
-        },
-      })
-      if (result.data) {
-        sync().set("workflow", (items) => [...items.filter((item) => item.id !== result.data!.id), result.data!])
-      }
-      return result.data
-    },
-    onSuccess: (workflow) => {
-      if (!workflow) return
-      setWorkflowUi("expanded", true)
-      const sessionID = params.id ?? workflow.rootSessionID
-      showToast({
-        variant: "success",
-        icon: "circle-check",
-        title: language.t("session.workflow.started.title"),
-        description: workflow.id,
-      })
-      if (sessionID) void sync().session.workflow(sessionID, { force: true })
-      void sync().session.workflowGraph(workflow.id, { force: true })
-      void sync().session.fetch(0)
-      if (!params.id && workflow.rootSessionID) navigate(`/${params.dir}/session/${workflow.rootSessionID}`)
-      dialog.close()
-    },
-    onError: fail,
-  }))
-
-  const openStartWorkflowDialog = () => {
-    void import("@/components/dialog-start-workflow").then((x) => {
-      dialog.show(() => (
-        <x.DialogStartWorkflow
-          initialRequest={workflowPrompt()}
-          variants={workflowVariants()}
-          initialVariant={local.model.variant.current() ?? "default"}
-          pending={startWorkflowMutation.isPending}
-          onStart={(input) => startWorkflowMutation.mutate(input)}
-        />
-      ))
-    })
-  }
-
-  const updateWorkflowXmlMutation = useMutation(() => ({
-    mutationFn: async () => {
-      const workflow = activeWorkflow()
-      if (!workflow) return
-      return sdk().client.workflow.updateXml({ workflowID: workflow.id, xml: workflowUi.xml }).then((result) => result.data)
-    },
-    onSuccess: (graph) => {
-      if (!graph) return
-      sync().set("workflow_graph", graph.workflow.id, graph)
-      setWorkflowUi("editingXml", false)
-      showToast({
-        variant: "success",
-        icon: "circle-check",
-        title: language.t("session.workflow.xmlSaved.title"),
-      })
-    },
-    onError: fail,
-  }))
-
-  const updateWorkflowStaffingMutation = useMutation(() => ({
-    mutationFn: async () => {
-      const workflow = activeWorkflow()
-      if (!workflow) return
-      return sdk().client.workflow
-        .updateStaffing({
-          workflowID: workflow.id,
-          staffing: { ...workflowStaffing },
-          modelWhitelist: workflowModelWhitelistPayload(workflowModelWhitelist),
-        })
-        .then((result) => result.data)
-    },
-    onSuccess: (workflow) => {
-      if (!workflow) return
-      sync().set("workflow", (items) => [...items.filter((item) => item.id !== workflow.id), workflow])
-      void sync().session.workflow(params.id, { force: true })
-      void sync().session.workflowGraph(workflow.id, { force: true })
-      void sync().session.fetch(0)
-      showToast({
-        variant: "success",
-        icon: "circle-check",
-        title: language.t("session.workflow.staffing.saved"),
-      })
-    },
-    onError: fail,
-  }))
-
-  const workflowInterventionMutation = useMutation(() => ({
-    mutationFn: async () => {
-      const workflow = activeWorkflow()
-      const message = workflowUi.interventionMessage.trim()
-      if (!workflow || !message) return
-      return sdk().client.workflow
-        .intervene({
-          workflowID: workflow.id,
-          message,
-          timing: workflowUi.interventionTiming,
-          targetRole: workflowUi.interventionTargetRole,
-        })
-        .then((result) => result.data)
-    },
-    onSuccess: (workflow) => {
-      if (!workflow) return
-      sync().set("workflow", (items) => [...items.filter((item) => item.id !== workflow.id), workflow])
-      setWorkflowUi("interventionMessage", "")
-      void sync().session.workflow(params.id, { force: true })
-      void sync().session.workflowGraph(workflow.id, { force: true })
-      void sync().session.fetch(0)
-      showToast({
-        variant: "success",
-        icon: "circle-check",
-        title: language.t("session.workflow.intervention.sent"),
-      })
-    },
-    onError: fail,
-  }))
-
-  const resumeWorkflowMutation = useMutation(() => ({
-    mutationFn: async () => {
-      const workflow = activeWorkflow()
-      if (!workflow) return
-      const sessionID = params.id
-      if (sessionID && sessionBelongsToWorkflow()) {
-        const agent = local.agent.current()?.name
-        const model = workflowModel()
-        const variant = local.model.variant.current()
-        const result = await sdk().client.session.command({
-          sessionID,
-          command: "workflow-continue",
-          arguments: "",
-          ...(agent ? { agent } : {}),
-          ...(model ? { model } : {}),
-          ...(variant ? { variant } : {}),
-        })
-        if (!result.data) return
-        return sdk().client.workflow.get({ workflowID: workflow.id }).then((next) => next.data)
-      }
-      return sdk().client.workflow.resume({ workflowID: workflow.id }).then((result) => result.data)
-    },
-    onSuccess: (workflow) => {
-      if (!workflow) return
-      sync().set("workflow", (items) => [...items.filter((item) => item.id !== workflow.id), workflow])
-      void sync().session.workflow(params.id, { force: true })
-      void sync().session.workflowGraph(workflow.id, { force: true })
-      void sync().session.fetch(0)
-    },
-    onError: fail,
-  }))
-
-  const cancelWorkflowMutation = useMutation(() => ({
-    mutationFn: async () => {
-      const workflow = activeWorkflow()
-      if (!workflow) return
-      return sdk().client.workflow.cancel({ workflowID: workflow.id }).then((result) => result.data)
-    },
-    onSuccess: (workflow) => {
-      if (!workflow) return
-      void sync().session.workflow(params.id, { force: true })
-      void sync().session.workflowGraph(workflow.id, { force: true })
-      void sync().session.fetch(0)
-    },
-    onError: fail,
-  }))
-
-  const openWorkflowPath = (path: string | undefined) => {
-    if (!path) return
-    setWorkflowMenu(undefined)
-    setWorkflowUi("fullscreen", false)
-    openReviewFile(path)
-    openReviewPanel()
-  }
-
-  const openWorkflowSession = (sessionID: string | undefined) => {
-    if (!sessionID) return
-    setWorkflowMenu(undefined)
-    setWorkflowUi("fullscreen", false)
-    setWorkflowUi("sessionLog", false)
-    navigate(`/${params.dir}/session/${sessionID}`)
-  }
-
-  const workflowNodeClick = (target: WorkflowReactFlowTarget) => {
-    openWorkflowSession(target.sessionID)
-  }
-
-  const workflowNodeContextMenu = (target: WorkflowReactFlowContextTarget) => {
-    setWorkflowMenu(target)
-  }
-
-  const workflowSessionState = (graph: WorkflowGraph) =>
-    Object.fromEntries(
-      graph.nodes
-        .map((node): [string, WorkflowReactFlowSessionState] | undefined => {
-          if (!node.sessionID) return
-          if (sync().data.session_working(node.sessionID)) return [node.sessionID, "running"]
-          if (node.type === "session") return [node.sessionID, "completed"]
-          return
-        })
-        .filter((entry): entry is [string, WorkflowReactFlowSessionState] => !!entry),
-    )
-
-  const workflowSessionLogRoleLabel = (role: WorkflowSessionLogRole) => {
-    if (role === "requester") return language.t("session.workflow.sessionLog.requester")
-    if (role === "main_pm") return language.t("session.workflow.staffing.mainPM")
-    if (role === "department_pm") return language.t("session.workflow.staffing.departmentPM")
-    if (role === "executor") return language.t("session.workflow.staffing.executor")
-    if (role === "reviewer") return language.t("session.workflow.staffing.reviewer")
-    if (role === "tester") return language.t("session.workflow.staffing.tester")
-    return language.t("session.workflow.staffing.expert")
-  }
-  const workflowSessionLogSourceLabel = (source: WorkflowSessionLogSource) => {
-    if (source === "workflow") return language.t("session.workflow.sessionLog.source.workflow")
-    if (source === "trigger") return language.t("session.workflow.sessionLog.source.trigger")
-    return language.t("session.workflow.sessionLog.source.staff")
-  }
-  const workflowSessionLogStatusLabel = (status: string) =>
-    status === "untriggered" ? language.t("session.workflow.sessionLog.untriggered") : status
-
-  makeEventListener(window, "click", () => setWorkflowMenu(undefined))
-  makeEventListener(window, "keydown", (event) => {
-    if (event.key !== "Escape") return
-    setWorkflowMenu(undefined)
-    setWorkflowUi("fullscreen", false)
-    setWorkflowUi("sessionLog", false)
-  })
-
-  const WorkflowGraphView = (props: { graph: WorkflowGraph; fullscreen?: boolean }) => {
-    const [host, setHost] = createSignal<HTMLDivElement>()
-    let flow: WorkflowReactFlowInstance | undefined
-    createEffect(() => {
-      const element = host()
-      if (!element) return
-      const next: WorkflowReactFlowProps = {
-        graph: props.graph,
-        milestoneLabel: language.t("session.workflow.milestone"),
-        viewport: props.fullscreen ? "fullscreen" : "panel",
-        currentSessionID: params.id,
-        sessionState: workflowSessionState(props.graph),
-        onNodeSelect: workflowNodeClick,
-        onNodeContextMenu: workflowNodeContextMenu,
-      }
-      if (!flow) {
-        flow = mountWorkflowReactFlow(element, next)
-        return
-      }
-      flow.update(next)
-    })
-    onCleanup(() => flow?.dispose())
-    return (
-      <div
-        ref={setHost}
-        class={
-          props.fullscreen
-            ? "h-full min-h-0 w-full overflow-hidden rounded-md border border-border-weak-base bg-surface-panel/60"
-            : "h-[280px] min-h-[220px] overflow-hidden rounded-md border border-border-weak-base bg-surface-panel/60"
-        }
-      />
-    )
-  }
-
-  const workflowContextMenu = () => (
-    <Show when={workflowMenu()}>
-      {(target) => (
-        <Portal>
-          <div
-            class="fixed z-[100] flex min-w-44 flex-col gap-1 rounded-md border border-border-weak-base bg-surface-panel p-1 shadow-lg"
-            style={{
-              left: `${Math.max(8, Math.min(target().x, window.innerWidth - 184))}px`,
-              top: `${Math.max(8, Math.min(target().y, window.innerHeight - 88))}px`,
-            }}
-            onClick={(event) => event.stopPropagation()}
-            onContextMenu={(event) => event.preventDefault()}
-          >
-            <button
-              type="button"
-              class="rounded px-2 py-1.5 text-left text-12-regular text-text-strong hover:bg-surface-hover disabled:cursor-not-allowed disabled:text-text-disabled"
-              disabled={!target().sessionID}
-              onClick={() => {
-                openWorkflowSession(target().sessionID)
-                setWorkflowMenu(undefined)
-              }}
-            >
-              {language.t("session.workflow.openSession")}
-            </button>
-            <button
-              type="button"
-              class="rounded px-2 py-1.5 text-left text-12-regular text-text-strong hover:bg-surface-hover disabled:cursor-not-allowed disabled:text-text-disabled"
-              disabled={!target().planPath}
-              onClick={() => {
-                openWorkflowPath(target().planPath)
-                setWorkflowMenu(undefined)
-              }}
-            >
-              {language.t("session.workflow.openPlan")}
-            </button>
-          </div>
-        </Portal>
-      )}
-    </Show>
-  )
-
-  const workflowSessionLogWindow = () => (
-    <Show when={workflowUi.sessionLog && activeWorkflowGraph()}>
-      {(graph) => (
-        <Portal>
-          <div
-            class="fixed inset-0 z-[1000] isolate flex items-center justify-center bg-black/70 p-4 backdrop-blur-sm"
-            onClick={() => setWorkflowUi("sessionLog", false)}
-          >
-            <div
-              class="relative z-[1] flex max-h-[82vh] w-full max-w-5xl flex-col overflow-hidden rounded-lg border border-border-strong bg-surface-raised-stronger-non-alpha shadow-xl"
-              onClick={(event) => event.stopPropagation()}
-            >
-              <div class="flex items-center gap-3 border-b border-border-weak-base bg-surface-raised-stronger-non-alpha px-4 py-3">
-                <div class="min-w-0 flex-1">
-                  <div class="text-15-medium text-text-strong">{language.t("session.workflow.sessionLog")}</div>
-                  <div class="truncate text-12-regular text-text-weak">
-                    {graph().workflow.title} · {graph().workflow.id}
-                  </div>
-                </div>
-                <IconButton
-                  type="button"
-                  size="small"
-                  variant="ghost"
-                  icon="close-small"
-                  onClick={() => setWorkflowUi("sessionLog", false)}
-                  aria-label={language.t("common.close")}
-                />
-              </div>
-              <div class="min-h-0 overflow-y-auto bg-background-base p-4">
-                <div class="mb-3 text-12-regular text-text-weak">
-                  {language.t("session.workflow.sessionLog.description")}
-                </div>
-                <div class="flex flex-col gap-3">
-                  <For
-                    each={workflowSessionLog()}
-                    fallback={
-                      <div class="rounded-md border border-border-weak-base bg-background px-3 py-4 text-12-regular text-text-weak">
-                        {language.t("session.workflow.sessionLog.empty")}
-                      </div>
-                    }
-                  >
-                    {(group) => (
-                      <section class="overflow-hidden rounded-md border border-border-weak-base bg-background-base">
-                        <div class="flex items-center gap-2 border-b border-border-weak-base bg-surface-raised-stronger-non-alpha px-3 py-2">
-                          <div class="min-w-0 flex-1">
-                            <div class="text-13-medium text-text-strong">{workflowSessionLogRoleLabel(group.role)}</div>
-                            <div class="text-11-regular text-text-weaker">
-                              {language.t("session.workflow.sessionLog.count", { count: group.entries.length })}
-                            </div>
-                          </div>
-                        </div>
-                        <div class="divide-y divide-border-weak-base">
-                          <For each={group.entries}>
-                            {(entry) => (
-                              <div
-                                class="grid grid-cols-[minmax(0,1fr)_auto] gap-3 bg-background-base px-3 py-2"
-                                classList={{
-                                  "border-l-2 border-accent bg-accent/5": entry.current,
-                                }}
-                              >
-                                <div class="min-w-0">
-                                  <div class="flex min-w-0 flex-wrap items-center gap-1.5">
-                                    <span class="truncate text-12-medium text-text-strong">{entry.title}</span>
-                                    <span
-                                      class={`rounded px-1.5 py-0.5 text-[10px] leading-4 ${workflowSessionLogStatusTone(
-                                        entry.status,
-                                      )}`}
-                                    >
-                                      {workflowSessionLogStatusLabel(entry.status)}
-                                    </span>
-                                  </div>
-                                  <div class="mt-1 flex min-w-0 flex-wrap gap-x-3 gap-y-1 text-11-regular text-text-weak">
-                                    <span>{workflowSessionLogSourceLabel(entry.source)}</span>
-                                    <Show when={entry.specialty}>
-                                      {(specialty) => <span>{specialty()}</span>}
-                                    </Show>
-                                    <Show when={entry.milestoneID}>
-                                      {(milestoneID) => (
-                                        <span class="truncate">
-                                          {milestoneID()}
-                                          <Show when={entry.milestoneTitle}> · {entry.milestoneTitle}</Show>
-                                        </span>
-                                      )}
-                                    </Show>
-                                    <Show when={entry.attempt !== undefined}>
-                                      <span>
-                                        {language.t("session.workflow.sessionLog.attempt", {
-                                          count: entry.attempt ?? 0,
-                                        })}
-                                      </span>
-                                    </Show>
-                                    <Show when={entry.sessionID}>
-                                      {(sessionID) => (
-                                        <span class="max-w-60 truncate font-mono text-text-weaker">{sessionID()}</span>
-                                      )}
-                                    </Show>
-                                  </div>
-                                </div>
-                                <Button
-                                  type="button"
-                                  size="small"
-                                  variant="ghost"
-                                  icon="enter"
-                                  disabled={!entry.sessionID}
-                                  onClick={() => openWorkflowSession(entry.sessionID)}
-                                >
-                                  {language.t("session.workflow.openSession")}
-                                </Button>
-                              </div>
-                            )}
-                          </For>
-                        </div>
-                      </section>
-                    )}
-                  </For>
-                </div>
-              </div>
-            </div>
-          </div>
-        </Portal>
-      )}
-    </Show>
-  )
-
-  const workflowFullscreenPreview = () => (
-    <Show when={workflowUi.fullscreen && activeWorkflowGraph()}>
-      {(graph) => (
-        <Portal>
-          <div class="workflow-fullscreen-preview fixed inset-0 z-[90] flex flex-col gap-3 p-4">
-            <div class="flex min-h-8 items-center gap-2">
-              <div class="min-w-0 flex-1">
-                <div class="truncate text-13-medium text-text-strong">{graph().workflow.title}</div>
-                <div class="truncate text-11-regular text-text-weaker">{graph().workflow.id}</div>
-              </div>
-              <Tooltip placement="bottom" value={language.t("session.workflow.exitFullscreen")}>
-                <IconButton
-                  type="button"
-                  size="small"
-                  variant="secondary"
-                  icon="collapse"
-                  onClick={() => setWorkflowUi("fullscreen", false)}
-                  aria-label={language.t("session.workflow.exitFullscreen")}
-                />
-              </Tooltip>
-              <Tooltip placement="bottom" value={language.t("session.workflow.sessionLog")}>
-                <IconButton
-                  type="button"
-                  size="small"
-                  variant="secondary"
-                  icon="bullet-list"
-                  onClick={() => setWorkflowUi("sessionLog", true)}
-                  aria-label={language.t("session.workflow.sessionLog")}
-                />
-              </Tooltip>
-            </div>
-            <div class="workflow-fullscreen-preview__graph min-h-0 flex-1 overflow-hidden rounded-md">
-              <WorkflowGraphView graph={graph()} fullscreen />
-            </div>
-          </div>
-        </Portal>
-      )}
-    </Show>
-  )
-
-  const workflowSessionControl = () => (
-    <>
-      <Show when={params.id && !mobileChanges()}>
-        <div class="shrink-0 px-3 pt-2 pb-1 flex max-w-full flex-col gap-2">
-        <div class="rounded-md border border-border-weak-base bg-surface-panel shadow-sm">
-          <div class="flex items-center gap-2 px-2 py-1.5">
-            <Show
-              when={sessionBelongsToWorkflow()}
-              fallback={
-                <Button
-                  type="button"
-                  size="small"
-                  variant={activeWorkflow() ? "secondary" : "primary"}
-                  icon="branch"
-                  disabled={startWorkflowMutation.isPending || !params.id}
-                  onClick={openStartWorkflowDialog}
-                >
-                  {activeWorkflow() ? language.t("session.workflow.startAnother") : language.t("session.workflow.start")}
-                </Button>
-              }
-            >
-              <span class="shrink-0 rounded border border-border-weak-base px-2 py-1 text-12-medium text-text-weak">
-                {language.t("session.workflow.belongsTo")}
-              </span>
-            </Show>
-            <Show when={activeWorkflow()} keyed>
-              {(workflow) => (
-                <>
-                  <button
-                    type="button"
-                    class="min-w-0 flex-1 text-left"
-                    onClick={() => setWorkflowUi("expanded", !workflowUi.expanded)}
-                  >
-                    <div class="flex min-w-0 items-center gap-2">
-                      <span
-                        class={`shrink-0 rounded px-1.5 py-0.5 text-[10px] leading-4 ${workflowStatusTone(
-                          workflow.status,
-                        )}`}
-                      >
-                        {workflow.status}
-                      </span>
-                      <span class="truncate text-12-medium text-text-strong">{workflow.title}</span>
-                    </div>
-                    <div class="truncate text-11-regular text-text-weaker">{workflow.id}</div>
-                  </button>
-                  <Tooltip placement="bottom" value={language.t("session.workflow.fullscreen")}>
-                    <IconButton
-                      type="button"
-                      size="small"
-                      variant="ghost"
-                      icon="expand"
-                      disabled={!activeWorkflowGraph()}
-                      onClick={() => setWorkflowUi("fullscreen", true)}
-                      aria-label={language.t("session.workflow.fullscreen")}
-                    />
-                  </Tooltip>
-                  <Tooltip placement="bottom" value={language.t("session.workflow.sessionLog")}>
-                    <IconButton
-                      type="button"
-                      size="small"
-                      variant="ghost"
-                      icon="bullet-list"
-                      disabled={!activeWorkflowGraph()}
-                      onClick={() => setWorkflowUi("sessionLog", true)}
-                      aria-label={language.t("session.workflow.sessionLog")}
-                    />
-                  </Tooltip>
-                  <Tooltip placement="bottom" value={language.t("session.workflow.resume")}>
-                    <IconButton
-                      type="button"
-                      size="small"
-                      variant="ghost"
-                      icon="circle-check"
-                      disabled={resumeWorkflowMutation.isPending || workflow.status === "completed"}
-                      onClick={() => resumeWorkflowMutation.mutate()}
-                      aria-label={language.t("session.workflow.resume")}
-                    />
-                  </Tooltip>
-                  <Tooltip placement="bottom" value={language.t("session.workflow.cancel")}>
-                    <IconButton
-                      type="button"
-                      size="small"
-                      variant="ghost"
-                      icon="close-small"
-                      disabled={cancelWorkflowMutation.isPending || workflow.status === "cancelled"}
-                      onClick={() => cancelWorkflowMutation.mutate()}
-                      aria-label={language.t("session.workflow.cancel")}
-                    />
-                  </Tooltip>
-                </>
-              )}
-            </Show>
-          </div>
-          <Show when={workflowUi.expanded && activeWorkflow()}>
-            <div class="border-t border-border-weak-base p-2 flex flex-col gap-2">
-              <Show when={activeWorkflowGraph()} fallback={<div class="text-12-regular text-text-weak px-1 py-2">{language.t("common.loading")}</div>}>
-                {(graph) => (
-                  <>
-                    <WorkflowGraphView graph={graph()} />
-                    <div class="flex flex-wrap gap-1.5">
-                      <For each={graph().milestones}>
-                        {(milestone) => (
-                          <>
-                            <Show when={milestone.planPath}>
-                              {(path) => (
-                                <Button
-                                  type="button"
-                                  size="small"
-                                  variant="ghost"
-                                  icon="open-file"
-                                  onClick={() => openWorkflowPath(path())}
-                                >
-                                  {milestone.id}
-                                </Button>
-                              )}
-                            </Show>
-                          </>
-                        )}
-                      </For>
-                    </div>
-                    <details class="rounded-md border border-border-weak-base bg-background">
-                      <summary class="cursor-pointer px-2 py-1.5 text-12-medium text-text-weak">
-                        {language.t("session.workflow.intervention.title")}
-                      </summary>
-                      <div class="border-t border-border-weak-base p-2 flex flex-col gap-2">
-                        <textarea
-                          class="min-h-24 w-full resize-y rounded-md border border-border-weak-base bg-surface-panel p-2 text-12-regular text-text-strong outline-none focus:border-border-strong"
-                          value={workflowUi.interventionMessage}
-                          placeholder={language.t("session.workflow.intervention.placeholder")}
-                          onInput={(event) => setWorkflowUi("interventionMessage", event.currentTarget.value)}
-                          spellcheck={false}
-                        />
-                        <div class="flex flex-wrap items-center justify-end gap-1.5">
-                          <Select
-                            options={workflowInterventionTargetRoleOptions}
-                            current={workflowUi.interventionTargetRole}
-                            label={(option) => language.t(`session.workflow.intervention.target.${option}`)}
-                            onSelect={(option) => option && setWorkflowUi("interventionTargetRole", option)}
-                            variant="secondary"
-                            size="small"
-                            aria-label={language.t("session.workflow.intervention.target")}
-                          />
-                          <Select
-                            options={workflowInterventionTimingOptions}
-                            current={workflowUi.interventionTiming}
-                            label={(option) => language.t(`session.workflow.intervention.timing.${option}`)}
-                            onSelect={(option) => option && setWorkflowUi("interventionTiming", option)}
-                            variant="secondary"
-                            size="small"
-                            aria-label={language.t("session.workflow.intervention.timing")}
-                          />
-                          <Button
-                            type="button"
-                            size="small"
-                            variant="primary"
-                            icon="arrow-up"
-                            disabled={
-                              workflowInterventionMutation.isPending || workflowUi.interventionMessage.trim().length === 0
-                            }
-                            onClick={() => workflowInterventionMutation.mutate()}
-                          >
-                            {language.t("session.workflow.intervention.send")}
-                          </Button>
-                        </div>
-                      </div>
-                    </details>
-                    <details class="rounded-md border border-border-weak-base bg-background">
-                      <summary class="cursor-pointer px-2 py-1.5 text-12-medium text-text-weak">
-                        {language.t("session.workflow.staffing.title")}
-                      </summary>
-                      <div class="border-t border-border-weak-base p-2 flex flex-col gap-2">
-                        <div class="grid grid-cols-2 gap-2 md:grid-cols-3">
-                          <For each={workflowStaffingFields}>
-                            {([key, label]) => (
-                                <TextField
-                                  type="number"
-                                  min="1"
-                                  max="64"
-                                  step="1"
-                                label={language.t(label)}
-                                value={String(workflowStaffing[key])}
-                                onChange={(value) =>
-                                  setWorkflowStaffing(
-                                    key,
-                                    workflowStaffingValue(Number(value), defaultWorkflowStaffing[key]),
-                                  )
-                                }
-                              />
-                            )}
-                          </For>
-                        </div>
-                        <div class="flex flex-col gap-3 border-t border-border-weak-base pt-2">
-                          <div>
-                            <div class="text-12-medium text-text-base">
-                              {language.t("session.workflow.modelWhitelist.title")}
-                            </div>
-                            <div class="text-11-regular text-text-muted">
-                              {language.t("session.workflow.modelWhitelist.description")}
-                            </div>
-                          </div>
-                          <For each={workflowModelWhitelistRoles}>
-                            {([role, label]) => (
-                              <div class="flex flex-col gap-2">
-                                <div class="flex items-center justify-between gap-2">
-                                  <div class="text-12-medium text-text-weak">{language.t(label)}</div>
-                                  <Button
-                                    type="button"
-                                    size="small"
-                                    variant="secondary"
-                                    icon="plus-small"
-                                    disabled={workflowModelOptions().length === 0}
-                                    onClick={() => addWorkflowModelWhitelist(role)}
-                                  >
-                                    {language.t("session.workflow.modelWhitelist.add")}
-                                  </Button>
-                                </div>
-                                <Show
-                                  when={workflowModelWhitelist[role].length > 0}
-                                  fallback={
-                                    <div class="rounded-md border border-border-weak-base px-2 py-1.5 text-12-regular text-text-muted">
-                                      {language.t("session.workflow.modelWhitelist.empty")}
-                                    </div>
-                                  }
-                                >
-                                  <div class="flex flex-col gap-2">
-                                    <For each={workflowModelWhitelist[role]}>
-                                      {(entry, index) => {
-                                        const selectedModel = () =>
-                                          workflowModelOptions().find(
-                                            (model) =>
-                                              model.providerID === entry.providerID && model.modelID === entry.modelID,
-                                          )
-                                        const variantOptions = () => ["default", ...(selectedModel()?.variants ?? [])]
-                                        return (
-                                          <div class="grid grid-cols-1 gap-2 rounded-md border border-border-weak-base p-2 md:grid-cols-[minmax(0,1fr)_140px_96px_96px_auto] md:items-end">
-                                            <Select
-                                              size="small"
-                                              variant="secondary"
-                                              options={workflowModelOptions()}
-                                              current={selectedModel()}
-                                              value={(model) => `${model.providerID}/${model.modelID}`}
-                                              label={(model) => model.name}
-                                              onSelect={(model) => selectWorkflowModelWhitelist(role, index(), model)}
-                                              valueClass="truncate text-12-regular"
-                                            />
-                                            <Select
-                                              size="small"
-                                              variant="secondary"
-                                              options={variantOptions()}
-                                              current={entry.variant ?? "default"}
-                                              label={(value) => (value === "default" ? language.t("common.default") : value)}
-                                              onSelect={(value) =>
-                                                setWorkflowModelWhitelist(
-                                                  role,
-                                                  index(),
-                                                  "variant",
-                                                  value === "default" ? undefined : value,
-                                                )
-                                              }
-                                              valueClass="truncate text-12-regular"
-                                            />
-                                            <TextField
-                                              type="number"
-                                              min="0"
-                                              max="100"
-                                              step="1"
-                                              label={language.t("session.workflow.modelWhitelist.weight")}
-                                              value={String(entry.weight)}
-                                              onChange={(value) =>
-                                                setWorkflowModelWhitelist(role, index(), "weight", workflowModelWeight(value))
-                                              }
-                                            />
-                                            <TextField
-                                              type="number"
-                                              min="0"
-                                              max="43200"
-                                              step="1"
-                                              label={language.t("session.workflow.modelWhitelist.cacheMinutes")}
-                                              value={String(entry.cacheMinutes)}
-                                              onChange={(value) =>
-                                                setWorkflowModelWhitelist(
-                                                  role,
-                                                  index(),
-                                                  "cacheMinutes",
-                                                  workflowModelCacheMinutes(value),
-                                                )
-                                              }
-                                            />
-                                            <Button
-                                              type="button"
-                                              size="small"
-                                              variant="ghost"
-                                              icon="close"
-                                              onClick={() => removeWorkflowModelWhitelist(role, index())}
-                                            />
-                                          </div>
-                                        )
-                                      }}
-                                    </For>
-                                  </div>
-                                </Show>
-                              </div>
-                            )}
-                          </For>
-                        </div>
-                        <div class="flex justify-end">
-                          <Button
-                            type="button"
-                            size="small"
-                            variant="primary"
-                            icon="check-small"
-                            disabled={updateWorkflowStaffingMutation.isPending}
-                            onClick={() => updateWorkflowStaffingMutation.mutate()}
-                          >
-                            {language.t("session.workflow.staffing.save")}
-                          </Button>
-                        </div>
-                      </div>
-                    </details>
-                    <details class="rounded-md border border-border-weak-base bg-background">
-                      <summary class="cursor-pointer px-2 py-1.5 text-12-medium text-text-weak">
-                        {language.t("session.workflow.xml")}
-                      </summary>
-                      <div class="border-t border-border-weak-base p-2 flex flex-col gap-2">
-                        <textarea
-                          class="min-h-40 w-full resize-y rounded-md border border-border-weak-base bg-surface-panel p-2 font-mono text-12-regular text-text-strong outline-none focus:border-border-strong"
-                          value={workflowUi.xml}
-                          onInput={(event) => {
-                            setWorkflowUi("editingXml", true)
-                            setWorkflowUi("xml", event.currentTarget.value)
-                          }}
-                          spellcheck={false}
-                        />
-                        <div class="flex justify-end gap-1.5">
-                          <Button
-                            type="button"
-                            size="small"
-                            variant="secondary"
-                            onClick={() => {
-                              setWorkflowUi("xml", graph().workflow.xml)
-                              setWorkflowUi("editingXml", false)
-                            }}
-                          >
-                            {language.t("common.cancel")}
-                          </Button>
-                          <Button
-                            type="button"
-                            size="small"
-                            variant="primary"
-                            icon="check-small"
-                            disabled={updateWorkflowXmlMutation.isPending}
-                            onClick={() => updateWorkflowXmlMutation.mutate()}
-                          >
-                            {language.t("session.workflow.saveXml")}
-                          </Button>
-                        </div>
-                      </div>
-                    </details>
-                  </>
-                )}
-              </Show>
-            </div>
-          </Show>
-        </div>
-        </div>
-      </Show>
-      {workflowContextMenu()}
-      {workflowFullscreenPreview()}
-      {workflowSessionLogWindow()}
-    </>
-  )
-
-  const merge = (next: NonNullable<ReturnType<typeof info>>) =>
-    sync().set("session", (list) => {
-      const idx = list.findIndex((item) => item.id === next.id)
-      if (idx < 0) return list
-      const out = list.slice()
-      out[idx] = next
-      return out
-    })
-
-  const roll = (sessionID: string, next: NonNullable<ReturnType<typeof info>>["revert"]) =>
-    sync().set("session", (list) => {
-      const idx = list.findIndex((item) => item.id === sessionID)
-      if (idx < 0) return list
-      const out = list.slice()
-      out[idx] = { ...out[idx], revert: next }
-      return out
-    })
 
   const busy = (sessionID: string) => sync().data.session_working(sessionID)
 
@@ -2618,6 +1625,7 @@ export default function Page() {
 
   const followupMutation = useMutation(() => ({
     mutationFn: async (input: { sessionID: string; id: string; manual?: boolean }) => {
+      const owner = sessionOwnership.capture()
       const item = (followup.items[input.sessionID] ?? []).find((entry) => entry.id === input.id)
       if (!item) return
 
@@ -2630,7 +1638,6 @@ export default function Page() {
         serverSync: serverSync(),
         draft: item,
         optimisticBusy: item.sessionDirectory === sdk().directory,
-        defaultPrompt: settings.general.defaultPrompt(),
       }).catch((err) => {
         setFollowup("failed", input.sessionID, input.id)
         fail(err)
@@ -2639,7 +1646,7 @@ export default function Page() {
       if (!ok) return
 
       setFollowup("items", input.sessionID, (items) => (items ?? []).filter((entry) => entry.id !== input.id))
-      if (input.manual) resumeScroll()
+      if (input.manual) owner.run(resumeScroll)
     },
   }))
 
@@ -2656,11 +1663,7 @@ export default function Page() {
   const queueEnabled = createMemo(() => {
     const id = params.id
     if (!id) return false
-    return (
-      settings.general.followup() === "queue" &&
-      busy(id) &&
-      !composer.blocked()
-    )
+    return settings.general.followup() === "queue" && busy(id) && !composer.blocked() && !isChildSession()
   })
 
   const followupText = (item: FollowupDraft) => {
@@ -2680,351 +1683,14 @@ export default function Page() {
     return `[${language.t("common.attachment")}]`
   }
 
-  const queueFollowup = (draft: FollowupDraft, id = Identifier.ascending("message")) => {
-    setFollowup("items", draft.sessionID, (items) => [...(items ?? []), { id, ...draft }])
+  const queueFollowup = (draft: FollowupDraft) => {
+    setFollowup("items", draft.sessionID, (items) => [
+      ...(items ?? []),
+      { id: Identifier.ascending("message"), ...draft },
+    ])
     setFollowup("failed", draft.sessionID, undefined)
     setFollowup("paused", draft.sessionID, undefined)
   }
-
-  const removeQueuedPlanFollowups = (sessionID: string) => {
-    setFollowup("items", sessionID, (items) =>
-      (items ?? []).filter((entry) => !entry.id.startsWith(PLAN_FOLLOWUP_PREFIX)),
-    )
-    setFollowup("failed", sessionID, (value) => (value?.startsWith(PLAN_FOLLOWUP_PREFIX) ? undefined : value))
-  }
-
-  const assistantOutput = (messageID: string) => {
-    const parts = sync().data.part[messageID]
-    if (!parts) return
-    return parts
-      .filter((part) => part.type === "text")
-      .map((part) => part.text)
-      .join("\n")
-  }
-
-  const hasPlanCompleteMarker = (output: string) =>
-    output.split(/\r?\n/).some((line) => line.trim() === PLAN_COMPLETE_MARKER)
-
-  const planMilestones = createMemo(() => {
-    const id = params.id
-    if (!id) return emptyPlanMilestones
-    return planSession.milestones[id] ?? emptyPlanMilestones
-  })
-
-  const savePlanBlock = async (block: OpencodePlanBlock) => {
-    return sdk().client.file
-      .plan.save({
-        title: block.title,
-        content: block.content,
-      })
-      .then((result) => result.data?.path)
-      .catch((err) => {
-        showToast({
-          variant: "error",
-          title: language.t("common.requestFailed"),
-          description: formatServerError(err, language.t, language.t("common.requestFailed")),
-        })
-        return undefined
-      })
-  }
-
-  const parsePlanMilestones = (output: string) => {
-    const matches = output.matchAll(PLAN_MILESTONE_PATTERN)
-    return [...matches].map((match) => match[1]?.trim()).filter((text): text is string => !!text)
-  }
-
-  const recordPlanMilestones = (sessionID: string, assistant: AssistantMessage, output: string) => {
-    const parsed = parsePlanMilestones(output)
-    if (parsed.length === 0) return
-
-    setPlanSession("milestones", sessionID, (items) => {
-      const existing = items ?? []
-      if (existing.some((item) => item.messageID === assistant.id)) return existing
-      return [
-        ...existing,
-        ...parsed.map((text, index) => ({
-          id: `${assistant.id}:${index}`,
-          messageID: assistant.id,
-          parentID: assistant.parentID,
-          at: assistant.time.completed ?? assistant.time.created,
-          text,
-        })),
-      ]
-    })
-  }
-
-  const queuePlanFollowup = (sessionID: string, path: string, opts?: { notify?: boolean }) => {
-    if (followupBusy(sessionID)) return false
-    if ((followup.items[sessionID] ?? []).length > 0) return false
-    if (followup.paused[sessionID]) return false
-    if (composer.blocked()) return false
-    if (busy(sessionID)) return false
-
-    const currentModel = local.model.current()
-    const currentAgent = local.agent.current()
-    if (!currentModel || !currentAgent) {
-      if (opts?.notify) {
-        showToast({
-          title: language.t("prompt.toast.modelAgentRequired.title"),
-          description: language.t("prompt.toast.modelAgentRequired.description"),
-        })
-      }
-      return false
-    }
-
-    const content = PLAN_FOLLOWUP_CONTENT + "\n\n"
-    const fileContent = `@${path}`
-    queueFollowup(
-      {
-        sessionID,
-        sessionDirectory: sdk().directory,
-        prompt: [
-          { type: "text", content, start: 0, end: content.length },
-          {
-            type: "file",
-            path,
-            content: fileContent,
-            start: content.length,
-            end: content.length + fileContent.length,
-          },
-        ],
-        context: [],
-        agent: currentAgent.name,
-        model: { providerID: currentModel.provider.id, modelID: currentModel.id },
-        variant: local.model.variant.current(),
-      },
-      PLAN_FOLLOWUP_PREFIX + Identifier.ascending("message"),
-    )
-    return true
-  }
-
-  const usePlanBlock = async (block: OpencodePlanBlock) => {
-    const sessionID = params.id
-    if (!sessionID) return
-    const path = await savePlanBlock(block)
-    if (!path) return
-    batch(() => {
-      setPlanSession("file", sessionID, path)
-      setPlanSession("enabled", sessionID, false)
-      setPlanSession("lastAssistant", sessionID, undefined)
-      setPlanSession("milestones", sessionID, [])
-      setFollowup("paused", sessionID, undefined)
-      removeQueuedPlanFollowups(sessionID)
-    })
-    if (queuePlanFollowup(sessionID, path, { notify: true })) {
-      setPlanSession("enabled", sessionID, true)
-      return
-    }
-    showToast({
-      variant: "success",
-      icon: "circle-check",
-      title: language.t("session.plan.block.ready.title"),
-      description: language.t("session.plan.block.ready.description"),
-    })
-  }
-
-  const enablePlanSession = (sessionID: string, path: string, opts?: { resetMilestones?: boolean }) => {
-    batch(() => {
-      setPlanSession("file", sessionID, path)
-      setPlanSession("enabled", sessionID, false)
-      setPlanSession("lastAssistant", sessionID, undefined)
-      if (opts?.resetMilestones) setPlanSession("milestones", sessionID, [])
-      setFollowup("paused", sessionID, undefined)
-      removeQueuedPlanFollowups(sessionID)
-    })
-    if (queuePlanFollowup(sessionID, path, { notify: true })) {
-      setPlanSession("enabled", sessionID, true)
-    }
-  }
-
-  const choosePlanFile = () => {
-    const sessionID = params.id
-    if (!sessionID) return
-    void import("@/components/dialog-select-file").then((x) => {
-      dialog.show(() => (
-        <x.DialogSelectFile
-          mode="files"
-          nativeFilePicker
-          onSelectFile={(path) => {
-            const id = params.id
-            if (!id) return
-            enablePlanSession(id, path, { resetMilestones: true })
-          }}
-        />
-      ))
-    })
-  }
-
-  const pausePlanSession = () => {
-    const sessionID = params.id
-    if (!sessionID) return
-    setPlanSession("enabled", sessionID, false)
-    removeQueuedPlanFollowups(sessionID)
-  }
-
-  const clearPlanSession = () => {
-    const sessionID = params.id
-    if (!sessionID) return
-    batch(() => {
-      setPlanSession("enabled", sessionID, undefined)
-      setPlanSession("file", sessionID, undefined)
-      setPlanSession("lastAssistant", sessionID, undefined)
-      setPlanSession("milestones", sessionID, undefined)
-      removeQueuedPlanFollowups(sessionID)
-    })
-  }
-
-  const togglePlanSession = () => {
-    const sessionID = params.id
-    if (!sessionID) return
-    if (planActive()) {
-      pausePlanSession()
-      return
-    }
-    const path = planSession.file[sessionID]
-    if (!path) {
-      choosePlanFile()
-      return
-    }
-    enablePlanSession(sessionID, path)
-  }
-
-  const planSessionControl = () => (
-    <Show when={params.id && !mobileChanges()}>
-      <div class="shrink-0 px-3 pt-3 pb-1 flex max-w-full flex-col gap-2">
-        <div class="flex max-w-full items-center gap-1">
-          <Tooltip
-            placement="bottom"
-            value={
-              <div class="flex flex-col gap-1">
-                <span>{language.t(planFile() ? "session.plan.change" : "session.plan.choose")}</span>
-                <span class="text-text-weaker">
-                  {language.t("session.plan.marker", {
-                    marker: PLAN_COMPLETE_MARKER,
-                  })}
-                </span>
-                <span class="text-text-weaker">
-                  {language.t("session.plan.milestoneTag", {
-                    open: PLAN_MILESTONE_OPEN,
-                    close: PLAN_MILESTONE_CLOSE,
-                  })}
-                </span>
-              </div>
-            }
-          >
-            <Button
-              type="button"
-              size="small"
-              variant={planActive() ? "primary" : "secondary"}
-              icon={planFile() ? (planActive() ? "circle-ban-sign" : "arrow-up") : "checklist"}
-              class="max-w-[260px] justify-start border border-border-weak-base bg-surface-panel shadow-sm"
-              onClick={() => (planFile() ? togglePlanSession() : choosePlanFile())}
-              aria-label={language.t(
-                planFile()
-                  ? planActive()
-                    ? "session.plan.disable"
-                    : "session.plan.enable"
-                  : "session.plan.choose",
-              )}
-            >
-              <span class="truncate">
-                {planFile()
-                  ? planActive()
-                    ? getFilename(planFile()!)
-                    : language.t("session.plan.enable")
-                  : language.t("session.plan.choose")}
-              </span>
-            </Button>
-          </Tooltip>
-          <Show when={planFile()}>
-            <Tooltip placement="bottom" value={language.t("session.plan.change")}>
-              <IconButton
-                type="button"
-                size="small"
-                variant="secondary"
-                icon="folder"
-                class="border border-border-weak-base bg-surface-panel shadow-sm"
-                onClick={choosePlanFile}
-                aria-label={language.t("session.plan.change")}
-              />
-            </Tooltip>
-            <Tooltip placement="bottom" value={language.t("session.plan.clear")}>
-              <IconButton
-                type="button"
-                size="small"
-                variant="secondary"
-                icon="close-small"
-                class="border border-border-weak-base bg-surface-panel shadow-sm"
-                onClick={clearPlanSession}
-                aria-label={language.t("session.plan.clear")}
-              />
-            </Tooltip>
-          </Show>
-        </div>
-        <Show when={planMilestones().length > 0}>
-          <div class="max-w-full overflow-x-auto">
-            <div class="flex items-stretch gap-1.5">
-              <div class="shrink-0 self-center text-11-medium text-text-weaker">
-                {language.t("session.plan.milestones")}
-              </div>
-              <For each={planMilestones()}>
-                {(item, index) => (
-                  <button
-                    type="button"
-                    class="shrink-0 max-w-[280px] rounded-md border border-border-weak-base bg-surface-panel px-2 py-1 text-left shadow-sm hover:bg-surface-hover"
-                    onClick={() => {
-                      const message = visibleUserMessages().find((value) => value.id === item.parentID)
-                      if (message) scrollToMessage(message)
-                    }}
-                  >
-                    <div class="text-11-medium text-text-weaker">
-                      {language.t("session.plan.milestone", { count: index() + 1 })}
-                    </div>
-                    <div class="text-12-regular text-text-strong whitespace-pre-wrap break-words max-h-14 overflow-hidden">
-                      {item.text}
-                    </div>
-                  </button>
-                )}
-              </For>
-            </div>
-          </div>
-        </Show>
-      </div>
-    </Show>
-  )
-
-  createEffect(() => {
-    const sessionID = params.id
-    const path = planSession.file[sessionID ?? ""]
-    const assistant = lastCompletedAssistant()
-    if (!sessionID || !path || !planSession.enabled[sessionID] || !assistant) return
-    if (planSession.lastAssistant[sessionID] === assistant.id) return
-    if (assistant.error) return
-
-    const output = assistantOutput(assistant.id)
-    if (output === undefined) return
-
-    recordPlanMilestones(sessionID, assistant, output)
-
-    if (hasPlanCompleteMarker(output)) {
-      batch(() => {
-        setPlanSession("enabled", sessionID, false)
-        setPlanSession("lastAssistant", sessionID, assistant.id)
-        removeQueuedPlanFollowups(sessionID)
-      })
-      showToast({
-        variant: "success",
-        icon: "circle-check",
-        title: language.t("session.plan.complete.title"),
-        description: language.t("session.plan.complete.description"),
-      })
-      return
-    }
-
-    if (queuePlanFollowup(sessionID, path)) {
-      setPlanSession("lastAssistant", sessionID, assistant.id)
-    }
-  })
 
   const followupDock = createMemo(() => queuedFollowups().map((item) => ({ id: item.id, text: followupText(item) })))
 
@@ -3069,25 +1735,23 @@ export default function Page() {
 
   const revertMutation = useMutation(() => ({
     mutationFn: async (input: { sessionID: string; messageID: string }) => {
-      const prev = prompt.current().slice()
-      const last = info()?.revert
+      const client = sdk().client
+      const target = sync()
+      const last = target.session.get(input.sessionID)?.revert
       const value = draft(input.messageID)
-      batch(() => {
-        roll(input.sessionID, { messageID: input.messageID })
-        prompt.set(value)
+      await runPromptRollbackMutation({
+        capturePrompt: prompt.capture,
+        optimistic: (prompt) => {
+          roll(input.sessionID, { messageID: input.messageID }, target)
+          prompt.set(value)
+        },
+        request: () => halt(input.sessionID).then(() => client.session.revert(input)),
+        complete: (result) => {
+          if (result.data) merge(result.data, target)
+        },
+        rollback: () => roll(input.sessionID, last, target),
+        fail,
       })
-      await halt(input.sessionID)
-        .then(() => sdk().client.session.revert(input))
-        .then((result) => {
-          if (result.data) merge(result.data)
-        })
-        .catch((err) => {
-          batch(() => {
-            roll(input.sessionID, last)
-            prompt.set(prev)
-          })
-          fail(err)
-        })
     },
   }))
 
@@ -3096,39 +1760,31 @@ export default function Page() {
       const sessionID = params.id
       if (!sessionID) return
 
+      const client = sdk().client
+      const target = sync()
       const next = userMessages().find((item) => item.id > id)
-      const prev = prompt.current().slice()
-      const last = info()?.revert
+      const last = target.session.get(sessionID)?.revert
 
-      batch(() => {
-        roll(sessionID, next ? { messageID: next.id } : undefined)
-        if (next) {
-          prompt.set(draft(next.id))
-          return
-        }
-        prompt.reset()
+      await runPromptRollbackMutation({
+        capturePrompt: prompt.capture,
+        optimistic: (promptSession) => {
+          roll(sessionID, next ? { messageID: next.id } : undefined, target)
+          if (next) {
+            promptSession.set(draft(next.id))
+            return
+          }
+          promptSession.reset()
+        },
+        request: () =>
+          !next
+            ? halt(sessionID).then(() => client.session.unrevert({ sessionID }))
+            : halt(sessionID).then(() => client.session.revert({ sessionID, messageID: next.id })),
+        complete: (result) => {
+          if (result.data) merge(result.data, target)
+        },
+        rollback: () => roll(sessionID, last, target),
+        fail,
       })
-
-      const task = !next
-        ? halt(sessionID).then(() => sdk().client.session.unrevert({ sessionID }))
-        : halt(sessionID).then(() =>
-            sdk().client.session.revert({
-              sessionID,
-              messageID: next.id,
-            }),
-          )
-
-      await task
-        .then((result) => {
-          if (result.data) merge(result.data)
-        })
-        .catch((err) => {
-          batch(() => {
-            roll(sessionID, last)
-            prompt.set(prev)
-          })
-          fail(err)
-        })
     },
   }))
 
@@ -3153,12 +1809,7 @@ export default function Page() {
       .map((item) => ({ id: item.id, text: line(item.id) }))
   })
 
-  const actions = {
-    revert,
-    renderFileReference: (input: { path: string; type: "file"; children: JSX.Element }) => (
-      <FilePathContextMenu target={{ path: input.path, type: input.type }}>{input.children}</FilePathContextMenu>
-    ),
-  }
+  const actions = { revert }
 
   createEffect(() => {
     const sessionID = params.id
@@ -3169,6 +1820,7 @@ export default function Page() {
     if (followupBusy(sessionID)) return
     if (followup.failed[sessionID] === item.id) return
     if (followup.paused[sessionID]) return
+    if (isChildSession()) return
     if (composer.blocked()) return
     if (busy(sessionID)) return
 
@@ -3248,44 +1900,28 @@ export default function Page() {
 
   useUsageExceededDialogs()
 
-  const composerRegion = (placement: "dock" | "inline") => (
-    <SessionComposerRegion
-      state={composer}
-      ready={!store.deferRender && messagesReady()}
-      centered={placement === "dock" && centered()}
-      placement={placement}
-      inputRef={(el) => {
-        inputRef = el
-      }}
-      newSessionWorktree={newSessionWorktree()}
-      onNewSessionWorktreeReset={() => setStore("newSessionWorktree", "main")}
-      onSubmit={() => {
-        comments.clear()
-        resumeScroll()
-      }}
-      onResponseSubmit={resumeScroll}
-      followup={
-        params.id
+  const composerRegion = () => {
+    const controller = createSessionComposerRegionController({
+      state: composer,
+      sessionKey,
+      sessionID: () => params.id,
+      prompt,
+      ready: () => !store.deferRender && messagesReady(),
+      centered,
+      todo: {
+        collapsed: () => view().todoCollapsed.get(),
+        onToggle: () => view().todoCollapsed.set(!view().todoCollapsed.get()),
+      },
+      followup: () =>
+        params.id && !isChildSession()
           ? {
-              queue: queueEnabled,
               items: followupDock(),
               sending: sendingFollowup(),
-              edit: editingFollowup(),
-              onQueue: queueFollowup,
-              onAbort: () => {
-                const id = params.id
-                if (!id) return
-                setFollowup("paused", id, true)
-              },
-              onSend: (id) => {
-                void sendFollowup(params.id!, id, { manual: true })
-              },
+              onSend: (id) => void sendFollowup(params.id!, id, { manual: true }),
               onEdit: editFollowup,
-              onEditLoaded: clearFollowupEdit,
             }
-          : undefined
-      }
-      revert={
+          : undefined,
+      revert: () =>
         rolled().length > 0
           ? {
               items: rolled(),
@@ -3293,165 +1929,209 @@ export default function Page() {
               disabled: reverting(),
               onRestore: restore,
             }
-          : undefined
-      }
-      setPromptDockRef={(el) => {
+          : undefined,
+      onResponseSubmit: resumeScroll,
+      openParent: () => {
+        const id = info()?.parentID
+        if (!id) return
+        navigate(
+          params.serverKey
+            ? sessionHref(requireServerKey(params.serverKey), id)
+            : legacySessionHref(sdk().directory, id),
+        )
+      },
+      setPromptRef: (el) => {
+        inputRef = el
+      },
+      setDockRef: (el) => {
         promptDock = el
-      }}
-    />
+      },
+    })
+    return (
+      <SessionComposerRegion
+        controller={controller}
+        promptInput={
+          <PromptInput
+            controls={inputController()}
+            ref={(el) => {
+              inputRef = el
+            }}
+            newSessionWorktree={newSessionWorktree()}
+            onNewSessionWorktreeReset={() => setStore("newSessionWorktree", "main")}
+            onSubmit={() => {
+              comments.clear()
+              resumeScroll()
+            }}
+            edit={editingFollowup()}
+            onEditLoaded={clearFollowupEdit}
+            shouldQueue={queueEnabled}
+            onQueue={queueFollowup}
+            onAbort={() => {
+              const id = params.id
+              if (!id) return
+              setFollowup("paused", id, true)
+            }}
+          />
+        }
+      />
+    )
+  }
+
+  const mobileTabs = (compact = false, bottom = false) => (
+    <Tabs value={store.mobileTab} class="h-auto">
+      <Tabs.List
+        classList={{
+          "!h-9": compact,
+          "[&::after]:!border-b-0 [&::after]:!border-t [&::after]:!border-border-weak-base": bottom,
+        }}
+      >
+        <Tabs.Trigger
+          value="session"
+          classList={{
+            "!w-1/2 !max-w-none": true,
+            "!border-b-0 !border-t !border-border-weak-base [&:has([data-selected])]:!border-t-transparent": bottom,
+          }}
+          classes={{ button: compact ? "w-full !py-2" : "w-full" }}
+          onClick={() => setStore("mobileTab", "session")}
+        >
+          {language.t("session.tab.session")}
+        </Tabs.Trigger>
+        <Tabs.Trigger
+          value="changes"
+          classList={{
+            "!w-1/2 !max-w-none !border-r-0": true,
+            "!border-b-0 !border-t !border-border-weak-base [&:has([data-selected])]:!border-t-transparent": bottom,
+          }}
+          classes={{ button: compact ? "w-full !py-2" : "w-full" }}
+          onClick={() => setStore("mobileTab", "changes")}
+        >
+          {hasReview()
+            ? language.t("session.review.filesChanged", { count: reviewCount() })
+            : language.t("session.review.change.other")}
+        </Tabs.Trigger>
+      </Tabs.List>
+    </Tabs>
+  )
+  const mobileTabsBottom = createMemo(
+    () => !isDesktop() && settings.general.newLayoutDesigns() && settings.general.mobileTitlebarPosition() === "bottom",
+  )
+
+  const sessionErrorFallback = (error: unknown, reset: () => void) => {
+    createEffect(on(sessionKey, reset, { defer: true }))
+    return <SessionErrorFallback error={error} sessionID={params.id} />
+  }
+
+  const sessionPanelContent = () => (
+    <>
+      {sessionSync() ?? ""}
+      <Show when={!isDesktop() && !!params.id && settings.general.newLayoutDesigns() && !mobileTabsBottom()}>
+        {mobileTabs(true)}
+      </Show>
+      <div class="flex-1 min-h-0 overflow-hidden">
+        <Switch>
+          <Match when={params.id && mobileChanges()}>
+            <div class="relative h-full overflow-hidden">
+              {reviewContent({
+                diffStyle: "unified",
+                classes: {
+                  root: "pb-8 [&_[data-slot=session-review-list]]:pb-0",
+                  header: "px-4 !h-16 !pb-4",
+                  container: "px-4",
+                },
+                loadingClass: "px-4 py-4 text-text-weak",
+                emptyClass: "h-full pb-64 -mt-4 flex flex-col items-center justify-center text-center gap-6",
+              })}
+            </div>
+          </Match>
+          <Match when={params.id}>
+            <Show when={messagesReady() ? params.id : undefined} keyed>
+              {(_id) => (
+                <MessageTimeline
+                  actions={actions}
+                  scroll={ui.scroll}
+                  onResumeScroll={resumeScroll}
+                  setScrollRef={setScrollRef}
+                  onScheduleScrollState={scheduleScrollState}
+                  onAutoScrollHandleScroll={autoScroll.handleScroll}
+                  onMarkScrollGesture={markScrollGesture}
+                  hasScrollGesture={hasScrollGesture}
+                  onUserScroll={markUserScroll}
+                  onHistoryScroll={onHistoryScroll}
+                  onAutoScrollInteraction={autoScroll.handleInteraction}
+                  shouldAnchorBottom={() =>
+                    !location.hash && !store.messageId && !ui.pendingMessage && !autoScroll.userScrolled()
+                  }
+                  centered={centered()}
+                  setContentRef={(el) => {
+                    content = el
+                    autoScroll.contentRef(el)
+
+                    const root = scroller
+                    if (root) scheduleScrollState(root)
+                  }}
+                  userMessages={visibleUserMessages()}
+                  setHistoryAnchor={(handlers) => {
+                    captureHistoryAnchor = handlers.capture
+                    restoreHistoryAnchor = handlers.restore
+                  }}
+                  anchor={anchor}
+                  setRevealMessage={(fn) => {
+                    revealMessage = fn
+                  }}
+                  setScrollToEnd={(fn) => {
+                    scrollToEnd = fn
+                  }}
+                />
+              )}
+            </Show>
+          </Match>
+          <Match when={true}>
+            <NewSessionView worktree={newSessionWorktree()} />
+          </Match>
+        </Switch>
+      </div>
+
+      <Show when={(params.id || !newSessionDesign()) && !mobileChanges()}>{(_) => composerRegion()}</Show>
+      <Show when={!!params.id && mobileTabsBottom()}>{mobileTabs(true, true)}</Show>
+    </>
   )
 
   return (
-    <div class="relative size-full overflow-hidden flex flex-col">
-      {sessionSync() ?? ""}
+    <SessionRouteFrame>
       <SessionHeader />
       <div
-        class="flex-1 min-h-0 flex flex-col md:flex-row "
+        class="flex-1 min-h-0 flex flex-col md:flex-row"
         classList={{
           "gap-2 p-2": settings.general.newLayoutDesigns(),
         }}
       >
-        <Show when={!isDesktop() && !!params.id}>
-          <Tabs value={store.mobileTab} class="h-auto">
-            <Tabs.List>
-              <Tabs.Trigger
-                value="session"
-                class="!w-1/2 !max-w-none"
-                classes={{ button: "w-full" }}
-                onClick={() => setStore("mobileTab", "session")}
-              >
-                {language.t("session.tab.session")}
-              </Tabs.Trigger>
-              <Tabs.Trigger
-                value="changes"
-                class="!w-1/2 !max-w-none !border-r-0"
-                classes={{ button: "w-full" }}
-                onClick={() => setStore("mobileTab", "changes")}
-              >
-                {hasReview()
-                  ? language.t("session.review.filesChanged", { count: reviewCount() })
-                  : language.t("session.review.change.other")}
-              </Tabs.Trigger>
-            </Tabs.List>
-          </Tabs>
-        </Show>
+        <Show when={!isDesktop() && !!params.id && !settings.general.newLayoutDesigns()}>{mobileTabs()}</Show>
 
         <div
           classList={{
             "@container relative shrink-0 flex flex-col min-h-0 h-full flex-1 md:flex-none transition-[width]": true,
             "duration-[240ms] ease-[cubic-bezier(0.22,1,0.36,1)] will-change-[width] motion-reduce:transition-none":
-              !size.active() && !ui.reviewSnap,
+              !size.active() && !ui.reviewSnap && !desktopInlineTerminalOnlyOpen(),
           }}
           style={{
             width: sessionPanelWidth(),
           }}
         >
-          <div
-            classList={{
-              "flex-1 min-h-0 flex flex-col bg-background-stronger": true,
-              "rounded-[10px] overflow-hidden": settings.general.newLayoutDesigns(),
-              "shadow-[var(--v2-elevation-raised)]": settings.general.newLayoutDesigns() && !!params.id,
-            }}
-          >
-            {planSessionControl()}
-            {workflowSessionControl()}
-            <div class="flex-1 min-h-0 overflow-hidden">
-              <Switch>
-                <Match when={params.id && mobileChanges()}>
-                  <div class="relative h-full overflow-hidden">
-                    {reviewContent({
-                      diffStyle: "unified",
-                      classes: {
-                        root: "pb-8",
-                        header: "px-4",
-                        container: "px-4",
-                      },
-                      loadingClass: "px-4 py-4 text-text-weak",
-                      emptyClass: "h-full pb-64 -mt-4 flex flex-col items-center justify-center text-center gap-6",
-                    })}
-                  </div>
-                </Match>
-                <Match when={params.id}>
-                  <Show when={messagesReady() ? params.id : undefined} keyed>
-                    {(_id) => (
-                      <MessageTimeline
-                        actions={actions}
-                        onPlanSave={savePlanBlock}
-                        onPlanContinue={usePlanBlock}
-                        scroll={ui.scroll}
-                        onResumeScroll={resumeScroll}
-                        setScrollRef={setScrollRef}
-                        onScheduleScrollState={scheduleScrollState}
-                        onAutoScrollHandleScroll={autoScroll.handleScroll}
-                        onMarkScrollGesture={markScrollGesture}
-                        hasScrollGesture={hasScrollGesture}
-                        onUserScroll={markUserScroll}
-                        onHistoryScroll={onHistoryScroll}
-                        onAutoScrollInteraction={autoScroll.handleInteraction}
-                        shouldAnchorBottom={() =>
-                          !location.hash && !store.messageId && !ui.pendingMessage && !autoScroll.userScrolled()
-                        }
-                        centered={centered()}
-                        setContentRef={(el) => {
-                          content = el
-                          autoScroll.contentRef(el)
+          {settings.general.newLayoutDesigns() ? (
+            <Show when={sessionPanelKey()} keyed>
+              {(_) => (
+                <SessionPanelFrame newLayout raised={!!params.id}>
+                  <ErrorBoundary fallback={sessionErrorFallback}>{sessionPanelContent()}</ErrorBoundary>
+                </SessionPanelFrame>
+              )}
+            </Show>
+          ) : (
+            <SessionPanelFrame newLayout={false} raised={!!params.id}>
+              {sessionPanelContent()}
+            </SessionPanelFrame>
+          )}
 
-                          const root = scroller
-                          if (root) scheduleScrollState(root)
-                        }}
-                        userMessages={visibleUserMessages()}
-                        setHistoryAnchor={(handlers) => {
-                          captureHistoryAnchor = handlers.capture
-                          restoreHistoryAnchor = handlers.restore
-                        }}
-                        anchor={anchor}
-                        setRevealMessage={(fn) => {
-                          revealMessage = fn
-                        }}
-                        setScrollToEnd={(fn) => {
-                          scrollToEnd = fn
-                        }}
-                      />
-                    )}
-                  </Show>
-                </Match>
-                <Match when={true}>
-                  <Show
-                    when={newSessionDesign()}
-                    fallback={
-                      <NewSessionView
-                        worktree={newSessionWorktree()}
-                        workflowPending={startWorkflowMutation.isPending}
-                        onStartWorkflow={openStartWorkflowDialog}
-                      />
-                    }
-                  >
-                    <NewSessionDesignView>
-                      <div class="flex flex-col gap-3">
-                        <div class="flex justify-center">
-                          <Button
-                            type="button"
-                            size="large"
-                            variant="secondary"
-                            icon="branch"
-                            disabled={startWorkflowMutation.isPending}
-                            onClick={openStartWorkflowDialog}
-                          >
-                            {language.t("session.workflow.start")}
-                          </Button>
-                        </div>
-                        {composerRegion("inline")}
-                      </div>
-                    </NewSessionDesignView>
-                  </Show>
-                </Match>
-              </Switch>
-            </div>
-
-            <Show when={params.id || !newSessionDesign()}>{composerRegion("dock")}</Show>
-          </div>
-
-          <Show when={desktopReviewOpen()}>
+          <Show when={desktopSessionResizeOpen()}>
             <div onPointerDown={() => size.start()}>
               <ResizeHandle
                 classList={{
@@ -3470,22 +2150,72 @@ export default function Page() {
           </Show>
         </div>
 
-        <SessionSidePanel
-          canReview={canReview}
-          diffs={reviewDiffs}
-          diffsReady={reviewReady}
-          empty={reviewEmptyText}
-          hasReview={hasReview}
-          reviewCount={reviewCount}
-          reviewPanel={reviewPanel}
-          activeDiff={tree.activeDiff}
-          focusReviewDiff={focusReviewDiff}
-          reviewSnap={ui.reviewSnap}
-          size={size}
-        />
+        <Show when={!newSessionDesign()}>
+          <SessionSidePanel
+            canReview={canReview}
+            diffs={reviewDiffs}
+            diffsReady={reviewReady}
+            empty={reviewEmptyText}
+            hasReview={hasReview}
+            reviewCount={reviewCount}
+            reviewPanel={reviewPanel}
+            activeDiff={tree.activeDiff}
+            focusReviewDiff={focusReviewDiff}
+            reviewSnap={ui.reviewSnap}
+            size={size}
+          />
+        </Show>
+        <Show when={newSessionDesign()}>
+          <Show when={isDesktop() ? desktopV2PanelLayout().visible : terminalOpen()}>
+            <div class="min-w-0 h-full flex flex-1 flex-col">
+              <Show when={isDesktop() && (desktopV2ReviewOpen() || desktopFileTreeOpen())}>
+                <div class="min-h-0 flex-1">
+                  <SessionSidePanel
+                    canReview={canReview}
+                    diffs={reviewDiffs}
+                    diffsReady={reviewReady}
+                    empty={reviewEmptyText}
+                    hasReview={hasReview}
+                    reviewCount={reviewCount}
+                    reviewPanel={reviewPanelV2}
+                    activeDiff={tree.activeDiff}
+                    focusReviewDiff={focusReviewDiff}
+                    reviewSnap={ui.reviewSnap}
+                    size={size}
+                    stacked={desktopV2PanelLayout().stacked}
+                  />
+                </div>
+              </Show>
+              <Show when={desktopV2PanelLayout().stacked}>
+                <div class="relative h-2 shrink-0" onPointerDown={() => size.start()}>
+                  <ResizeHandle
+                    class="!relative !inset-auto !h-full !w-full !transform-none"
+                    direction="vertical"
+                    size={layout.terminal.height()}
+                    min={100}
+                    max={typeof window === "undefined" ? 600 : window.innerHeight * 0.6}
+                    collapseThreshold={50}
+                    onResize={(height) => {
+                      size.touch()
+                      layout.terminal.resize(height)
+                    }}
+                    onCollapse={() => view().terminal.close()}
+                  />
+                </div>
+              </Show>
+              <Show when={terminalOpen()}>
+                <div class="min-h-0 flex-1">
+                  <TerminalPanelV2 stacked={desktopV2PanelLayout().stacked} />
+                </div>
+              </Show>
+            </div>
+          </Show>
+        </Show>
       </div>
 
-      <TerminalPanel />
-    </div>
+      <Show when={!newSessionDesign()}>
+        <TerminalPanel />
+      </Show>
+    </SessionRouteFrame>
   )
 }

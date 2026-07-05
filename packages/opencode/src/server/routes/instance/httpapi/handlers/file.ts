@@ -2,7 +2,7 @@ import * as InstanceState from "@/effect/instance-state"
 import { FileSystem } from "@opencode-ai/core/filesystem"
 import * as FileIgnore from "@opencode-ai/core/filesystem/ignore"
 import * as PlanFile from "@opencode-ai/core/filesystem/plan"
-import { LocationServiceMap } from "@opencode-ai/core/location-layer"
+import { LocationServiceMap, locationServiceMapLayer } from "@opencode-ai/core/location-services"
 import { Ripgrep } from "@opencode-ai/core/ripgrep"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import { Location } from "@opencode-ai/core/location"
@@ -16,7 +16,7 @@ import { InstanceHttpApi } from "../api"
 export const fileHandlers = HttpApiBuilder.group(InstanceHttpApi, "file", (handlers) =>
   Effect.gen(function* () {
     const ripgrep = yield* Ripgrep.Service
-    const locations = yield* LocationServiceMap
+    const locations = yield* LocationServiceMap.Service
 
     const filesystem = Effect.fnUntraced(function* <A, E, R>(effect: Effect.Effect<A, E, R>) {
       return yield* effect.pipe(
@@ -27,7 +27,9 @@ export const fileHandlers = HttpApiBuilder.group(InstanceHttpApi, "file", (handl
     })
 
     const ignorePath = (instance: { directory: string; worktree: string }) =>
-      FileIgnore.projectPath(instance.worktree === path.parse(instance.worktree).root ? instance.directory : instance.worktree)
+      FileIgnore.projectPath(
+        instance.worktree === path.parse(instance.worktree).root ? instance.directory : instance.worktree,
+      )
 
     const ignoreGet = Effect.fn("FileHttpApi.ignoreGet")(function* () {
       const instance = yield* InstanceState.context
@@ -46,8 +48,9 @@ export const fileHandlers = HttpApiBuilder.group(InstanceHttpApi, "file", (handl
     const ignoreUpdate = Effect.fn("FileHttpApi.ignoreUpdate")(function* (ctx: { payload: { content: string } }) {
       const instance = yield* InstanceState.context
       const fs = yield* FSUtil.Service
+      const root = instance.worktree === path.parse(instance.worktree).root ? instance.directory : instance.worktree
       const file = ignorePath(instance)
-      if (!FSUtil.contains(instance.worktree === path.parse(instance.worktree).root ? instance.directory : instance.worktree, file)) {
+      if (!FSUtil.contains(root, file)) {
         return yield* Effect.die(new Error("Access denied: ignore file path escapes project directory"))
       }
       yield* fs.writeWithDirs(file, ctx.payload.content).pipe(Effect.orDie)
@@ -157,6 +160,10 @@ export const fileHandlers = HttpApiBuilder.group(InstanceHttpApi, "file", (handl
       )
     })
 
+    const status = Effect.fn("FileHttpApi.status")(function* () {
+      return []
+    })
+
     const savePlan = Effect.fn("FileHttpApi.savePlan")(function* (ctx: {
       payload: { title?: string; content: string }
     }) {
@@ -170,10 +177,6 @@ export const fileHandlers = HttpApiBuilder.group(InstanceHttpApi, "file", (handl
       )
     })
 
-    const status = Effect.fn("FileHttpApi.status")(function* () {
-      return []
-    })
-
     return handlers
       .handle("findText", findText)
       .handle("findFile", findFile)
@@ -185,4 +188,4 @@ export const fileHandlers = HttpApiBuilder.group(InstanceHttpApi, "file", (handl
       .handle("ignoreUpdate", ignoreUpdate)
       .handle("status", status)
   }),
-).pipe(Layer.provide(LocationServiceMap.layer))
+).pipe(Layer.provide(locationServiceMapLayer))

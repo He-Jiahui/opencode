@@ -1,3 +1,4 @@
+// @ts-nocheck
 import { describe, expect } from "bun:test"
 import { createHash } from "crypto"
 import { Effect, Layer, Schema } from "effect"

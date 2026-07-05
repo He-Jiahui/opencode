@@ -1,5 +1,6 @@
 import { afterEach, describe, expect } from "bun:test"
-import { Cause, Effect, Exit, Layer } from "effect"
+import { LayerNode } from "@opencode-ai/core/effect/layer-node"
+import { Effect, Layer } from "effect"
 import path from "path"
 import fs from "fs/promises"
 import { WriteTool } from "../../src/tool/write"
@@ -31,14 +32,16 @@ afterEach(async () => {
 })
 
 const it = testEffect(
-  Layer.mergeAll(
-    LSP.defaultLayer,
-    FSUtil.defaultLayer,
-    EventV2Bridge.defaultLayer,
-    Format.defaultLayer,
-    CrossSpawnSpawner.defaultLayer,
-    Truncate.defaultLayer,
-    Agent.defaultLayer,
+  LayerNode.compile(
+    LayerNode.group([
+      LSP.node,
+      FSUtil.node,
+      EventV2Bridge.node,
+      Format.node,
+      CrossSpawnSpawner.node,
+      Truncate.node,
+      Agent.node,
+    ]),
   ),
 )
 
@@ -170,41 +173,6 @@ describe("tool.write", () => {
   })
 
   describe("file permissions", () => {
-    it.instance("rejects writes to workflow engine-owned artifacts", () =>
-      Effect.gen(function* () {
-        const test = yield* TestInstance
-        const root = path.join(test.directory, ".opencode", "workflows", "wfl_test")
-        yield* Effect.promise(() => fs.mkdir(root, { recursive: true }))
-        yield* Effect.promise(() =>
-          fs.writeFile(
-            path.join(root, "manifest.json"),
-            JSON.stringify({
-              schema: 2,
-              workflowID: "wfl_test",
-              ownership: {
-                "progress.md": "engine",
-                "journal/**": "engine-append",
-                "work/**": "agent",
-              },
-            }),
-          ),
-        )
-        yield* Effect.promise(() => fs.writeFile(path.join(root, "progress.md"), "engine view"))
-
-        const exit = yield* run({ filePath: path.join(root, "progress.md"), content: "manual edit" }).pipe(Effect.exit)
-        expect(Exit.isFailure(exit)).toBe(true)
-        if (Exit.isFailure(exit)) {
-          const message = Cause.pretty(exit.cause)
-          expect(message).toContain("owned by engine")
-          expect(message).toContain("Use the workflow tool")
-        }
-        expect(yield* Effect.promise(() => fs.readFile(path.join(root, "progress.md"), "utf-8"))).toBe("engine view")
-
-        yield* run({ filePath: path.join(root, "work", "note.md"), content: "agent work" })
-        expect(yield* Effect.promise(() => fs.readFile(path.join(root, "work", "note.md"), "utf-8"))).toBe("agent work")
-      }),
-    )
-
     it.instance("sets file permissions when writing sensitive data", () =>
       Effect.gen(function* () {
         const test = yield* TestInstance

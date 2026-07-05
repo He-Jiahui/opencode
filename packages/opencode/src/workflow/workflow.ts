@@ -5,6 +5,7 @@ import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from "fs"
 import { appendFile, cp, mkdir, open, readFile, readdir, rename, rm, stat } from "fs/promises"
 
 import { serviceUse } from "@opencode-ai/core/effect/service-use"
+import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { Bus } from "@/bus"
 import { GlobalBus } from "@/bus/global"
 import { EventV2 } from "@opencode-ai/core/event"
@@ -13754,5 +13755,11 @@ export const defaultLayer = Layer.suspend(() =>
     Layer.provide(SessionPrompt.defaultLayer),
   ),
 )
+
+export const node = LayerNode.make({
+  service: Service,
+  layer,
+  deps: [BackgroundJob.node, Bus.node, EventV2Bridge.node, Session.node, SessionPrompt.node],
+})
 
 export * as Workflow from "./workflow"

@@ -3,12 +3,14 @@ import type {
   Command,
   Config,
   LspStatus,
+  McpResource,
   McpStatus,
   Message,
   Part,
   Path,
   PermissionRequest,
   QuestionRequest,
+  ReferenceInfo,
   Session,
   SessionStatus,
   SnapshotFileDiff,
@@ -17,7 +19,7 @@ import type {
   Workflow,
   WorkflowGraph,
 } from "@opencode-ai/sdk/v2/client"
-import { NormalizedProviderListResponse } from "@opencode-ai/ui/context"
+import { NormalizedProviderListResponse } from "@opencode-ai/session-ui/context"
 import type { Accessor } from "solid-js"
 import type { SetStoreFunction, Store } from "solid-js/store"
 
@@ -36,6 +38,7 @@ export type State = {
   status: "loading" | "partial" | "complete"
   agent: Agent[]
   command: Command[]
+  reference: ReferenceInfo[]
   project: string
   projectMeta: ProjectMeta | undefined
   icon: string | undefined
@@ -71,6 +74,9 @@ export type State = {
   mcp_ready: boolean
   mcp: {
     [name: string]: McpStatus
+  }
+  mcp_resource: {
+    [key: string]: McpResource
   }
   lsp_ready: boolean
   lsp: LspStatus[]

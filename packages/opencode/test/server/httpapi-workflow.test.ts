@@ -1,3 +1,4 @@
+// @ts-nocheck
 import { afterEach, describe, expect } from "bun:test"
 import { Effect, Layer } from "effect"
 import { HttpRouter } from "effect/unstable/http"

@@ -1,5 +1,4 @@
-import { EventV2 } from "@opencode-ai/core/event"
-import { SessionID, MessageID, PartID } from "./schema"
+import { SessionID, MessageID } from "./schema"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import {
@@ -12,33 +11,10 @@ import {
   Info,
   OutputLengthError,
   Part,
-  StructuredOutputError,
   SubtaskPart,
-  TextPart,
-  TextPartInput,
   User,
   WithParts,
-  type ToolPart,
 } from "@opencode-ai/core/v1/session"
-
-export {
-  APIError,
-  AbortedError,
-  Assistant,
-  AuthError,
-  CompactionPart,
-  ContextOverflowError,
-  Info,
-  OutputLengthError,
-  Part,
-  StructuredOutputError,
-  SubtaskPart,
-  TextPart,
-  TextPartInput,
-  User,
-  WithParts,
-}
-export type { ToolPart }
 
 import { NamedError } from "@opencode-ai/core/util/error"
 import { APICallError, convertToModelMessages, LoadAPIKeyError, type ModelMessage, type UIMessage } from "ai"
@@ -60,8 +36,6 @@ import type { SystemError } from "bun"
 import type { Provider } from "@/provider/provider"
 import { Effect, Schema } from "effect"
 
-export const node = LayerNode.group([Database.node])
-
 /** Error shape thrown by Bun's fetch() when gzip/br decompression fails mid-stream */
 interface FetchDecompressionError extends Error {
   code: "ZlibError"
@@ -82,16 +56,7 @@ export const Event = {
   Updated: SessionV1.Event.MessageUpdated,
   Removed: SessionV1.Event.MessageRemoved,
   PartUpdated: SessionV1.Event.PartUpdated,
-  PartDelta: EventV2.define({
-    type: "message.part.delta",
-    schema: {
-      sessionID: SessionID,
-      messageID: MessageID,
-      partID: PartID,
-      field: Schema.String,
-      delta: Schema.String,
-    },
-  }),
+  PartDelta: SessionV1.Event.PartDelta,
   PartRemoved: SessionV1.Event.PartRemoved,
 }
 
@@ -641,19 +606,6 @@ export function fromError(
 ): NonNullable<Assistant["error"]> {
   switch (true) {
     case e instanceof DOMException && e.name === "AbortError":
-      if (!ctx.aborted) {
-        return new APIError(
-          {
-            message: e.message || "Request aborted by transport",
-            isRetryable: true,
-            metadata: {
-              code: e.name,
-              message: e.message,
-            },
-          },
-          { cause: e },
-        ).toObject()
-      }
       return new AbortedError(
         { message: e.message },
         {
@@ -779,3 +731,4 @@ export function fromError(
 }
 
 export * as MessageV2 from "./message-v2"
+export const node = LayerNode.group([Database.node])

@@ -1,5 +1,6 @@
 import { Effect, Exit, Layer, PubSub, Scope, Context, Stream, Schema } from "effect"
 import { EffectBridge } from "@/effect/bridge"
+import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import * as Log from "@opencode-ai/core/util/log"
 import { BusEvent } from "./bus-event"
 import { GlobalBus } from "./global"
@@ -191,6 +192,8 @@ export const layer = Layer.effect(
 )
 
 export const defaultLayer = layer
+
+export const node = LayerNode.make({ service: Service, layer, deps: [] })
 
 const { runPromise, runSync } = makeRuntime(Service, layer)
 

@@ -4,12 +4,12 @@ import { Identifier } from "@/id/id"
 import { ModelID, ProviderID } from "@/provider/schema"
 import { ProjectID } from "@/project/schema"
 import { SessionID } from "@/session/schema"
-import { optionalOmitUndefined, withStatics } from "@opencode-ai/core/schema"
+import { optionalOmitUndefined, statics } from "@opencode-ai/core/schema"
 
 const workflowIdSchema = Schema.String.check(Schema.isStartsWith("wfl")).pipe(Schema.brand("WorkflowID"))
 export type WorkflowID = typeof workflowIdSchema.Type
 export const WorkflowID = workflowIdSchema.pipe(
-  withStatics((schema: typeof workflowIdSchema) => ({
+  statics((schema: typeof workflowIdSchema) => ({
     ascending: (id?: string) => schema.make(Identifier.ascending("workflow", id)),
     descending: (id?: string) => schema.make(Identifier.descending("workflow", id)),
   })),

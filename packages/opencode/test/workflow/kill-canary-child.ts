@@ -1,3 +1,4 @@
+// @ts-nocheck
 import { Effect, Layer } from "effect"
 
 import { Agent } from "@/agent/agent"

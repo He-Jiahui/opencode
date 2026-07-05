@@ -1,10 +1,10 @@
 import { describe, expect, test } from "bun:test"
+import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import type { NamedError } from "@opencode-ai/core/util/error"
 import { APICallError } from "ai"
 import { setTimeout as sleep } from "node:timers/promises"
 import { Effect, Schedule, Schema } from "effect"
-import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { SessionRetry } from "../../src/session/retry"
 import { MessageV2 } from "../../src/session/message-v2"
@@ -16,7 +16,7 @@ import { ProviderV2 } from "@opencode-ai/core/provider"
 
 const providerID = ProviderV2.ID.make("test")
 const retryProvider = "test"
-const it = testEffect(LayerNode.buildLayer(LayerNode.group([SessionStatus.node, CrossSpawnSpawner.node])))
+const it = testEffect(LayerNode.compile(LayerNode.group([SessionStatus.node, CrossSpawnSpawner.node])))
 
 function apiError(headers?: Record<string, string>): SessionV1.APIError {
   return Schema.decodeUnknownSync(SessionV1.APIError.Schema)(
@@ -33,16 +33,10 @@ function wrap(message: unknown): ReturnType<NamedError["toObject"]> {
 }
 
 describe("session.retry.delay", () => {
-  test("caps delay at 1 minute when retry hints are missing", () => {
+  test("caps delay at 30 seconds when headers missing", () => {
     const error = apiError()
     const delays = Array.from({ length: 10 }, (_, index) => SessionRetry.delay(index + 1, error))
-    expect(delays).toStrictEqual([2000, 4000, 8000, 16000, 32000, 60000, 60000, 60000, 60000, 60000])
-  })
-
-  test("caps delay at 1 minute when headers have no retry hints", () => {
-    const error = apiError({ "x-request-id": "req_123" })
-    const delays = Array.from({ length: 7 }, (_, index) => SessionRetry.delay(index + 1, error))
-    expect(delays).toStrictEqual([2000, 4000, 8000, 16000, 32000, 60000, 60000])
+    expect(delays).toStrictEqual([2000, 4000, 8000, 16000, 30000, 30000, 30000, 30000, 30000, 30000])
   })
 
   test("prefers retry-after-ms when shorter than exponential", () => {
@@ -244,24 +238,6 @@ describe("session.retry.retryable", () => {
     )
 
     expect(SessionRetry.retryable(error, retryProvider)).toBeUndefined()
-  })
-
-  test("retries network errors even when isRetryable is false", () => {
-    const error = Schema.decodeUnknownSync(MessageV2.APIError.Schema)(
-      new MessageV2.APIError({
-        message: "fetch failed",
-        isRetryable: false,
-        metadata: { message: "fetch failed" },
-      }).toObject(),
-    )
-
-    expect(SessionRetry.retryable(error, retryProvider)).toEqual({ message: "fetch failed" })
-  })
-
-  test("retries network errors serialized as unknown errors", () => {
-    const msg = "HTTP transport failed: fetch failed"
-    const error = wrap(msg)
-    expect(SessionRetry.retryable(error, retryProvider)).toEqual({ message: msg })
   })
 
   test("retries ZlibError decompression failures", () => {

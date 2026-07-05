@@ -21,6 +21,7 @@ export interface SoundSettings {
 export interface Settings {
   general: {
     autoSave: boolean
+    defaultPrompt: string
     releaseNotes: boolean
     followup: "queue" | "steer"
     showFileTree: boolean
@@ -31,9 +32,8 @@ export interface Settings {
     showReasoningSummaries: boolean
     shellToolPartsExpanded: boolean
     editToolPartsExpanded: boolean
-    showSessionProgressBar: boolean
     showCustomAgents: boolean
-    defaultPrompt: string
+    mobileTitlebarPosition: "top" | "bottom"
     newLayoutDesigns?: boolean
   }
   appearance: {
@@ -107,6 +107,7 @@ export function terminalFontFamily(font: string | undefined) {
 const defaultSettings: Settings = {
   general: {
     autoSave: true,
+    defaultPrompt: "",
     releaseNotes: true,
     followup: "steer",
     showFileTree: false,
@@ -117,9 +118,8 @@ const defaultSettings: Settings = {
     showReasoningSummaries: false,
     shellToolPartsExpanded: false,
     editToolPartsExpanded: false,
-    showSessionProgressBar: true,
     showCustomAgents: false,
-    defaultPrompt: "",
+    mobileTitlebarPosition: "top",
   },
   appearance: {
     fontSize: 14,
@@ -187,6 +187,10 @@ export const { use: useSettings, provider: SettingsProvider } = createSimpleCont
         setAutoSave(value: boolean) {
           setStore("general", "autoSave", value)
         },
+        defaultPrompt: withFallback(() => store.general?.defaultPrompt, defaultSettings.general.defaultPrompt),
+        setDefaultPrompt(value: string) {
+          setStore("general", "defaultPrompt", value)
+        },
         releaseNotes: withFallback(() => store.general?.releaseNotes, defaultSettings.general.releaseNotes),
         setReleaseNotes(value: boolean) {
           setStore("general", "releaseNotes", value)
@@ -239,22 +243,18 @@ export const { use: useSettings, provider: SettingsProvider } = createSimpleCont
         setEditToolPartsExpanded(value: boolean) {
           setStore("general", "editToolPartsExpanded", value)
         },
-        showSessionProgressBar: withFallback(
-          () => store.general?.showSessionProgressBar,
-          defaultSettings.general.showSessionProgressBar,
-        ),
-        setShowSessionProgressBar(value: boolean) {
-          setStore("general", "showSessionProgressBar", value)
-        },
         showCustomAgents,
         setShowCustomAgents(value: boolean) {
           setStore("general", "showCustomAgents", value)
         },
-        defaultPrompt: withFallback(() => store.general?.defaultPrompt, defaultSettings.general.defaultPrompt),
-        setDefaultPrompt(value: string) {
-          setStore("general", "defaultPrompt", value)
+        mobileTitlebarPosition: withFallback(
+          () => store.general?.mobileTitlebarPosition,
+          defaultSettings.general.mobileTitlebarPosition,
+        ),
+        setMobileTitlebarPosition(value: "top" | "bottom") {
+          setStore("general", "mobileTitlebarPosition", value)
         },
-        newLayoutDesigns: withFallback(() => store.general?.newLayoutDesigns, newLayoutDesignsDefault),
+        newLayoutDesigns,
         setNewLayoutDesigns(value: boolean) {
           setStore("general", "newLayoutDesigns", value)
         },

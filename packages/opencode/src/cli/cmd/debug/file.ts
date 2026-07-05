@@ -1,16 +1,16 @@
 import { EOL } from "os"
 import { Effect } from "effect"
 import { FileSystem } from "@opencode-ai/core/filesystem"
+import { LocationServiceMap, locationServiceMapLayer } from "@opencode-ai/core/location-services"
 import { Location } from "@opencode-ai/core/location"
-import { LocationServiceMap } from "@opencode-ai/core/location-layer"
 import { AbsolutePath, RelativePath } from "@opencode-ai/core/schema"
 import { effectCmd } from "../../effect-cmd"
 import { cmd } from "../cmd"
 
 const filesystem = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
   effect.pipe(
-    Effect.provide(LocationServiceMap.get(Location.Ref.make({ directory: AbsolutePath.make(process.cwd()) }))),
-    Effect.provide(LocationServiceMap.layer),
+    Effect.provide(LocationServiceMap.Service.get(Location.Ref.make({ directory: AbsolutePath.make(process.cwd()) }))),
+    Effect.provide(locationServiceMapLayer),
   )
 
 const FileSearchCommand = effectCmd({
@@ -67,6 +67,7 @@ const FileListCommand = effectCmd({
 export const FileCommand = cmd({
   command: "file",
   describe: "file system debugging utilities",
-  builder: (yargs) => yargs.command(FileReadCommand).command(FileListCommand).command(FileSearchCommand).demandCommand(),
+  builder: (yargs) =>
+    yargs.command(FileReadCommand).command(FileListCommand).command(FileSearchCommand).demandCommand(),
   async handler() {},
 })

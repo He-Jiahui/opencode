@@ -33,6 +33,7 @@ import { useArgs } from "./args"
 import { batch, onMount } from "solid-js"
 import path from "path"
 import { useKV } from "./kv"
+import { usePermission } from "./permission"
 
 const emptyConsoleState: ConsoleState = {
   consoleManagedProviders: [],
@@ -61,6 +62,7 @@ export const {
   init: () => {
     const startup = useTuiStartup()
     const kv = useKV()
+    const permission = usePermission()
     const [store, setStore] = createStore<{
       status: "loading" | "partial" | "complete"
       provider: Provider[]
@@ -173,7 +175,7 @@ export const {
         .then((x) => (x.data ?? []).toSorted((a, b) => a.id.localeCompare(b.id)))
     }
 
-    event.subscribe((event, { workspace }) => {
+    event.subscribe((event, { directory, workspace }) => {
       switch (event.type) {
         case "server.instance.disposed":
           void bootstrap()
@@ -195,6 +197,15 @@ export const {
 
         case "permission.asked": {
           const request = event.properties
+          if (permission.mode === "auto") {
+            void sdk.client.permission.reply({
+              requestID: request.id,
+              reply: "once",
+              directory,
+              workspace,
+            })
+            break
+          }
           const requests = store.permission[request.sessionID]
           if (!requests) {
             setStore("permission", request.sessionID, [request])
@@ -311,7 +322,7 @@ export const {
 
         case "workflow.created":
         case "workflow.updated": {
-          const info = event.properties.info
+          const info = event.properties.info as Workflow
           const result = search(store.workflow, info.id, (workflow) => workflow.id)
           if (result.found) {
             setStore("workflow", result.index, reconcile(info))
@@ -327,9 +338,10 @@ export const {
         }
 
         case "workflow.graph.updated": {
-          const graph = event.properties.graph
+          const graph = event.properties.graph as WorkflowGraph | undefined
+          const workflowID = event.properties.workflowID as string
           if (!graph) {
-            void sdk.client.workflow.graph({ workflowID: event.properties.workflowID }).then((result) => {
+            void sdk.client.workflow.graph({ workflowID }).then((result) => {
               if (!result.data) return
               setStore("workflow_graph", result.data.workflow.id, reconcile(result.data))
               const index = search(store.workflow, result.data.workflow.id, (workflow) => workflow.id)

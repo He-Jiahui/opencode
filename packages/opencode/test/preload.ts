@@ -87,6 +87,24 @@ delete process.env["OTEL_RESOURCE_ATTRIBUTES"]
 process.env["OPENCODE_DB"] = ":memory:"
 
 // Now safe to import from src/
+const { Effect } = await import("effect")
+const { Database } = await import("../src/storage/db")
+const coreSchema = (await import("@opencode-ai/core/database/schema.gen")).default
 const { initProjectors } = await import("../src/server/projectors")
+
+const client = Database.Client()
+const hasSessionTable = !!client.$client
+  .prepare("SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?")
+  .get("session")
+if (!hasSessionTable) {
+  await Effect.runPromise(
+    coreSchema.up({
+      run: (statement: string) =>
+        Effect.sync(() => {
+          client.$client.exec(statement)
+        }),
+    } as unknown as Parameters<typeof coreSchema.up>[0]),
+  )
+}
 
 initProjectors()

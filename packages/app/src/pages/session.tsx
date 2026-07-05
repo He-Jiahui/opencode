@@ -169,7 +169,7 @@ const workflowModelWhitelistRoles = [
   ["expert", "session.workflow.staffing.expert"],
 ] as const
 const workflowStaffingValue = (value: number | undefined, fallback: number) =>
-  Number.isFinite(value) ? Math.max(1, Math.min(12, Math.trunc(value!))) : fallback
+  Number.isFinite(value) ? Math.max(1, Math.min(64, Math.trunc(value!))) : fallback
 const workflowModelWeight = (value: unknown) => {
   const parsed = Number(value)
   if (!Number.isFinite(parsed)) return 50
@@ -2386,11 +2386,11 @@ export default function Page() {
                         <div class="grid grid-cols-2 gap-2 md:grid-cols-3">
                           <For each={workflowStaffingFields}>
                             {([key, label]) => (
-                              <TextField
-                                type="number"
-                                min="1"
-                                max="12"
-                                step="1"
+                                <TextField
+                                  type="number"
+                                  min="1"
+                                  max="64"
+                                  step="1"
                                 label={language.t(label)}
                                 value={String(workflowStaffing[key])}
                                 onChange={(value) =>

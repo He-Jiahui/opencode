@@ -27,6 +27,7 @@ import { Provider } from "@/provider/provider"
 
 import { WebSearchTool } from "./websearch"
 import { WorkflowTool } from "./workflow"
+import { WorkflowMessageTool } from "./workflow-message"
 import { LspTool } from "./lsp"
 import * as Truncate from "./truncate"
 import { ApplyPatchTool } from "./apply_patch"
@@ -101,6 +102,7 @@ export const layer = Layer.effect(
     const webfetch = yield* WebFetchTool
     const websearch = yield* WebSearchTool
     const workflowtool = yield* WorkflowTool
+    const workflowmessagetool = yield* WorkflowMessageTool
     const shell = yield* ShellTool
     const globtool = yield* GlobTool
     const writetool = yield* WriteTool
@@ -211,6 +213,7 @@ export const layer = Layer.effect(
           todo: Tool.init(todo),
           search: Tool.init(websearch),
           workflow: Tool.init(workflowtool),
+          workflowMessage: Tool.init(workflowmessagetool),
           skill: Tool.init(skilltool),
           patch: Tool.init(patchtool),
           question: Tool.init(question),
@@ -232,9 +235,10 @@ export const layer = Layer.effect(
             tool.task,
             tool.fetch,
             tool.todo,
-            tool.search,
-            tool.workflow,
-            tool.skill,
+          tool.search,
+          tool.workflow,
+          tool.workflowMessage,
+          tool.skill,
             tool.patch,
             ...(flags.experimentalLspTool ? [tool.lsp] : []),
             ...(flags.experimentalPlanMode && flags.client === "cli" ? [tool.plan] : []),

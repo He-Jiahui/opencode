@@ -18,7 +18,7 @@ export const WorkflowID = workflowIdSchema.pipe(
 export const WorkflowMilestoneID = Schema.NonEmptyString.pipe(Schema.brand("WorkflowMilestoneID"))
 export type WorkflowMilestoneID = typeof WorkflowMilestoneID.Type
 
-export const WorkflowGroupKind = Schema.Literals(["ordered", "parallel"])
+export const WorkflowGroupKind = Schema.Literals(["ordered", "parallel", "pipeline"])
 export type WorkflowGroupKind = typeof WorkflowGroupKind.Type
 
 export const WorkflowRole = Schema.Literals([
@@ -32,7 +32,7 @@ export const WorkflowRole = Schema.Literals([
 ])
 export type WorkflowRole = typeof WorkflowRole.Type
 
-const WorkflowStaffLimit = Schema.Int.check(Schema.isGreaterThanOrEqualTo(0), Schema.isLessThanOrEqualTo(12))
+const WorkflowStaffLimit = Schema.Int.check(Schema.isGreaterThanOrEqualTo(0), Schema.isLessThanOrEqualTo(64))
 
 export const WorkflowStaffingConfig = Schema.Struct({
   mainPM: Schema.optional(WorkflowStaffLimit),
@@ -43,6 +43,15 @@ export const WorkflowStaffingConfig = Schema.Struct({
   expert: Schema.optional(WorkflowStaffLimit),
 }).annotate({ identifier: "WorkflowStaffingConfig" })
 export type WorkflowStaffingConfig = typeof WorkflowStaffingConfig.Type
+
+export const WorkflowSchedulingMode = Schema.Literals(["eager", "staged", "economical"])
+export type WorkflowSchedulingMode = typeof WorkflowSchedulingMode.Type
+
+export const WorkflowSchedulingConfig = Schema.Struct({
+  mode: Schema.optional(WorkflowSchedulingMode),
+  maxActive: Schema.optional(Schema.Int.check(Schema.isGreaterThanOrEqualTo(1), Schema.isLessThanOrEqualTo(64))),
+}).annotate({ identifier: "WorkflowSchedulingConfig" })
+export type WorkflowSchedulingConfig = typeof WorkflowSchedulingConfig.Type
 
 const WorkflowModelFields = {
   providerID: ProviderID,
@@ -73,6 +82,9 @@ export type WorkflowModelWhitelistConfig = typeof WorkflowModelWhitelistConfig.T
 export const WorkflowMemberStatus = Schema.Literals(["active", "paused"])
 export type WorkflowMemberStatus = typeof WorkflowMemberStatus.Type
 
+export const WorkflowMemberAvailability = Schema.Literals(["idle", "working", "blocked_waiting"])
+export type WorkflowMemberAvailability = typeof WorkflowMemberAvailability.Type
+
 export const WorkflowMember = Schema.Struct({
   id: Schema.String,
   workflowID: WorkflowID,
@@ -82,6 +94,10 @@ export const WorkflowMember = Schema.Struct({
   sessionID: SessionID,
   capacity: Schema.Number,
   status: WorkflowMemberStatus,
+  availability: Schema.optional(WorkflowMemberAvailability),
+  currentFocus: Schema.optional(Schema.String),
+  blockers: Schema.optional(Schema.Array(Schema.String)),
+  progressNote: Schema.optional(Schema.String),
   model: Schema.optional(WorkflowModel),
   modelWeight: Schema.optional(Schema.Finite.check(Schema.isGreaterThanOrEqualTo(0), Schema.isLessThanOrEqualTo(100))),
   modelCacheUntil: Schema.optional(Schema.Finite),
@@ -110,6 +126,12 @@ export const WorkflowMilestoneStatus = Schema.Literals([
 ])
 export type WorkflowMilestoneStatus = typeof WorkflowMilestoneStatus.Type
 
+export const WorkflowMilestoneReview = Schema.Literals(["required", "skip"])
+export type WorkflowMilestoneReview = typeof WorkflowMilestoneReview.Type
+
+export const WorkflowMilestoneWaitingFor = Schema.Literals(["pipeline_items", "staffing", "scheduling"])
+export type WorkflowMilestoneWaitingFor = typeof WorkflowMilestoneWaitingFor.Type
+
 export const WorkflowStatus = Schema.Literals([
   "pending",
   "running",
@@ -134,7 +156,7 @@ export const WorkflowSessionRef = Schema.Struct({
 }).annotate({ identifier: "WorkflowSessionRef" })
 export type WorkflowSessionRef = typeof WorkflowSessionRef.Type
 
-export const WorkflowConsultationStatus = Schema.Literals(["pending", "answered", "failed"])
+export const WorkflowConsultationStatus = Schema.Literals(["pending", "answered", "expired", "failed"])
 export type WorkflowConsultationStatus = typeof WorkflowConsultationStatus.Type
 
 export const WorkflowCommunicationTiming = Schema.Literals(["after-task", "interrupt", "temporary-interrupt"])
@@ -160,7 +182,7 @@ export const WorkflowConsultation = Schema.Struct({
 }).annotate({ identifier: "WorkflowConsultation" })
 export type WorkflowConsultationInfo = typeof WorkflowConsultation.Type
 
-export const WorkflowInterventionStatus = Schema.Literals(["queued", "delivered", "blocked", "failed"])
+export const WorkflowInterventionStatus = Schema.Literals(["queued", "delivered", "acked", "blocked", "expired", "failed"])
 export type WorkflowInterventionStatus = typeof WorkflowInterventionStatus.Type
 
 export const WorkflowIntervention = Schema.Struct({
@@ -187,11 +209,14 @@ export type WorkflowStep =
       id: WorkflowMilestoneID
       title?: string
       department?: string
+      review?: WorkflowMilestoneReview
+      waitingFor?: WorkflowMilestoneWaitingFor
       prompt: string
       dependsOn: ReadonlyArray<WorkflowMilestoneID>
     }
   | {
       type: WorkflowGroupKind
+      items?: string
       children: WorkflowStep[]
     }
 
@@ -206,6 +231,8 @@ export const WorkflowMilestone = Schema.Struct({
   id: WorkflowMilestoneID,
   title: Schema.optional(Schema.String),
   department: Schema.optional(Schema.String),
+  review: Schema.optional(WorkflowMilestoneReview),
+  waitingFor: Schema.optional(WorkflowMilestoneWaitingFor),
   prompt: Schema.String,
   dependsOn: Schema.Array(WorkflowMilestoneID),
   status: WorkflowMilestoneStatus,
@@ -229,6 +256,7 @@ export const WorkflowInfo = Schema.Struct({
   xml: Schema.String,
   status: WorkflowStatus,
   staffing: Schema.optional(WorkflowStaffingConfig),
+  scheduling: Schema.optional(WorkflowSchedulingConfig),
   model: Schema.optional(WorkflowModel),
   modelWhitelist: Schema.optional(WorkflowModelWhitelistConfig),
   agent: Schema.optional(Schema.String),

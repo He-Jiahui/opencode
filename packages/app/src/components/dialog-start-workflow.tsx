@@ -69,7 +69,7 @@ const emptyModelWhitelist = (): WorkflowModelWhitelist => ({
 function normalizeLimit(value: string) {
   const parsed = Number(value)
   if (!Number.isFinite(parsed)) return 1
-  return Math.max(1, Math.min(12, Math.trunc(parsed)))
+  return Math.max(1, Math.min(64, Math.trunc(parsed)))
 }
 
 function normalizeWeight(value: string) {
@@ -203,7 +203,7 @@ export function DialogStartWorkflow(props: {
                   <TextField
                     type="number"
                     min="1"
-                    max="12"
+                    max="64"
                     step="1"
                     label={language.t(label)}
                     value={String(store.staffing[key])}

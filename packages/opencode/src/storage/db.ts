@@ -111,6 +111,24 @@ function sqlString(value: string) {
   return `'${value.replaceAll("'", "''")}'`
 }
 
+function tableExists(db: Client, table: string) {
+  return !!db.$client.prepare("SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?").get(table)
+}
+
+function columnExists(db: Client, table: string, column: string) {
+  return !!db.$client.prepare("SELECT 1 FROM pragma_table_info(?) WHERE name = ?").get(table, column)
+}
+
+function skipLegacyMigration(db: Client, name: string) {
+  if (name === "20260511173437_session-metadata") return !tableExists(db, "session") || columnExists(db, "session", "metadata")
+  if (name === "20260527120000_agent_workflow") return !tableExists(db, "session") || tableExists(db, "workflow")
+  return false
+}
+
+function pendingMigrations(db: Client, entries: Journal) {
+  return entries.filter((entry) => !skipLegacyMigration(db, entry.name))
+}
+
 function latestBackupAt(dir: string) {
   if (!existsSync(dir)) return 0
   return readdirSync(dir, { withFileTypes: true })
@@ -205,19 +223,19 @@ export const Client = Object.assign(
       typeof OPENCODE_MIGRATIONS !== "undefined"
         ? OPENCODE_MIGRATIONS
         : migrations(path.join(import.meta.dirname, "../../migration"))
-    if (entries.length > 0) {
+    const pending = flags.skipMigrations
+      ? entries.map((entry) => ({ ...entry, sql: "select 1;" }))
+      : pendingMigrations(db, entries)
+    if (pending.length > 0) {
       log.info("applying migrations", {
-        count: entries.length,
+        count: pending.length,
+        skipped: entries.length - pending.length,
         mode: typeof OPENCODE_MIGRATIONS !== "undefined" ? "bundled" : "dev",
       })
-      if (flags.skipMigrations) {
-        for (const item of entries) {
-          item.sql = "select 1;"
-        }
-      } else {
+      if (!flags.skipMigrations) {
         ensureBackup(db, dbPath, "pre-migration", existing)
       }
-      applyMigrations(db, entries)
+      applyMigrations(db, pending)
     }
 
     client = db

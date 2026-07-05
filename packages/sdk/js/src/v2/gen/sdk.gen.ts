@@ -5382,8 +5382,10 @@ export class Workflow extends HeyApiClient {
       directory?: string
       workspace?: string
       message?: string
+      sourceSessionID?: string
       timing?: "after-task" | "interrupt" | "temporary-interrupt"
       targetRole?: "requester" | "main_pm" | "department_pm" | "executor" | "reviewer" | "tester" | "expert"
+      targetSpecialty?: string
       targetSessionID?: string
     },
     options?: Options<never, ThrowOnError>,
@@ -5397,8 +5399,10 @@ export class Workflow extends HeyApiClient {
             { in: "query", key: "directory" },
             { in: "query", key: "workspace" },
             { in: "body", key: "message" },
+            { in: "body", key: "sourceSessionID" },
             { in: "body", key: "timing" },
             { in: "body", key: "targetRole" },
+            { in: "body", key: "targetSpecialty" },
             { in: "body", key: "targetSessionID" },
           ],
         },

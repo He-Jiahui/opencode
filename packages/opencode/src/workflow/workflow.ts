@@ -1,12 +1,15 @@
 // @ts-nocheck
 import path from "path"
-import { appendFileSync, mkdirSync } from "fs"
-import { appendFile, cp, mkdir, readFile, readdir, stat, writeFile } from "fs/promises"
+import { createHash } from "crypto"
+import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from "fs"
+import { appendFile, cp, mkdir, open, readFile, readdir, rename, rm, stat } from "fs/promises"
 
 import { serviceUse } from "@opencode-ai/core/effect/service-use"
 import { Bus } from "@/bus"
+import { GlobalBus } from "@/bus/global"
 import { EventV2 } from "@opencode-ai/core/event"
 import { EventV2Bridge } from "@/event-v2-bridge"
+import { EffectBridge } from "@/effect/bridge"
 import { InstanceState } from "@/effect/instance-state"
 import { FileWatcher } from "@/file/watcher"
 import { Permission } from "@/permission"
@@ -28,11 +31,22 @@ import {
   SessionMessageTable,
   SessionTable,
 } from "@opencode-ai/core/session/sql"
+import { ProjectTable } from "@opencode-ai/core/project/sql"
 import { InstallationVersion } from "@opencode-ai/core/installation/version"
 
-import { parseWorkflowXml } from "./parse"
-import { readyMilestones } from "./scheduler"
-import { WorkflowToolCommandEvent, type WorkflowToolCommand } from "./command"
+import { parseWorkflowXml, workflowPipelineItemsMissing } from "./parse"
+import { dependencyBlockedMilestones, dependencyUnblockedMilestones, readyMilestones } from "./scheduler"
+import {
+  WorkflowToolCommandEvent,
+  WorkflowToolCommandResultEvent,
+  registerWorkflowMessageSendDispatcher,
+  registerWorkflowToolCommandDispatcher,
+  type WorkflowMessageSendCommand,
+  type WorkflowMessageSendResult,
+  type WorkflowToolCommand,
+  type WorkflowToolCommandResult,
+  type WorkflowToolCommandRejection,
+} from "./command"
 import {
   WorkflowGraph,
   WorkflowGraphEdge,
@@ -45,6 +59,7 @@ import {
   WorkflowMilestoneID,
   WorkflowModelWhitelistConfig,
   type WorkflowModelWhitelistItem,
+  WorkflowSchedulingConfig,
   WorkflowStaffingConfig,
   type WorkflowConsultationInfo,
   type WorkflowDefinition,
@@ -57,13 +72,27 @@ import {
   WorkflowConsultationTable,
   WorkflowEdgeTable,
   WorkflowInterventionTable,
+  WorkflowMessageTable,
   WorkflowMemberTable,
   WorkflowMilestoneTable,
   WorkflowTable,
 } from "./workflow.sql"
 
 const workflowDir = path.join(".opencode", "workflows")
+const workflowManifestFileName = "manifest.json"
 const workflowStateFileName = "workflow-state.json"
+const workflowStateSchemaVersion = 2
+const workflowMessageKinds = ["consultation", "intervention", "handoff", "standup", "report"] as const
+type WorkflowMessageKind = (typeof workflowMessageKinds)[number]
+type WorkflowToolCommandRuntimeResult = {
+  input: WorkflowToolCommand
+  result: {
+    workflowID?: WorkflowID
+    applied: boolean
+    message: string
+    rejection?: WorkflowToolCommandRejection
+  }
+}
 const defaultXml = `<workflow>
   <ordered>
     <milestone id="requirements" title="Clarify requirements" department="product">Clarify the user request, constraints, and acceptance criteria.</milestone>
@@ -71,6 +100,34 @@ const defaultXml = `<workflow>
     <milestone id="verification" title="Verify solution" department="quality">Verify behavior with focused tests and checks.</milestone>
   </ordered>
 </workflow>`
+const workflowConsultationTimeoutMillis = 30 * 60 * 1000
+const workflowInterventionTimeoutMillis = 30 * 60 * 1000
+const workflowWaitingTimeoutMillis = 30 * 60 * 1000
+const workflowMilestoneAttemptLimit = 3
+const workflowResumeDoctorBlockingCodes = new Set([
+  "duplicate_directory",
+  "noncanonical_path",
+  "invalid_state_json",
+  "unsupported_state_version",
+  "missing_manifest",
+  "invalid_manifest_json",
+  "unsupported_manifest_schema",
+  "manifest_workflow_mismatch",
+  "manifest_project_mismatch",
+  "session_state_hash_mismatch",
+])
+const workflowStateDoctorFixCodes = new Set([
+  "missing_state",
+  "invalid_state_json",
+  "unsupported_state_version",
+  "state_workflow_mismatch",
+  "state_status_mismatch",
+  "state_missing_milestone",
+  "milestone_status_mismatch",
+  "missing_session_state",
+  "invalid_session_state_json",
+  "session_state_hash_mismatch",
+])
 const ensureSchemaSql = `
 CREATE TABLE IF NOT EXISTS workflow (
   id text PRIMARY KEY NOT NULL,
@@ -85,6 +142,7 @@ CREATE TABLE IF NOT EXISTS workflow (
   xml text NOT NULL,
   status text NOT NULL,
   staffing text,
+  scheduling text,
   model text,
   model_whitelist text,
   agent text,
@@ -109,6 +167,10 @@ CREATE TABLE IF NOT EXISTS workflow_member (
   session_id text NOT NULL,
   capacity integer DEFAULT 1 NOT NULL,
   status text NOT NULL,
+  availability text,
+  current_focus text,
+  blockers text,
+  progress_note text,
   model text,
   model_weight integer,
   model_cache_until integer,
@@ -125,6 +187,8 @@ CREATE TABLE IF NOT EXISTS workflow_milestone (
   id text NOT NULL,
   title text,
   department text,
+  review text,
+  waiting_for text,
   prompt text NOT NULL,
   depends_on text NOT NULL,
   status text NOT NULL,
@@ -190,6 +254,33 @@ CREATE TABLE IF NOT EXISTS workflow_intervention (
 );
 CREATE INDEX IF NOT EXISTS workflow_intervention_workflow_idx ON workflow_intervention (workflow_id);
 CREATE INDEX IF NOT EXISTS workflow_intervention_target_session_idx ON workflow_intervention (target_session_id);
+CREATE TABLE IF NOT EXISTS workflow_message (
+  workflow_id text NOT NULL,
+  id text NOT NULL,
+  kind text NOT NULL,
+  from_session_id text,
+  from_role text,
+  to_session_id text,
+  to_role text,
+  milestone_id text,
+  timing text,
+  body text NOT NULL,
+  response text,
+  attachments text,
+  status text NOT NULL,
+  time_created integer NOT NULL,
+  time_delivered integer,
+  time_closed integer,
+  time_updated integer NOT NULL,
+  PRIMARY KEY (workflow_id, id),
+  FOREIGN KEY (workflow_id) REFERENCES workflow(id) ON DELETE cascade,
+  FOREIGN KEY (from_session_id) REFERENCES session(id) ON DELETE set null,
+  FOREIGN KEY (to_session_id) REFERENCES session(id) ON DELETE set null
+);
+CREATE INDEX IF NOT EXISTS workflow_message_workflow_idx ON workflow_message (workflow_id);
+CREATE INDEX IF NOT EXISTS workflow_message_to_session_idx ON workflow_message (to_session_id);
+CREATE INDEX IF NOT EXISTS workflow_message_from_session_idx ON workflow_message (from_session_id);
+CREATE INDEX IF NOT EXISTS workflow_message_workflow_status_idx ON workflow_message (workflow_id, status);
 `
 const ensureWorkflowOwnershipSql = `
 PRAGMA foreign_keys = OFF;
@@ -275,6 +366,7 @@ export const StartInput = Schema.Struct({
   agent: Schema.optional(Schema.String),
   title: Schema.optional(Schema.String),
   staffing: Schema.optional(WorkflowStaffingConfig),
+  scheduling: Schema.optional(WorkflowSchedulingConfig),
   modelWhitelist: Schema.optional(WorkflowModelWhitelistConfig),
 }).annotate({ identifier: "WorkflowStartInput" })
 export type StartInput = typeof StartInput.Type
@@ -295,8 +387,10 @@ export type UpdateStaffingInput = typeof UpdateStaffingInput.Type
 export const InterveneInput = Schema.Struct({
   workflowID: WorkflowID,
   message: Schema.String,
+  sourceSessionID: Schema.optional(SessionID),
   timing: Schema.optional(WorkflowCommunicationTiming),
   targetRole: Schema.optional(WorkflowRole),
+  targetSpecialty: Schema.optional(Schema.String),
   targetSessionID: Schema.optional(SessionID),
 }).annotate({ identifier: "WorkflowInterveneInput" })
 export type InterveneInput = typeof InterveneInput.Type
@@ -305,6 +399,29 @@ export const ListInput = Schema.Struct({
   sessionID: Schema.optional(SessionID),
 }).annotate({ identifier: "WorkflowListInput" })
 export type ListInput = typeof ListInput.Type
+
+export const DoctorInput = Schema.Struct({
+  workflowID: Schema.optional(WorkflowID),
+  fix: Schema.optional(Schema.Boolean),
+  migrate: Schema.optional(Schema.Boolean),
+}).annotate({ identifier: "WorkflowDoctorInput" })
+export type DoctorInput = typeof DoctorInput.Type
+
+export const DoctorIssue = Schema.Struct({
+  severity: Schema.Literals(["error", "warning"]),
+  code: Schema.String,
+  message: Schema.String,
+  workflowID: Schema.optional(WorkflowID),
+  path: Schema.optional(Schema.String),
+}).annotate({ identifier: "WorkflowDoctorIssue" })
+export type DoctorIssue = typeof DoctorIssue.Type
+
+export const DoctorReport = Schema.Struct({
+  ok: Schema.Boolean,
+  checked: Schema.Number,
+  issues: Schema.Array(DoctorIssue),
+}).annotate({ identifier: "WorkflowDoctorReport" })
+export type DoctorReport = typeof DoctorReport.Type
 
 const CreatedPayloadFields = {
   workflowID: WorkflowID,
@@ -345,9 +462,11 @@ export interface Interface {
   readonly start: (input: StartInput) => Effect.Effect<WorkflowInfo, Error>
   readonly get: (workflowID: WorkflowID) => Effect.Effect<WorkflowInfo, Error>
   readonly list: (input?: ListInput) => Effect.Effect<WorkflowInfo[]>
+  readonly doctor: (input?: DoctorInput) => Effect.Effect<DoctorReport, Error>
   readonly graph: (workflowID: WorkflowID) => Effect.Effect<WorkflowGraph, Error>
   readonly updateXml: (input: UpdateXmlInput) => Effect.Effect<WorkflowGraph, Error>
   readonly updateStaffing: (input: UpdateStaffingInput) => Effect.Effect<WorkflowInfo, Error>
+  readonly dispatchCommand: (input: WorkflowToolCommand) => Effect.Effect<WorkflowToolCommandResult>
   readonly intervene: (input: InterveneInput) => Effect.Effect<WorkflowInfo, Error>
   readonly continueFromSession: (input: { sessionID: SessionID; message?: string }) => Effect.Effect<WorkflowInfo, Error>
   readonly resume: (workflowID: WorkflowID) => Effect.Effect<WorkflowInfo, Error>
@@ -387,9 +506,34 @@ function normalizeStaffing(input: WorkflowStaffingConfig | undefined) {
   } satisfies Required<WorkflowStaffingConfig>
 }
 
+function normalizeScheduling(input: WorkflowSchedulingConfig | undefined) {
+  const mode = input?.mode ?? "eager"
+  if (mode === "economical") {
+    return {
+      mode,
+      maxActive: schedulingMaxActive(input?.maxActive),
+    }
+  }
+  return { mode }
+}
+
+function schedulingMaxActive(value: number | undefined) {
+  if (value === undefined || !Number.isFinite(value)) return 2
+  return Math.max(1, Math.min(64, Math.trunc(value)))
+}
+
+function workflowSchedulingMode(workflow: WorkflowInfo) {
+  return workflow.scheduling?.mode ?? "eager"
+}
+
+function workflowSchedulingActiveLimit(workflow: WorkflowInfo) {
+  if (workflowSchedulingMode(workflow) !== "economical") return undefined
+  return schedulingMaxActive(workflow.scheduling?.maxActive)
+}
+
 function staffLimit(value: number | undefined, fallback: number, minimum: number) {
   if (value === undefined || !Number.isFinite(value)) return fallback
-  return Math.max(minimum, Math.min(12, Math.trunc(value)))
+  return Math.max(minimum, Math.min(64, Math.trunc(value)))
 }
 
 const workflowModelRoles = ["requester", "main_pm", "department_pm", "executor", "reviewer", "tester", "expert"] as const
@@ -741,6 +885,8 @@ export function selectWorkflowMember(input: {
     .filter((ref) => ref.role === input.role)
     .forEach((ref) => assignments.set(ref.sessionID, (assignments.get(ref.sessionID) ?? 0) + 1))
   return available.toSorted((a, b) => {
+    const specialty = Number(b.specialty === input.specialty) - Number(a.specialty === input.specialty)
+    if (specialty !== 0) return specialty
     const model =
       workflowMemberModelScore({
         member: b,
@@ -761,8 +907,6 @@ export function selectWorkflowMember(input: {
     if (model !== 0) return model
     const load = (assignments.get(a.sessionID) ?? 0) - (assignments.get(b.sessionID) ?? 0)
     if (load !== 0) return load
-    const specialty = Number(b.specialty === input.specialty) - Number(a.specialty === input.specialty)
-    if (specialty !== 0) return specialty
     return a.time.created - b.time.created || a.id.localeCompare(b.id)
   })[0]
 }
@@ -789,6 +933,10 @@ function staffSlug(value: string) {
   )
 }
 
+function workflowMessageKind(value: unknown): WorkflowMessageKind | undefined {
+  return workflowMessageKinds.find((item) => item === value)
+}
+
 function workflowMemberID(role: WorkflowSessionRef["role"], specialty: string, index: number) {
   return `${role}:${staffSlug(specialty)}:${index}`
 }
@@ -810,49 +958,29 @@ function projectWorkflowPath(directory: string, workflow: Pick<WorkflowInfo, "id
   return path.join(directory, workflowArtifactPath(workflow, ...segments))
 }
 
-function workflowFolderPath(time: number, title: string) {
-  return path.join(workflowDir, `${workflowFolderTime(time)}_${workflowFolderTitle(title)}`)
+function workflowFolderPath(workflowID: WorkflowID) {
+  return path.join(workflowDir, workflowFolderID(workflowID))
 }
 
-function workflowFolderTime(time: number) {
-  const date = new Date(time)
-  return [
-    date.getFullYear(),
-    pad2(date.getMonth() + 1),
-    pad2(date.getDate()),
-    "_",
-    pad2(date.getHours()),
-    pad2(date.getMinutes()),
-    pad2(date.getSeconds()),
-    "_",
-    String(date.getMilliseconds()).padStart(3, "0"),
-  ].join("")
-}
-
-function pad2(value: number) {
-  return String(value).padStart(2, "0")
-}
-
-function workflowFolderTitle(title: string) {
-  return (
-    title
-      .replace(/[<>:"/\\|?*\x00-\x1F]+/g, " ")
-      .replace(/\s+/g, " ")
-      .trim()
-      .replace(/[. ]+$/g, "")
-      .slice(0, 80) || "workflow"
-  )
+function workflowFolderID(workflowID: WorkflowID) {
+  return String(workflowID)
+    .replace(/[^a-zA-Z0-9._-]+/g, "-")
+    .replace(/^-+|-+$/g, "")
 }
 
 function isLegacyWorkflowPath(workflow: Pick<WorkflowInfo, "id" | "path">) {
-  return path.normalize(workflow.path) === path.normalize(workflowPath(workflow.id))
+  return path.normalize(workflow.path) !== path.normalize(workflowPath(workflow.id))
 }
 
 function rewriteWorkflowStoredPath(workflow: Pick<WorkflowInfo, "id" | "path">, stored: string) {
-  const legacy = path.normalize(workflowPath(workflow.id))
+  return rewriteStoredPathPrefix(stored, workflowPath(workflow.id), workflow.path)
+}
+
+function rewriteStoredPathPrefix(stored: string, fromPath: string, toPath: string) {
+  const from = path.normalize(fromPath)
   const current = path.normalize(stored)
-  if (current === legacy) return workflow.path
-  if (current.startsWith(legacy + path.sep)) return path.join(workflow.path, path.relative(legacy, current))
+  if (current === from) return toPath
+  if (current.startsWith(from + path.sep)) return path.join(toPath, path.relative(from, current))
   return stored
 }
 
@@ -875,6 +1003,14 @@ function normalizedRelativePath(root: string, file: string) {
 function workflowRelativeFile(workflow: WorkflowInfo, file: string) {
   if (!containedPath(path.resolve(workflow.directory, workflow.path), file)) return
   return path.relative(path.resolve(workflow.directory, workflow.path), file)
+}
+
+function workflowPlanFileMilestoneID(relative: string) {
+  const normalized = path.normalize(relative)
+  if (path.basename(normalized).toLowerCase() !== "plan.md") return
+  const parent = path.basename(path.dirname(normalized))
+  if (!parent || parent === "." || parent === "planning" || parent === "reference") return
+  return WorkflowMilestoneID.make(parent)
 }
 
 function workflowFileSignature(event: "add" | "change" | "unlink", file: string, size?: number, mtimeMs?: number) {
@@ -909,19 +1045,157 @@ async function ensureWorkflowDirectory(directory: string, fromPath: string, toPa
   await mkdir(to, { recursive: true })
 }
 
+const workflowFileWriteChains = new Map<string, Promise<void>>()
+const workflowToolCommandChains = new Map<string, Promise<void>>()
+const workflowMemberAssignmentChains = new Map<string, Promise<void>>()
+let workflowWriteFaultKey = ""
+let workflowWriteFaultCounter = 0
+
+function workflowWriteFaultPoint(label: string) {
+  const spec = process.env.OPENCODE_WORKFLOW_WRITE_FAULT_AT
+  if (!spec) {
+    workflowWriteFaultKey = ""
+    workflowWriteFaultCounter = 0
+    return
+  }
+  const key = `${process.env.OPENCODE_WORKFLOW_WRITE_FAULT_RUN ?? ""}:${spec}`
+  if (key !== workflowWriteFaultKey) {
+    workflowWriteFaultKey = key
+    workflowWriteFaultCounter = 0
+  }
+  const index = ++workflowWriteFaultCounter
+  if (!spec.split(/[,\s]+/).filter(Boolean).some((item) => item === String(index) || item === label || item === `${label}:${index}`)) {
+    return
+  }
+  const signalFile = process.env.OPENCODE_WORKFLOW_WRITE_FAULT_SIGNAL_FILE
+  if (signalFile) {
+    mkdirSync(path.dirname(signalFile), { recursive: true })
+    writeFileSync(signalFile, `${JSON.stringify({ label, pid: process.pid, point: index, time: Date.now() })}\n`)
+    Atomics.wait(
+      new Int32Array(new SharedArrayBuffer(4)),
+      0,
+      0,
+      Number(process.env.OPENCODE_WORKFLOW_WRITE_FAULT_WAIT_MS ?? 30000),
+    )
+  }
+  throw new globalThis.Error(`workflow write fault injected at ${label}#${index}`)
+}
+
+async function withWorkflowFileWriteQueue<T>(file: string, write: () => Promise<T>) {
+  const key = path.resolve(file).toLowerCase()
+  const previous = workflowFileWriteChains.get(key) ?? Promise.resolve()
+  let release = () => {}
+  const current = new Promise<void>((done) => {
+    release = done
+  })
+  const chain = previous.catch(() => {}).then(() => current)
+  workflowFileWriteChains.set(key, chain)
+  await previous.catch(() => {})
+  try {
+    return await write()
+  } finally {
+    release()
+    if (workflowFileWriteChains.get(key) === chain) workflowFileWriteChains.delete(key)
+  }
+}
+
 async function writeFileEnsured(file: string, content: string) {
-  await mkdir(path.dirname(file), { recursive: true })
-  await writeFile(file, content)
+  return withWorkflowFileWriteQueue(file, async () => {
+    await assertWorkflowArtifactWritableByEngine(file)
+    await mkdir(path.dirname(file), { recursive: true })
+    workflowWriteFaultPoint("write:after-mkdir")
+    const temp = path.join(
+      path.dirname(file),
+      `.tmp-${path.basename(file)}-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+    )
+    const handle = await open(temp, "w")
+    try {
+      workflowWriteFaultPoint("write:after-open")
+      await handle.writeFile(content)
+      workflowWriteFaultPoint("write:after-write")
+      await handle.sync()
+      workflowWriteFaultPoint("write:after-sync")
+    } finally {
+      await handle.close().catch(() => {})
+    }
+    workflowWriteFaultPoint("write:before-rename")
+    try {
+      await rename(temp, file)
+      workflowWriteFaultPoint("write:after-rename")
+    } catch (error) {
+      await rm(temp, { force: true }).catch(() => {})
+      throw error
+    }
+  })
 }
 
 async function appendFileEnsured(file: string, content: string) {
-  await mkdir(path.dirname(file), { recursive: true })
-  await appendFile(file, content)
+  return withWorkflowFileWriteQueue(file, async () => {
+    await assertWorkflowArtifactWritableByEngine(file)
+    await mkdir(path.dirname(file), { recursive: true })
+    workflowWriteFaultPoint("append:before")
+    await appendFile(file, content)
+    workflowWriteFaultPoint("append:after")
+  })
 }
 
 async function writeFileEnsuredIfMissing(file: string, content: string) {
   if (await exists(file)) return
   await writeFileEnsured(file, content)
+}
+
+async function assertWorkflowArtifactWritableByEngine(file: string) {
+  const location = workflowArtifactLocationFromFile(file)
+  if (!location) return
+  if (location.relative === workflowManifestFileName) return
+  const manifest = await readWorkflowManifestFileUnchecked(path.join(location.root, workflowManifestFileName)).catch(
+    (error) => {
+      if (nodeErrorCode(error) === "ENOENT") return undefined
+      throw new globalThis.Error(
+        `Workflow engine cannot write ${location.relative}: manifest.json is not readable; run workflow doctor before continuing.`,
+      )
+    },
+  )
+  if (!manifest) return
+  const owner = workflowManifestOwner(manifest, location.relative)
+  if (!owner || owner === "engine" || owner === "engine-append") return
+  throw new globalThis.Error(
+    `Workflow engine cannot write ${location.relative}: ownership is ${owner}. Engine writes are limited to engine and engine-append paths.`,
+  )
+}
+
+function workflowArtifactLocationFromFile(file: string) {
+  const segments = path.resolve(file).split(path.sep)
+  const opencodeIndex = segments.lastIndexOf(".opencode")
+  if (opencodeIndex < 0) return
+  if (segments[opencodeIndex + 1] !== "workflows") return
+  const workflowIndex = opencodeIndex + 2
+  if (!segments[workflowIndex]) return
+  const relative = segments.slice(workflowIndex + 1).join("/")
+  if (!relative) return
+  return {
+    root: segments.slice(0, workflowIndex + 1).join(path.sep),
+    relative,
+  }
+}
+
+function workflowManifestOwner(manifest: { ownership?: Record<string, string> }, relativePath: string) {
+  const ownership = manifest.ownership ?? {}
+  return Object.entries(ownership)
+    .filter(([pattern]) => workflowOwnershipPatternMatches(pattern, relativePath))
+    .toSorted((a, b) => workflowOwnershipPatternScore(b[0]) - workflowOwnershipPatternScore(a[0]))[0]?.[1]
+}
+
+function workflowOwnershipPatternMatches(pattern: string, relativePath: string) {
+  const normalized = pattern.replaceAll("\\", "/")
+  if (normalized === relativePath) return true
+  if (!normalized.endsWith("/**")) return false
+  const prefix = normalized.slice(0, -3)
+  return relativePath === prefix.slice(0, -1) || relativePath.startsWith(prefix)
+}
+
+function workflowOwnershipPatternScore(pattern: string) {
+  return pattern.replaceAll("*", "").length
 }
 
 function ensureSchema() {
@@ -943,6 +1217,7 @@ function ensureSchema() {
   ensureColumn("workflow", "xml", "ALTER TABLE workflow ADD COLUMN xml text NOT NULL DEFAULT ''")
   ensureColumn("workflow", "status", "ALTER TABLE workflow ADD COLUMN status text NOT NULL DEFAULT 'planning'")
   ensureColumn("workflow", "staffing", "ALTER TABLE workflow ADD COLUMN staffing text")
+  ensureColumn("workflow", "scheduling", "ALTER TABLE workflow ADD COLUMN scheduling text")
   ensureColumn("workflow", "model", "ALTER TABLE workflow ADD COLUMN model text")
   ensureColumn("workflow", "model_whitelist", "ALTER TABLE workflow ADD COLUMN model_whitelist text")
   ensureColumn("workflow", "agent", "ALTER TABLE workflow ADD COLUMN agent text")
@@ -953,12 +1228,18 @@ function ensureSchema() {
   ensureColumn("workflow", "time_completed", "ALTER TABLE workflow ADD COLUMN time_completed integer")
   ensureColumn("workflow_member", "capacity", "ALTER TABLE workflow_member ADD COLUMN capacity integer NOT NULL DEFAULT 1")
   ensureColumn("workflow_member", "status", "ALTER TABLE workflow_member ADD COLUMN status text NOT NULL DEFAULT 'active'")
+  ensureColumn("workflow_member", "availability", "ALTER TABLE workflow_member ADD COLUMN availability text")
+  ensureColumn("workflow_member", "current_focus", "ALTER TABLE workflow_member ADD COLUMN current_focus text")
+  ensureColumn("workflow_member", "blockers", "ALTER TABLE workflow_member ADD COLUMN blockers text")
+  ensureColumn("workflow_member", "progress_note", "ALTER TABLE workflow_member ADD COLUMN progress_note text")
   ensureColumn("workflow_member", "model", "ALTER TABLE workflow_member ADD COLUMN model text")
   ensureColumn("workflow_member", "model_weight", "ALTER TABLE workflow_member ADD COLUMN model_weight integer")
   ensureColumn("workflow_member", "model_cache_until", "ALTER TABLE workflow_member ADD COLUMN model_cache_until integer")
   ensureColumn("workflow_member", "time_created", "ALTER TABLE workflow_member ADD COLUMN time_created integer NOT NULL DEFAULT 0")
   ensureColumn("workflow_member", "time_updated", "ALTER TABLE workflow_member ADD COLUMN time_updated integer NOT NULL DEFAULT 0")
   ensureColumn("workflow_milestone", "attempt", "ALTER TABLE workflow_milestone ADD COLUMN attempt integer NOT NULL DEFAULT 0")
+  ensureColumn("workflow_milestone", "review", "ALTER TABLE workflow_milestone ADD COLUMN review text")
+  ensureColumn("workflow_milestone", "waiting_for", "ALTER TABLE workflow_milestone ADD COLUMN waiting_for text")
   ensureColumn("workflow_milestone", "plan_path", "ALTER TABLE workflow_milestone ADD COLUMN plan_path text")
   ensureColumn("workflow_milestone", "review_path", "ALTER TABLE workflow_milestone ADD COLUMN review_path text")
   ensureColumn("workflow_milestone", "session", "ALTER TABLE workflow_milestone ADD COLUMN session text NOT NULL DEFAULT '[]'")
@@ -987,6 +1268,7 @@ function toInfo(row: typeof WorkflowTable.$inferSelect): WorkflowInfo {
     xml: row.xml,
     status: row.status,
     staffing: row.staffing ?? undefined,
+    scheduling: row.scheduling ?? undefined,
     model: row.model ?? undefined,
     modelWhitelist: row.model_whitelist ?? undefined,
     agent: row.agent ?? undefined,
@@ -1014,6 +1296,8 @@ function toMilestone(row: typeof WorkflowMilestoneTable.$inferSelect): WorkflowM
     id: row.id,
     title: row.title ?? undefined,
     department: row.department ?? undefined,
+    review: row.review ?? undefined,
+    waitingFor: row.waiting_for ?? undefined,
     prompt: row.prompt,
     dependsOn: row.depends_on,
     status: row.status,
@@ -1034,6 +1318,10 @@ function toMember(row: typeof WorkflowMemberTable.$inferSelect): WorkflowMemberI
     sessionID: row.session_id,
     capacity: row.capacity,
     status: row.status,
+    availability: row.availability ?? undefined,
+    currentFocus: row.current_focus ?? undefined,
+    blockers: row.blockers ?? [],
+    progressNote: row.progress_note ?? undefined,
     model: row.model ?? undefined,
     modelWeight: row.model_weight ?? undefined,
     modelCacheUntil: row.model_cache_until ?? undefined,
@@ -1122,6 +1410,22 @@ function workflowStaffMemoryPath(member: Pick<WorkflowMemberInfo, "id">) {
   return path.join("reference", "staff", `${staffSlug(member.id)}.md`)
 }
 
+function workflowMainPlanPath() {
+  return path.join("planning", "main-plan.md")
+}
+
+function workflowMilestoneArtifactsPath(milestoneID: WorkflowMilestoneID, ...segments: string[]) {
+  return path.join(String(milestoneID), "artifacts", ...segments)
+}
+
+function workflowMilestoneDecompositionPath(milestoneID: WorkflowMilestoneID) {
+  return workflowMilestoneArtifactsPath(milestoneID, "decomposition.md")
+}
+
+function workflowMilestoneReviewPath(milestoneID: WorkflowMilestoneID, attempt: number) {
+  return path.join(String(milestoneID), "reviews", `review-${attempt}.md`)
+}
+
 function workflowConsultationIndexPath() {
   return path.join("reference", "consultations", "index.md")
 }
@@ -1155,7 +1459,44 @@ function workflowDeliverySummaryPath() {
 }
 
 function workflowExpertNotePath(milestoneID: WorkflowMilestoneID, attempt: number) {
-  return path.join(String(milestoneID), `expert-${attempt}.md`)
+  return workflowMilestoneArtifactsPath(milestoneID, `expert-${attempt}.md`)
+}
+
+function workflowTestPlanPath() {
+  return path.join("final", "test-plan.md")
+}
+
+function workflowCommandJournalPath() {
+  return path.join("journal", "commands.jsonl")
+}
+
+function workflowMessageJournalPath() {
+  return path.join("journal", "messages.jsonl")
+}
+
+function workflowEventJournalPath() {
+  return path.join("journal", "events.jsonl")
+}
+
+function workflowTechnicalAssessmentPath() {
+  return path.join("final", "technical-assessment.md")
+}
+
+function workflowProjectionPaths(workflow: WorkflowInfo, staff: WorkflowMemberInfo[]) {
+  return Array.from(
+    new Set([
+      workflowArtifactPath(workflow, "index.md"),
+      workflowArtifactPath(workflow, "organization.md"),
+      workflowArtifactPath(workflow, "progress.md"),
+      workflowArtifactPath(workflow, workflowReferenceIndexPath()),
+      workflowArtifactPath(workflow, workflowRequesterMemoryPath()),
+      workflowArtifactPath(workflow, workflowConsultationIndexPath()),
+      workflowArtifactPath(workflow, workflowInterventionIndexPath()),
+      workflowArtifactPath(workflow, workflowStandupIndexPath()),
+      workflowArtifactPath(workflow, workflowDeliverySummaryPath()),
+      ...staff.map((member) => workflowArtifactPath(workflow, workflowStaffMemoryPath(member))),
+    ]),
+  )
 }
 
 function markdownFence(value: string, language = "") {
@@ -1236,6 +1577,7 @@ function archiveMessageMarkdown(message: MessageV2.WithParts) {
 const archiveWorkflowSessionMessages = Effect.fn("Workflow.archiveWorkflowSessionMessages")(function* (input: {
   workflow: WorkflowInfo
   session: Session.Info
+  messages: MessageV2.WithParts[]
   role: WorkflowSessionRef["role"]
   prompt?: string
   milestoneID?: WorkflowMilestoneID
@@ -1252,30 +1594,19 @@ const archiveWorkflowSessionMessages = Effect.fn("Workflow.archiveWorkflowSessio
       ].join("\n"),
     ),
   )
-  const pageSize = 20
-  let before: string | undefined
-  let wrote = false
-  while (true) {
-    const page = yield* MessageV2.page({
-      sessionID: input.session.id,
-      limit: pageSize,
-      before,
-    }).pipe(Effect.mapError((error) => new Error({ message: error.message })))
-    if (page.items.length === 0) break
-    wrote = true
+  if (input.messages.length > 0) {
     yield* Effect.promise(() =>
       appendFileEnsured(
         input.file,
-        `${page.items
+        `${input.messages
           .toReversed()
           .map(archiveMessageMarkdown)
           .join("\n")}\n`,
       ),
     )
-    if (!page.more || !page.cursor) break
-    before = page.cursor
+    return
   }
-  if (!wrote) yield* Effect.promise(() => appendFileEnsured(input.file, "_No messages recorded yet._\n"))
+  yield* Effect.promise(() => appendFileEnsured(input.file, "_No messages recorded yet._\n"))
 })
 
 function archiveSessionMarkdown(input: {
@@ -1306,6 +1637,20 @@ function compactMarkdown(text: string, limit = 2400) {
   const trimmed = text.replace(/\r\n/g, "\n").trim()
   if (trimmed.length <= limit) return trimmed
   return `${trimmed.slice(0, limit).trimEnd()}\n\n...`
+}
+
+function workflowMessageAttachmentInvalid(value: string) {
+  return (
+    path.isAbsolute(value) ||
+    value.includes("\0") ||
+    path.normalize(value) === "." ||
+    value.split(/[\\/]+/).includes("..")
+  )
+}
+
+function workflowMessageWithAttachments(message: string, attachments: readonly string[]) {
+  if (attachments.length === 0) return message
+  return [message, "", "Attachments:", ...attachments.map((item) => `- ${item}`)].join("\n")
 }
 
 export function extractHandoffSummary(text: string) {
@@ -1404,7 +1749,7 @@ function referenceIndexMarkdown(input: {
     "",
     `- Company organization: organization.md`,
     `- Workflow progress: progress.md`,
-    `- Main PM plan: main-plan.md`,
+    `- Main PM plan: ${workflowMainPlanPath()}`,
     `- Workflow XML: workflow.xml`,
     `- Local archive index: index.md`,
     `- Delivery summary: ${workflowDeliverySummaryPath()}`,
@@ -1483,8 +1828,8 @@ function referenceIndexMarkdown(input: {
     "## Final Review",
     "",
     `Delivery summary: ${workflowDeliverySummaryPath()}`,
-    `Tester completeness review: test-plan.md`,
-    `Technical advisor assessment: technical-assessment.md`,
+    `Tester completeness review: ${workflowTestPlanPath()}`,
+    `Technical advisor assessment: ${workflowTechnicalAssessmentPath()}`,
     `Main PM acceptance: ${workflowAcceptancePath("main_pm")}`,
     `Requester acceptance: ${workflowAcceptancePath("requester")}`,
     "",
@@ -1533,8 +1878,8 @@ function deliverySummaryMarkdown(input: {
     "",
     "## Review And Acceptance Evidence",
     "",
-    `- Tester completeness review: test-plan.md`,
-    `- Technical advisor assessment: technical-assessment.md`,
+    `- Tester completeness review: ${workflowTestPlanPath()}`,
+    `- Technical advisor assessment: ${workflowTechnicalAssessmentPath()}`,
     `- Main PM acceptance: ${workflowAcceptancePath("main_pm")}`,
     `- Requester acceptance: ${workflowAcceptancePath("requester")}`,
     "",
@@ -1743,7 +2088,7 @@ function progressMarkdown(input: {
       ? ["_No company staff sessions have been created yet._"]
       : input.members.map(
           (member) =>
-            `- ${member.title} [${member.status}] session: ${member.sessionID} model: ${workflowModelRefText(member.model)}${member.modelCacheUntil ? ` cached-until: ${new Date(member.modelCacheUntil).toISOString()}` : ""}`,
+            `- ${member.title} [${member.status}/${member.availability ?? "unknown"}] session: ${member.sessionID} focus: ${compactMarkdown(member.currentFocus ?? "none", 120).replace(/\n/g, " ")} blockers: ${(member.blockers ?? []).join("; ") || "none"} note: ${compactMarkdown(member.progressNote ?? "none", 120).replace(/\n/g, " ")} model: ${workflowModelRefText(member.model)}${member.modelCacheUntil ? ` cached-until: ${new Date(member.modelCacheUntil).toISOString()}` : ""}`,
         )),
     "",
     "## Recent Requester Interventions",
@@ -1826,6 +2171,10 @@ function organizationMarkdown(input: {
             `  - specialty: ${member.specialty}`,
             `  - session: ${member.sessionID}`,
             `  - status: ${member.status}`,
+            `  - availability: ${member.availability ?? "unknown"}`,
+            `  - current focus: ${member.currentFocus ?? "none"}`,
+            `  - blockers: ${(member.blockers ?? []).join("; ") || "none"}`,
+            `  - progress note: ${member.progressNote ?? "none"}`,
             `  - cached model: ${workflowModelRefText(member.model)}${member.modelWeight === undefined ? "" : ` weight=${workflowModelWeight(member.modelWeight)}`}${member.modelCacheUntil ? ` until=${new Date(member.modelCacheUntil).toISOString()}` : ""}`,
             `  - current/previous assignments: ${(assignments.get(member.sessionID) ?? ["none"]).join("; ")}`,
           ].join("\n"),
@@ -2091,12 +2440,12 @@ function archiveIndexMarkdown(workflow: WorkflowInfo, milestones: WorkflowMilest
     "- organization.md",
     "- progress.md",
     `- ${workflowStandupIndexPath()}`,
-    "- main-plan.md",
+    `- ${workflowMainPlanPath()}`,
     `- ${workflowReferenceIndexPath()}`,
     `- ${workflowRequesterMemoryPath()}`,
     `- ${workflowInterventionIndexPath()}`,
     ...(workflow.testPath ? [`- ${path.relative(workflow.path, workflow.testPath)}`] : []),
-    "- technical-assessment.md",
+    `- ${workflowTechnicalAssessmentPath()}`,
     "",
     "## User Requirement",
     "",
@@ -2260,13 +2609,17 @@ export function workflowReferencePrompt(workflow: WorkflowInfo) {
     '<opencode-workflow-consult target-session="ses_xxx" reason="why this session has the answer" model-weight="0-100">question for that session</opencode-workflow-consult>',
     "For role-based communication, emit:",
     '<opencode-workflow-message to-role="expert|main_pm|department_pm|executor|reviewer|tester|requester" specialty="optional area" timing="after-task|interrupt|temporary-interrupt" reason="short reason" model-weight="0-100">message or question</opencode-workflow-message>',
+    "Role-based workflow messages are consultation/notification only: they prompt an employee and archive the exchange, but they do not dispatch milestones, attach a session to a milestone, or change milestone status.",
+    "When you need to receive or close collaboration messages assigned to your session, use the built-in workflow_message tool: action=inbox at the start of a workflow-owned turn, action=answer for consultations, and action=ack or action=answer for requester interventions. Do not claim a consultation/intervention is closed unless the tool confirms it.",
+    "To dispatch real milestone work, update workflow.xml or emit <opencode-workflow-update>, then use the built-in workflow tool with action=update_xml or action=resume and confirm the tool result.",
+    "If the built-in workflow tool is unavailable but you must close a workflow gate, emit workflow control XML such as <opencode-workflow-control action=\"plan_complete\" milestone=\"milestone-id\">...</opencode-workflow-control> or <opencode-workflow-control action=\"force_complete\" milestone=\"milestone-id\">...</opencode-workflow-control>. The workflow manager will route that through the same command bus and record the result.",
     "Use timing=\"after-task\" for normal handoff, timing=\"temporary-interrupt\" when you need a quick answer before continuing, and timing=\"interrupt\" when the current task should pause until direction changes.",
     "Set model-weight=\"0-100\" when delegating; use lower weights for routine/focused tasks and higher weights for complex, risky, architectural, or ambiguous tasks.",
     "If the only valid blocker is a requester/user decision, send it to to-role=\"requester\" with 2-3 explicit options, mark one option as Recommended, and include the tradeoff for each option. Do not stop silently after asking.",
     "Main PM and department PM sessions may revise the workflow graph directly by emitting:",
     '<opencode-workflow-update reason="why the graph changed"><workflow>...</workflow></opencode-workflow-update>',
     "Use workflow updates when a milestone is too broad, requester strategy changes, or the company needs new ordered/parallel work. Preserve completed milestone ids when they remain valid.",
-    "The workflow manager will prompt the target employee session, record the exchange in the workflow graph, update the reference library, and inject the answer back here.",
+    "For consultation messages only, the workflow manager will prompt the target employee session, record the exchange in the workflow graph, update the reference library, and inject the answer back here. This still does not dispatch milestone work.",
   ].join("\n")
 }
 
@@ -2290,6 +2643,8 @@ export function workflowEmployeeContextPrompt(
     `Session: ${input.sessionID}`,
     `Company role: ${roleSessionTitle(input.role)}`,
     `Role responsibility: ${workflowEmployeeResponsibility(input.role)}`,
+    "At the start and end of each workflow-owned turn, use the built-in workflow tool with action=status_update to report availability=working|idle|blocked_waiting, currentFocus, blockers, and progressNote. Do not only describe your state in prose.",
+    "At the start of each workflow-owned turn, also use workflow_message action=inbox. If the inbox includes a consultation, respond with workflow_message action=answer. If it includes a requester intervention, respond with workflow_message action=ack or action=answer. A message is not closed until the tool result says it was recorded.",
     ...(input.member
       ? [
           `Employee title: ${input.member.title}`,
@@ -2311,6 +2666,9 @@ export function workflowEmployeeContextPrompt(
     "",
     "Before answering, read the workflow progress, organization chart, reference index, your staff memory file when listed above, and the relevant plan/review files. If another employee has the answer, use workflow communication XML instead of guessing.",
     workflowProjectMemoryPrompt(),
+    "",
+    input.milestone ? workflowMilestoneFileIsolationPrompt(workflow, input.milestone) : workflowRuntimeFileIsolationPrompt(workflow),
+    "",
     "Use this direct consultation XML when a specific employee session owns the missing context:",
     '<opencode-workflow-consult target-session="ses_xxx" timing="after-task|interrupt|temporary-interrupt" reason="short reason" model-weight="0-100">question</opencode-workflow-consult>',
     "Use this role-based communication XML when the workflow should route the message to an employee by function:",
@@ -2371,7 +2729,11 @@ export function workflowCompanySnapshotPrompt(input: {
                   .join(", ")
                 return `${milestone.id} [${milestone.status}] as ${roles}`
               })
+            const focus = compactMarkdown(member.currentFocus ?? "none", 140).replace(/\n/g, " ")
+            const blockers = (member.blockers ?? []).map((blocker) => compactMarkdown(blocker, 80).replace(/\n/g, " ")).join("; ") || "none"
+            const note = compactMarkdown(member.progressNote ?? "none", 140).replace(/\n/g, " ")
             return `- ${member.sessionID === input.currentSessionID ? "(you) " : ""}${member.title} [${member.role}/${member.specialty}] session=${member.sessionID} status=${member.status} capacity=${member.capacity} assignments=${assignments.join("; ") || "none"}`
+              + ` availability=${member.availability ?? "unknown"} focus="${focus}" blockers="${blockers}" progress="${note}"`
           }),
           ...(input.members.length > visibleMembers.length
             ? [`- ... ${input.members.length - visibleMembers.length} more employee session(s) omitted; read organization.md for the full company chart.`]
@@ -2461,6 +2823,32 @@ function workflowEmployeeResponsibility(role: WorkflowSessionRef["role"]) {
   if (role === "reviewer") return "Support PM-owned functional review with optional audit context; Department PM approval remains authoritative."
   if (role === "tester") return "Perform completeness, regression, and feedback-loop review."
   return "Advise on architecture, technology choices, performance, integration risk, and optimization."
+}
+
+function workflowRuntimeFileIsolationPrompt(workflow: WorkflowInfo) {
+  return [
+    "## Workflow File Isolation",
+    "",
+    "The workflow root contains opencode-managed runtime files. Do not delete, rename, or overwrite these unless this prompt names the exact file as your deliverable.",
+    `Runtime root: ${workflow.path}`,
+    `Opencode-managed examples: ${workflowArtifactPath(workflow, "progress.md")}, ${workflowArtifactPath(workflow, "organization.md")}, ${workflowArtifactPath(workflow, "index.md")}, ${workflowArtifactPath(workflow, workflowStateFileName)}, session_*.md, ${workflowArtifactPath(workflow, workflowReferenceIndexPath())}, ${workflowArtifactPath(workflow, workflowStandupIndexPath())}, ${workflowArtifactPath(workflow, workflowInterventionIndexPath())}.`,
+    `Main PM planning workspace: ${workflowArtifactPath(workflow, "planning")}.`,
+    `Final review workspace: ${workflowArtifactPath(workflow, "final")}.`,
+    "If a requester or milestone mentions shared paths such as implementation/*.md, verification/*.md, or requirements/*.md, treat them as logical names and write the real file inside the owning milestone's artifacts/ directory unless the path is already inside that milestone directory.",
+  ].join("\n")
+}
+
+function workflowMilestoneFileIsolationPrompt(workflow: WorkflowInfo, milestone: WorkflowMilestoneInfo) {
+  return [
+    workflowRuntimeFileIsolationPrompt(workflow),
+    "",
+    `Milestone-owned directory: ${workflowArtifactPath(workflow, milestone.id)}.`,
+    `Milestone plan file: ${workflowArtifactPath(workflow, milestone.id, "plan.md")}.`,
+    `Agent-authored deliverables for this milestone must go under: ${workflowArtifactPath(workflow, workflowMilestoneArtifactsPath(milestone.id))}.`,
+    "When the milestone text names a shared relative output path outside this milestone directory, preserve that logical path under artifacts/. Example: implementation/audit-core.md becomes <milestone>/artifacts/implementation/audit-core.md.",
+    "Record every logical-path to artifacts-path mapping in your Handoff Summary so downstream milestones can find the files.",
+    "Do not write into sibling milestone directories unless this prompt explicitly asks for cross-milestone synthesis.",
+  ].join("\n")
 }
 
 function consultationAttribute(attributes: string, name: string) {
@@ -2576,6 +2964,68 @@ function terminalMilestone(status: WorkflowMilestoneInfo["status"]) {
   )
 }
 
+const workflowMilestoneTransitions: Record<WorkflowMilestoneInfo["status"], WorkflowMilestoneInfo["status"][]> = {
+  pending: ["planning", "skipped", "cancelled"],
+  planning: ["executing", "blocked", "cancelled"],
+  executing: ["reviewing", "blocked", "failed", "cancelled"],
+  reviewing: ["testing", "rejected", "cancelled"],
+  testing: ["approved", "rejected", "cancelled"],
+  rejected: ["planning", "executing", "skipped", "cancelled"],
+  approved: ["done"],
+  blocked: ["planning", "executing", "cancelled"],
+  done: [],
+  skipped: [],
+  failed: ["pending", "planning", "cancelled"],
+  running: ["reviewing", "blocked", "failed", "cancelled"],
+  completed: [],
+  cancelled: [],
+}
+
+function canonicalMilestoneStatus(status: WorkflowMilestoneInfo["status"]) {
+  if (status === "completed") return "done"
+  if (status === "running") return "executing"
+  return status
+}
+
+function legalMilestoneTransitions(status: WorkflowMilestoneInfo["status"]) {
+  return workflowMilestoneTransitions[status] ?? []
+}
+
+function workflowCommandRejection(
+  code:
+    | "illegal_transition"
+    | "not_authorized"
+    | "invalid_xml"
+    | "unknown_milestone"
+    | "workflow_not_active"
+    | "precondition_failed",
+  reason: string,
+  allowedTransitions?: string[],
+) {
+  return {
+    applied: false,
+    message: reason,
+    rejection: {
+      code,
+      reason,
+      ...(allowedTransitions?.length ? { allowedTransitions } : {}),
+    },
+  }
+}
+
+function milestoneTransitionGuidance(input: {
+  currentStatus: WorkflowMilestoneInfo["status"]
+  targetStatus: WorkflowMilestoneInfo["status"]
+}) {
+  if (
+    canonicalMilestoneStatus(input.currentStatus) === "planning" &&
+    ["approved", "done"].includes(canonicalMilestoneStatus(input.targetStatus))
+  ) {
+    return " Planning gates do not close through milestone_status done/approved from non-owner sessions. Use action=plan_complete to continue this milestone into executor/review work, or requester/main_pm action=force_complete when this is a gate-only milestone that should unblock dependents. The owning department PM session may re-issue milestone_status=done/approved as a compatibility alias for plan_complete."
+  }
+  return ""
+}
+
 export function temporaryInterruptPauseStatus(status: WorkflowMilestoneInfo["status"] | undefined) {
   if (status === "planning" || status === "executing" || status === "reviewing" || status === "running") return status
   return undefined
@@ -2584,6 +3034,15 @@ export function temporaryInterruptPauseStatus(status: WorkflowMilestoneInfo["sta
 function errorFromCause(cause: Cause.Cause<unknown>) {
   const error = Cause.squash(cause)
   return error instanceof globalThis.Error ? error.message : String(error)
+}
+
+function workflowCommandDurabilityFailure(cause: Cause.Cause<unknown>) {
+  const message = errorFromCause(cause)
+  return (
+    message.includes("workflow write fault injected") ||
+    message.includes("Workflow engine cannot write") ||
+    /\b(EACCES|EPERM|ENOSPC|EBUSY|EIO)\b/i.test(message)
+  )
 }
 
 function graphFrom(
@@ -2623,7 +3082,7 @@ function graphFrom(
         {
           id: `${info.id}:main-plan`,
           title: "Main PM plan",
-          path: workflowArtifactPath(info, "main-plan.md"),
+          path: workflowArtifactPath(info, workflowMainPlanPath()),
           summary: "Main product manager high-level plan and linked workflow file index.",
         },
         {
@@ -2671,13 +3130,13 @@ function graphFrom(
           {
             id: `${info.id}:test-plan`,
             title: "Tester completeness review",
-            path: info.testPath ?? workflowArtifactPath(info, "test-plan.md"),
+            path: info.testPath ?? workflowArtifactPath(info, workflowTestPlanPath()),
             summary: "Tester-created targeted tests, regression checks, and completeness review.",
           },
           {
             id: `${info.id}:technical-assessment`,
             title: "Technical advisor assessment",
-            path: workflowArtifactPath(info, "technical-assessment.md"),
+            path: workflowArtifactPath(info, workflowTechnicalAssessmentPath()),
             summary: "Final architecture, integration, and performance assessment before acceptance.",
           },
           {
@@ -3416,13 +3875,15 @@ function promptMainPm(input: { workflow: WorkflowInfo }) {
     "Do not treat staff sessions as disposable. The requester, main PM, department PMs, executors, testers, and technical advisors are long-lived employees who should accumulate context and collaborate across milestones.",
     "When assigning or consulting staff, prefer the employee whose cached model and specialty already fit the task. Increase model-weight only when the remaining work is clearly harder than the employee's current cached model profile.",
     "Do not hide a complex feature behind a single broad milestone. Every milestone must be small enough for one executor session to finish, one department PM session to functionally review, and the tester to verify for completeness.",
-    "PM roles must not edit implementation code or perform code changes. PMs may write workflow, plan, decomposition, reference, organization, and review documents under the workflow directory; implementation belongs to executor sessions.",
+    "PM roles must not edit implementation code or perform code changes. PMs may write workflow, planning, decomposition, reference, and review documents under the workflow directory; implementation belongs to executor sessions.",
     `Write the canonical XML to ${workflowArtifactPath(input.workflow, "workflow.xml")}.`,
-    `Write the high-level plan to ${workflowArtifactPath(input.workflow, "main-plan.md")}.`,
-    `Maintain the company organization chart at ${workflowArtifactPath(input.workflow, "organization.md")}.`,
-    `Maintain the reference library at ${workflowArtifactPath(input.workflow, workflowReferenceIndexPath())}; link important child documents from main-plan.md.`,
+    `Write the high-level plan to ${workflowArtifactPath(input.workflow, workflowMainPlanPath())}.`,
+    `Treat ${workflowArtifactPath(input.workflow, "organization.md")}, ${workflowArtifactPath(input.workflow, "progress.md")}, and ${workflowArtifactPath(input.workflow, "index.md")} as runtime-generated status files. Read them, but do not rewrite them directly.`,
+    `Maintain planning notes under ${workflowArtifactPath(input.workflow, "planning")}; link important child documents from ${workflowMainPlanPath()}.`,
     "Do not claim that dispatch has started unless you have written workflow.xml or emitted an <opencode-workflow-update> block. The workflow runtime creates department PM, executor, reviewer, and tester sessions after it validates the XML.",
     "Use the built-in workflow tool to inspect and control runtime state: call action=status before supervising, action=update_xml after creating or replacing the canonical XML, and action=resume when dispatch should continue. Do not rely only on natural-language claims of dispatch.",
+    "Do not use <opencode-workflow-message> as a dispatch mechanism. It only asks or notifies another employee; it does not create a milestone job or unblock ordered dependencies.",
+    "If a PM-only planning gate is intentionally complete and should unblock downstream milestones, requester or main PM must use workflow tool action=force_complete. Do not use milestone_status done/approved from planning.",
     "",
     workflowReferencePrompt(input.workflow),
     "",
@@ -3431,7 +3892,7 @@ function promptMainPm(input: { workflow: WorkflowInfo }) {
     "Use <ordered> when milestones must run sequentially and <parallel> when they can run concurrently. Nest groups when useful.",
     "Milestone content must include concrete deliverables, likely files or modules, acceptance checks, and handoff constraints.",
     "For complex plugin or engine work, split by real subsystems instead of naming the whole system. Examples: contracts and architecture, manager lifecycle, CPU simulation, GPU rendering path, materials and shaders, textures and atlases, asset importers, emitter shapes, particle types or modules, editor authoring UI, serialization/runtime API, docs, tests, and build integration.",
-    "Write main-plan.md with a linked file index for workflow.xml, each milestone plan.md path, and any future decomposition files.",
+    `Write ${workflowMainPlanPath()} with a linked file index for workflow.xml, each milestone plan.md path, and any future decomposition files.`,
     "",
     "User requirement:",
     input.workflow.request,
@@ -3454,14 +3915,16 @@ function promptDepartmentPm(input: { workflow: WorkflowInfo; milestone: Workflow
     `Save a detailed execution plan to ${workflowArtifactPath(input.workflow, input.milestone.id, "plan.md")}.`,
     `If this milestone is still too broad, update ${workflowArtifactPath(input.workflow, "workflow.xml")} before writing a broad plan.`,
     `When splitting, replace this milestone with ordered/parallel child milestones whose ids are prefixed with "${input.milestone.id}-". Preserve the dependency intent and do not leave dependencies pointing at a removed milestone id.`,
-    `Write the split rationale and child mapping to ${workflowArtifactPath(input.workflow, input.milestone.id, "decomposition.md")}.`,
+    `Write the split rationale and child mapping to ${workflowArtifactPath(input.workflow, workflowMilestoneDecompositionPath(input.milestone.id))}.`,
     "Each child milestone must name concrete files or modules, deliverables, acceptance checks, and whether it can run in parallel.",
     "For plugin or graphics work, split independent concerns such as manager lifecycle, CPU/GPU paths, materials, textures, importers, emitter shapes, particle types, editor UI, serialization/runtime API, docs, tests, and build integration.",
     "Only keep this milestone executable when it is already small enough for one executor session to complete without guessing.",
     "Keep every plan file linked to the parent workflow and to any related child plan files.",
     "Include a `## Handoff Summary` section describing the executor-ready scope, assumptions, risks, and expected evidence.",
     "If you need strategy clarification, emit an opencode workflow message to main_pm or requester. If you need technical guidance, emit one to expert.",
-    "Use the built-in workflow tool with action=status at the start. If you split this milestone, call action=update_xml with the full revised workflow XML after writing it. If a real blocker prevents dispatch, call action=block with the blocker reason.",
+    "Use the built-in workflow tool with action=status at the start. After writing plan.md and the Handoff Summary, call action=plan_complete for this milestone so the runtime can continue. If you split this milestone, call action=update_xml with the full revised workflow XML after writing it. If a real blocker prevents dispatch, call action=block with the blocker reason.",
+    "Do not close planning by calling milestone_status done/approved. That command is intentionally rejected from planning; use plan_complete, or ask requester/main PM to force_complete a gate-only milestone.",
+    "Do not tell the company that executors were dispatched unless the workflow tool confirms update_xml/resume or this milestone is already running in the workflow status.",
   ].join("\n")
 }
 
@@ -3523,7 +3986,7 @@ function promptTester(input: { workflow: WorkflowInfo; milestones: WorkflowMiles
     "You are the long-lived workflow tester responsible for completeness review and regression feedback.",
     "",
     `Main request: ${input.workflow.request}`,
-    `Write targeted test notes to ${workflowArtifactPath(input.workflow, "test-plan.md")}.`,
+    `Write targeted test notes to ${workflowArtifactPath(input.workflow, workflowTestPlanPath())}.`,
     workflowReferencePrompt(input.workflow),
     "",
     "Use the built-in workflow tool with action=status at the start. If all work is truly complete after your required XML gate, action=complete may be used as an explicit final workflow signal.",
@@ -3609,7 +4072,7 @@ function mainPlanningExpectation(): WorkflowPromptExpectation {
     description: "dispatchable workflow XML and main plan",
     reminder: [
       "Finish the main PM planning task now.",
-      "Write workflow.xml and main-plan.md, or emit:",
+      `Write workflow.xml and ${workflowMainPlanPath()}, or emit:`,
       '<opencode-workflow-update reason="initial dispatch"><workflow>...</workflow></opencode-workflow-update>',
       "After writing files, call the built-in workflow tool with action=update_xml or action=resume so the runtime can validate and dispatch.",
       "Do not say dispatch has started unless the workflow runtime has received workflow XML.",
@@ -3626,6 +4089,7 @@ function handoffExpectation(label: string): WorkflowPromptExpectation {
     description: `${label} with a reusable ## Handoff Summary section`,
     reminder: "Finish the role task now and include a `## Handoff Summary` section with completed scope, evidence, risks, and next owner.",
     matches: hasHandoffSummary,
+    maxAttempts: 2,
   }
 }
 
@@ -3692,10 +4156,10 @@ function acceptanceExpectation(role: "main_pm" | "requester"): WorkflowPromptExp
 
 function workflowControlExpectation(): WorkflowPromptExpectation {
   return {
-    description: "workflow control XML with resume/block action",
+    description: "workflow control XML with resume/block or command action",
     reminder:
-      'Decide whether the workflow should resume or remain blocked and end with `<opencode-workflow-control action="resume">...</opencode-workflow-control>` or `<opencode-workflow-control action="block">...</opencode-workflow-control>`.',
-    matches: (text) => parseWorkflowControlAction(text) !== undefined,
+      'Decide whether the workflow should resume or remain blocked and end with `<opencode-workflow-control action="resume">...</opencode-workflow-control>` or `<opencode-workflow-control action="block">...</opencode-workflow-control>`. If you are closing a specific gate, use action="plan_complete", action="force_complete", action="force_skip", or action="milestone_status" with milestone="...".',
+    matches: (text) => parseWorkflowControlCommand(text) !== undefined,
   }
 }
 
@@ -3745,8 +4209,58 @@ function workflowExpectedOutputPrompt(expectation: WorkflowPromptExpectation, at
     expectation.reminder,
     "",
     "Do not request product clarification unless the original request is genuinely impossible to interpret. If another workflow employee has needed context, use workflow communication XML and then continue after the answer.",
+    "Workflow communication XML is not a dispatch signal. If the missing required output is a workflow status transition, use the built-in workflow tool and confirm it applied before saying the transition happened.",
     "If a requester/user decision is truly required, emit `<opencode-workflow-message to-role=\"requester\" timing=\"interrupt\" reason=\"decision required\">...Options: 1. ... (Recommended) ... 2. ...</opencode-workflow-message>` with concrete options and impacts.",
     `This is automatic continuation attempt ${attempt} of ${maxAttempts}.`,
+  ].join("\n")
+}
+
+function workflowDispatchCorrectionExpectation(role: WorkflowSessionRef["role"]): WorkflowPromptExpectation {
+  return {
+    description: "real workflow dispatch/control output, not workflow-message assignment",
+    reminder: [
+      "Your previous response claimed dispatch, routing, or queueing without a confirmed workflow control result.",
+      "Workflow communication or natural-language assignment only asks or notifies staff. It does not create a milestone job, attach a session to a milestone, unblock ordered dependencies, or close the current planning gate.",
+      "Now produce the real control output:",
+      "- If the graph needs more or different milestone jobs, emit <opencode-workflow-update> with the full valid workflow XML, then use the workflow tool action=update_xml.",
+      "- If the graph is already valid and should continue, use the workflow tool action=resume or end with <opencode-workflow-control action=\"resume\">...</opencode-workflow-control>.",
+      "- If you own a department PM planning gate and the plan is ready, use workflow tool action=plan_complete for the milestone, or emit <opencode-workflow-control action=\"plan_complete\" milestone=\"milestone-id\">...</opencode-workflow-control>.",
+      "- If a requester/main PM gate should unblock downstream work without executor/review work, use workflow tool action=force_complete, or emit <opencode-workflow-control action=\"force_complete\" milestone=\"milestone-id\">...</opencode-workflow-control>.",
+      "- If this was only a question to another employee, rewrite it as a question and do not describe it as an assignment, dispatch, wave, or executor startup.",
+    ].join("\n"),
+    matches: (text) =>
+      parseWorkflowUpdateXml(text) !== undefined ||
+      parseWorkflowControlCommand(text) !== undefined ||
+      (parseConsultRequests(text).length > 0 && !workflowMessageDispatchMisuse(text, role)),
+    maxAttempts: 2,
+  }
+}
+
+function workflowDispatchCorrectionPrompt(input: {
+  workflow: WorkflowInfo
+  role: WorkflowSessionRef["role"]
+  milestoneID?: WorkflowMilestoneID
+  previous: string
+}) {
+  return [
+    "Workflow dispatch correction required.",
+    "",
+    `Workflow: ${input.workflow.id}`,
+    `Role: ${roleSessionTitle(input.role)}`,
+    ...(input.milestoneID ? [`Milestone: ${input.milestoneID}`] : []),
+    "",
+    "The previous response looked like it claimed milestone dispatch, routing, or queueing without a confirmed workflow control result.",
+    "Workflow messages and natural-language assignments are only consultation or notification. They cannot start executor/reviewer/tester sessions and cannot satisfy ordered/parallel DAG scheduling.",
+    "",
+    "Correct the workflow state now using the real dispatch path:",
+    "1. For new or revised work items, emit <opencode-workflow-update> containing the full valid workflow XML and then use workflow tool action=update_xml.",
+    "2. If the XML is already correct, use workflow tool action=resume or end with <opencode-workflow-control action=\"resume\">continue scheduling</opencode-workflow-control>.",
+    "3. If this is a department PM planning handoff, finish the plan with ## Handoff Summary and use workflow tool action=plan_complete, or emit <opencode-workflow-control action=\"plan_complete\" milestone=\"milestone-id\">...</opencode-workflow-control>.",
+    "4. If this is a PM-only gate that should unblock downstream work, requester/main PM must use workflow tool action=force_complete, or emit <opencode-workflow-control action=\"force_complete\" milestone=\"milestone-id\">...</opencode-workflow-control>.",
+    "5. If you only need information from another employee, ask a question; do not call it assignment, dispatch, wave, direct routing, or executor startup.",
+    "",
+    "Previous response excerpt:",
+    compactMarkdown(input.previous, 1200),
   ].join("\n")
 }
 
@@ -3811,10 +4325,155 @@ export function parseGateMilestoneIDs(text: string, gate: "test" | "technical" |
   )
 }
 
+const workflowControlActions = new Set([
+  "resume",
+  "block",
+  "milestone_status",
+  "plan_complete",
+  "force_complete",
+  "force_skip",
+  "scheduling",
+  "workflow_status",
+  "complete",
+])
+const workflowMilestoneStatusValues = new Set([
+  "pending",
+  "planning",
+  "executing",
+  "reviewing",
+  "rejected",
+  "approved",
+  "blocked",
+  "testing",
+  "done",
+  "failed",
+  "skipped",
+  "running",
+  "completed",
+  "cancelled",
+])
+const workflowStatusValues = new Set([
+  "pending",
+  "running",
+  "planning",
+  "dispatching",
+  "executing",
+  "reviewing",
+  "testing",
+  "accepting",
+  "blocked",
+  "completed",
+  "failed",
+  "cancelled",
+])
+const workflowSchedulingModeValues = new Set(["eager", "staged", "economical"])
+
+export function parseWorkflowControlCommand(text: string) {
+  const paired = /<opencode-workflow-control\b([^>]*)>([\s\S]*?)<\/opencode-workflow-control>/i.exec(text)
+  const standalone = paired ? undefined : /<opencode-workflow-control\b([^>]*)\/?>/i.exec(text)
+  const attributes = paired?.[1] ?? standalone?.[1]
+  if (!attributes) return undefined
+  const action = (workflowControlAttribute(attributes, ["action"]) ?? "").replace(/-/g, "_").toLowerCase()
+  if (!workflowControlActions.has(action)) return undefined
+  const milestoneID = workflowControlAttribute(attributes, ["milestoneID", "milestone-id", "milestone", "id"])
+  const milestoneStatus = workflowMilestoneStatusAttribute(
+    workflowControlAttribute(attributes, ["milestoneStatus", "milestone-status", "status"]),
+  )
+  const workflowStatus = workflowControlAttribute(attributes, ["workflowStatus", "workflow-status", "workflow"])?.toLowerCase()
+  const schedulingMode = workflowControlAttribute(attributes, ["schedulingMode", "scheduling-mode", "mode"])?.toLowerCase()
+  const schedulingMaxActive = Number(workflowControlAttribute(attributes, ["schedulingMaxActive", "scheduling-max-active", "maxActive", "max-active"]))
+  const message = paired?.[2]?.trim()
+  return {
+    action,
+    ...(milestoneID ? { milestoneID: WorkflowMilestoneID.make(milestoneID) } : {}),
+    ...(milestoneStatus && workflowMilestoneStatusValues.has(milestoneStatus) ? { milestoneStatus } : {}),
+    ...(workflowStatus && workflowStatusValues.has(workflowStatus) ? { workflowStatus } : {}),
+    ...(schedulingMode && workflowSchedulingModeValues.has(schedulingMode) ? { schedulingMode } : {}),
+    ...(Number.isFinite(schedulingMaxActive) ? { schedulingMaxActive } : {}),
+    ...(message ? { message } : {}),
+  } as WorkflowToolCommand
+}
+
+function workflowMilestoneStatusAttribute(value: string | undefined) {
+  const status = value?.replace(/[-\s]+/g, "_").toLowerCase()
+  if (!status) return undefined
+  if (status === "approval" || status === "approve" || status === "accepted") return "approved"
+  if (status === "complete" || status === "finished" || status === "finish") return "done"
+  if (status === "in_progress" || status === "inprogress") return "executing"
+  return workflowMilestoneStatusValues.has(status) ? status : undefined
+}
+
 export function parseWorkflowControlAction(text: string) {
-  const action = /<opencode-workflow-control\b[^>]*\baction=["'](resume|block)["'][^>]*>/i.exec(text)?.[1]
+  const action = parseWorkflowControlCommand(text)?.action
   if (action === "resume" || action === "block") return action
   return undefined
+}
+
+function workflowControlAttribute(attributes: string, names: string[]) {
+  return names
+    .map((name) => new RegExp(`\\b${name}\\s*=\\s*["']([^"']+)["']`, "i").exec(attributes)?.[1]?.trim())
+    .find((value) => value)
+}
+
+export function workflowMessageDispatchMisuse(text: string, role?: WorkflowSessionRef["role"]) {
+  if (role !== "requester" && role !== "main_pm" && role !== "department_pm") return false
+  const requests = parseConsultRequests(text)
+  if (
+    !requests.some(
+      (request) =>
+        request.targetRole === "department_pm" ||
+        request.targetRole === "executor" ||
+        request.targetRole === "reviewer" ||
+        request.targetRole === "tester",
+    )
+  ) {
+    return false
+  }
+  return requests.some((request) =>
+    workflowTextClaimsDispatch([request.reason ?? "", request.question, text].filter(Boolean).join("\n")),
+  )
+}
+
+export function workflowDispatchClaimWithoutControl(text: string, role?: WorkflowSessionRef["role"]) {
+  if (role !== "requester" && role !== "main_pm" && role !== "department_pm") return false
+  if (parseWorkflowUpdateXml(text) || parseWorkflowControlCommand(text)) return false
+  if (workflowMessageDispatchMisuse(text, role)) return true
+  return workflowTextClaimsDispatch(text) || workflowTextClaimsControlQueue(text)
+}
+
+function workflowPlanClaimsClosedGate(text: string) {
+  return (
+    /\bqueued\b[\s\S]{0,120}\bmilestone_status\s*=\s*(done|approved|approval|complete|completed)\b/i.test(text) ||
+    /\bmilestone_status\s*=\s*(done|approved|approval|complete|completed)\b[\s\S]{0,120}\bqueued\b/i.test(text) ||
+    /\bgate[-\s]?only\b[\s\S]{0,120}\bcomplete\b/i.test(text) ||
+    /\brequirements[-\s]?milestone work is complete\b/i.test(text)
+  )
+}
+
+function workflowTextClaimsDispatch(text: string) {
+  const cleaned = text.replace(/do not use <opencode-workflow-message> as a dispatch mechanism/gi, "")
+  return /(\byour assignment\b|\bassign(?:ing|ed|ment)?\b[\s\S]{0,120}\b(executor|reviewer|tester|department[_\s-]*pm|sessions?)\b|\bdispatch(?:ed|ing)?\b[\s\S]{0,120}\b(executor|reviewer|tester|session|wave)\b|\broute\b[\s\S]{0,120}\bexecutor\b|\bprompt\b[\s\S]{0,120}\bexecutor sessions\b|\bwave\s*\d\b|第一波|第[一二三四五六七八九十]+波|直接继续到执行者|直接(?:派发|分配|启动)|开始派发|派发(?:执行者|会话|任务|第一波)|启动(?:执行者|后续流程)|路由到执行者|分配给执行者)/i.test(
+    cleaned,
+  )
+}
+
+function workflowCommandMessageClaimsDispatch(text: string | undefined, role?: WorkflowSessionRef["role"]) {
+  if (!text || (role !== "main_pm" && role !== "department_pm")) return false
+  return workflowTextClaimsDispatch(text)
+}
+
+function workflowTextClaimsControlQueue(text: string) {
+  const controlTerm =
+    /\b(milestone_status|plan_complete|force_complete|resume|workflow manager|control[-_\s]?plane|scheduler|dispatch|dispatching|queue|调度|派发|后续流程)\b/i
+  return (
+    /(\bqueued\b|\bqueue(?:d|ing)?\b|\bre-issue(?:d)?\b|\bissued\b|已(?:排队|提交|发送|触发)|重新(?:排队|提交|发送)|再次(?:排队|提交|发送))[\s\S]{0,180}\b(milestone_status|plan_complete|force_complete|resume|workflow manager|control[-_\s]?plane|scheduler|dispatch|dispatching|调度|派发|后续流程)\b/i.test(
+      text,
+    ) ||
+    (controlTerm.test(text) &&
+      /\b(hasn['’]?t|has not|not|still|genuinely|appears|is)\b[\s\S]{0,120}\b(drained?|draining|transitioned|stalled|stuck|blocked)\b|\b(drained?|draining|transitioned|stalled|stuck|blocked)\b[\s\S]{0,120}\b(milestone_status|plan_complete|force_complete|resume|control[-_\s]?plane|queue|scheduler)\b|没有(?:执行|生效|转换|派发)|未(?:执行|生效|转换|派发)/i.test(
+        text,
+      ))
+  )
 }
 
 function implicitWorkflowResume(text: string) {
@@ -3822,6 +4481,57 @@ function implicitWorkflowResume(text: string) {
   const dispatching = /Status\s*:\s*dispatching/i.test(text) || /状态\s*[:：]?\s*dispatching/i.test(text)
   const handoff = /(继续派发|开始派发|接手\s*M\d+|M\d+[-_\w]*\s*[:：]\s*(in_progress|pending)|下一步\s*[:：]?.*M\d+)/i.test(text)
   return (dispatching && (handoff || toolingBlocker)) || (toolingBlocker && handoff)
+}
+
+function requesterDirectExecutionOverride(text: string) {
+  return (
+    /(忽视|跳过|绕过|不要等|不用等|不需要等)[\s\S]{0,40}(planning|计划|规划|需求|requirements)/i.test(text) ||
+    /直接[\s\S]{0,40}(继续|进入|到|派发|分配|启动)[\s\S]{0,40}(执行者|执行|executor|审计|audit|后续)/i.test(text) ||
+    /(?:ignore|skip|bypass)[\s\S]{0,40}(planning|requirements)[\s\S]{0,60}(executor|execution|dispatch|audit|downstream)/i.test(
+      text,
+    )
+  )
+}
+
+function workflowInferredDispatchControl(input: {
+  text: string
+  role?: WorkflowSessionRef["role"]
+  milestoneID?: WorkflowMilestoneID
+  milestoneStatus?: WorkflowMilestoneInfo["status"]
+  milestones?: WorkflowMilestoneInfo[]
+}) {
+  if (!workflowDispatchClaimWithoutControl(input.text, input.role)) return
+  const currentStatus = input.milestoneStatus ? canonicalMilestoneStatus(input.milestoneStatus) : undefined
+  const gateClosed =
+    workflowPlanClaimsClosedGate(input.text) || requesterDirectExecutionOverride(input.text) || hasHandoffSummary(input.text)
+  if (
+    input.milestoneID &&
+    gateClosed &&
+    (currentStatus === "pending" || currentStatus === "planning" || currentStatus === "blocked") &&
+    (input.role === "requester" || input.role === "main_pm" || input.role === "department_pm")
+  ) {
+    return {
+      action: input.role === "department_pm" ? "plan_complete" : "force_complete",
+      milestoneID: input.milestoneID,
+      message:
+        "Runtime converted a completed planning-gate handoff that claimed dispatch without confirmed workflow control into the real workflow control command.",
+    } satisfies Partial<WorkflowToolCommand>
+  }
+  if (!gateClosed || (input.role !== "requester" && input.role !== "main_pm")) return
+  const activeGates = (input.milestones ?? []).filter((item) =>
+    ["planning", "blocked"].includes(canonicalMilestoneStatus(item.status)),
+  )
+  const planningGates =
+    activeGates.length > 0
+      ? activeGates
+      : (input.milestones ?? []).filter((item) => canonicalMilestoneStatus(item.status) === "pending")
+  if (planningGates.length !== 1) return
+  return {
+    action: "force_complete",
+    milestoneID: planningGates[0].id,
+    message:
+      "Runtime converted a requester/main PM planning-gate handoff that claimed dispatch without confirmed workflow control into force_complete.",
+  } satisfies Partial<WorkflowToolCommand>
 }
 
 function feedbackMilestoneIDs(items: WorkflowMilestoneInfo[], ids: WorkflowMilestoneID[]) {
@@ -3839,11 +4549,60 @@ function feedbackMilestoneIDs(items: WorkflowMilestoneInfo[], ids: WorkflowMiles
   return items.filter((item) => affected.has(String(item.id))).map((item) => item.id)
 }
 
-function parseXmlDefinition(xml: string) {
+function parseXmlDefinition(xml: string, workflow?: Pick<WorkflowInfo, "directory" | "id" | "path">) {
   try {
-    return parseWorkflowXml(xml)
+    return parseWorkflowXml(xml, workflow ? { readPipelineItems: workflowPipelineItemReader(workflow) } : {})
   } catch (error) {
     throw new globalThis.Error(error instanceof globalThis.Error ? error.message : String(error))
+  }
+}
+
+function workflowPipelineItemReader(workflow: Pick<WorkflowInfo, "directory" | "id" | "path">) {
+  return (itemsPath: string) => {
+    const normalized = normalizedWorkflowItemPath(itemsPath)
+    if (!normalized) throw new globalThis.Error(`invalid workflow pipeline items path: ${itemsPath}`)
+    try {
+      return JSON.parse(readFileSync(projectWorkflowPath(workflow.directory, workflow, normalized), "utf8"))
+    } catch (error) {
+      if (nodeErrorCode(error) === "ENOENT") return workflowPipelineItemsMissing(normalized)
+      throw error
+    }
+  }
+}
+
+function nodeErrorCode(error: unknown) {
+  return typeof error === "object" && error !== null && "code" in error
+    ? String((error as { code?: unknown }).code)
+    : undefined
+}
+
+function normalizedWorkflowItemPath(itemsPath: string) {
+  const trimmed = itemsPath.trim()
+  if (!trimmed || path.isAbsolute(trimmed)) return undefined
+  const parts = trimmed.split(/[\\/]+/).filter(Boolean)
+  if (parts.length === 0 || parts.some((part) => part === "..")) return undefined
+  return path.join(...parts)
+}
+
+function workflowPipelineItemPaths(xml: string) {
+  return Array.from(xml.matchAll(/<pipeline\b[^>]*\bitems\s*=\s*["']([^"']+)["']/gi))
+    .map((match) => match[1])
+    .filter((value): value is string => typeof value === "string")
+    .map(normalizedWorkflowItemPath)
+    .filter((value): value is string => typeof value === "string")
+}
+
+function workflowXmlFromText(text: string) {
+  const trimmed = text.trim()
+  const candidate = /^<workflow\b/i.test(trimmed)
+    ? trimmed
+    : /<workflow\b[\s\S]*<\/workflow>/i.exec(trimmed)?.[0]?.trim()
+  if (!candidate) return undefined
+  try {
+    parseXmlDefinition(candidate)
+    return candidate
+  } catch {
+    return undefined
   }
 }
 
@@ -3870,6 +4629,17 @@ function toConsultation(row: typeof WorkflowConsultationTable.$inferSelect): Wor
 
 function workflowStatePath(workflow: Pick<WorkflowInfo, "id" | "path">) {
   return workflowArtifactPath(workflow, workflowStateFileName)
+}
+
+function workflowStateSessionSnapshotPath(sessionID: SessionID) {
+  return path.join("state", "sessions", `${String(sessionID).replace(/[^a-zA-Z0-9._-]+/g, "_")}.json`)
+}
+
+function workflowStateRelativePath(value: string | undefined) {
+  if (!value || path.isAbsolute(value)) return undefined
+  const normalized = path.normalize(value)
+  if (normalized === ".." || normalized.startsWith(".." + path.sep)) return undefined
+  return normalized
 }
 
 function isWorkflowStatePath(file: string) {
@@ -3966,6 +4736,54 @@ function workflowStateSessionSnapshot(input: {
   }
 }
 
+function workflowStateSessionIndexEntry(session: ReturnType<typeof workflowStateSessionSnapshot>) {
+  const { messages, durableMessages, durableInputs, contextEpoch, ...summary } = session
+  return {
+    ...summary,
+    path: workflowStateSessionSnapshotPath(session.id),
+    contentHash: workflowStateContentHash(session),
+    messageCount: Array.isArray(messages) ? messages.length : 0,
+    durableMessageCount: Array.isArray(durableMessages) ? durableMessages.length : 0,
+    durableInputCount: Array.isArray(durableInputs) ? durableInputs.length : 0,
+    contextEpoch: contextEpoch ? { baselineSeq: contextEpoch.baseline_seq } : undefined,
+  }
+}
+
+async function readWorkflowStateSessionSnapshot(directory: string, workflow: WorkflowInfo, sessionState: Record<string, unknown>) {
+  const relative = workflowStateRelativePath(typeof sessionState.path === "string" ? sessionState.path : undefined)
+  if (!relative) return sessionState
+  const sidecar = await readFile(projectWorkflowPath(directory, workflow, relative), "utf8")
+    .then((text) => JSON.parse(text))
+    .catch(() => undefined)
+  if (!sidecar || typeof sidecar !== "object") return sessionState
+  if (typeof sessionState.contentHash === "string" && workflowStateContentHash(sidecar) !== sessionState.contentHash) {
+    throw new globalThis.Error(`session state content hash mismatch: ${relative}`)
+  }
+  return {
+    ...sidecar,
+    ...sessionState,
+    messages: Array.isArray(sidecar.messages) ? sidecar.messages : sessionState.messages,
+    durableMessages: Array.isArray(sidecar.durableMessages) ? sidecar.durableMessages : sessionState.durableMessages,
+    durableInputs: Array.isArray(sidecar.durableInputs) ? sidecar.durableInputs : sessionState.durableInputs,
+    contextEpoch: sidecar.contextEpoch ?? sessionState.contextEpoch,
+  }
+}
+
+function workflowStateContentHash(value: unknown) {
+  return createHash("sha256").update(workflowStateStableJson(value)).digest("hex")
+}
+
+function workflowStateStableJson(value: unknown): string {
+  if (value === undefined) return "null"
+  if (value === null || typeof value !== "object") return JSON.stringify(value)
+  if (Array.isArray(value)) return `[${value.map(workflowStateStableJson).join(",")}]`
+  return `{${Object.entries(value as Record<string, unknown>)
+    .filter((entry) => entry[1] !== undefined)
+    .toSorted((a, b) => a[0].localeCompare(b[0]))
+    .map((entry) => `${JSON.stringify(entry[0])}:${workflowStateStableJson(entry[1])}`)
+    .join(",")}}`
+}
+
 function workflowStateSessionRow(input: {
   ctx: { directory: string; worktree: string; project: { id: string } }
   workflow: WorkflowInfo
@@ -4012,6 +4830,22 @@ function workflowRestorePartID(sessionID: SessionID) {
   return PartID.ascending(`prt_workflow_restore_${String(sessionID).replace(/[^a-zA-Z0-9._-]+/g, "_")}`)
 }
 
+function workflowRestoreMessageExcerpts(session: ReturnType<typeof workflowStateSessionSnapshot>) {
+  const messages = Array.isArray(session.messages) ? session.messages : []
+  if (messages.length === 0) return []
+  const excerpts = messages
+    .flatMap((message) => (Array.isArray(message?.parts) ? message.parts : []))
+    .flatMap((part) => (part?.type === "text" && typeof part.text === "string" ? [part.text] : []))
+    .map((text) => text.replace(/\s+/g, " ").trim())
+    .filter(Boolean)
+    .slice(0, 3)
+  return [
+    "",
+    `Recovered snapshot messages: ${messages.length}.`,
+    ...excerpts.map((text, index) => `Recovered message excerpt ${index + 1}: ${text.slice(0, 500)}`),
+  ]
+}
+
 function workflowRestoreMessageText(workflow: WorkflowInfo, session: ReturnType<typeof workflowStateSessionSnapshot>) {
   return [
     "This session was restored from a project-local workflow snapshot.",
@@ -4022,15 +4856,23 @@ function workflowRestoreMessageText(workflow: WorkflowInfo, session: ReturnType<
     `Role: ${roleSessionTitle(session.role)}`,
     `Full session archive: ${workflowArtifactPath(workflow, workflowSessionArchivePath(session.id))}`,
     `Session summary: ${workflowArtifactPath(workflow, workflowSessionSummaryPath(session.id))}`,
+    ...workflowRestoreMessageExcerpts(session),
     "",
     "Use the workflow root, reference library, and archived session files as the recovered conversation history before continuing work.",
   ].join("\n")
 }
 
 function workflowRestoreMessageRows(workflow: WorkflowInfo, sessions: ReturnType<typeof workflowStateSessionSnapshot>[]) {
-  return sessions.map((session) => {
+  const restoredAt = Date.now()
+  return sessions.map((session, index) => {
     const id = workflowRestoreMessageID(session.id)
-    const time = session.time?.created ?? workflow.time.created
+    const time = Math.max(
+      restoredAt + index,
+      session.time?.updated ?? 0,
+      session.time?.created ?? 0,
+      workflow.time.updated ?? 0,
+      workflow.time.created,
+    )
     const model = session.model ?? workflowModelSessionRef(workflow.model) ?? { providerID: "opencode", id: "workflow-restore" }
     return {
       message: {
@@ -4148,6 +4990,97 @@ function workflowStateDurableInputRows(sessions: ReturnType<typeof workflowState
   )
 }
 
+function legacyQueuedWorkflowCommands(input: {
+  workflow: WorkflowInfo
+  sessions: ReturnType<typeof workflowStateSessionSnapshot>[]
+  legacy: boolean
+  existingCommandIDs: Set<string>
+}) {
+  if (!input.legacy) return []
+  const commands = input.sessions.flatMap((session) =>
+    (Array.isArray(session.messages) ? session.messages : []).flatMap((message) =>
+      (Array.isArray(message?.parts) ? message.parts : []).flatMap((part) =>
+        legacyQueuedWorkflowCommandFromPart({
+          workflow: input.workflow,
+          sessionID: session.id,
+          part,
+        }),
+      ),
+    ),
+  )
+  const seen = new Set<string>()
+  return commands
+    .filter((command) => {
+      const key = command.id ?? `${command.sourceSessionID}:${command.action}:${command.milestoneID ?? ""}:${command.milestoneStatus ?? ""}`
+      if (seen.has(key) || input.existingCommandIDs.has(key)) return false
+      seen.add(key)
+      return true
+    })
+    .toSorted(
+      (left, right) =>
+        legacyQueuedWorkflowCommandPriority(input.workflow, left) - legacyQueuedWorkflowCommandPriority(input.workflow, right),
+    )
+}
+
+function legacyQueuedWorkflowCommandFromPart(input: {
+  workflow: WorkflowInfo
+  sessionID: SessionID
+  part: Record<string, unknown>
+}) {
+  if (!input.part || input.part.type !== "tool" || input.part.tool !== "workflow") return []
+  const state = typeof input.part.state === "object" && input.part.state ? input.part.state : {}
+  if (state.status !== "completed") return []
+  const metadata = typeof state.metadata === "object" && state.metadata ? state.metadata : {}
+  const output = typeof state.output === "string" ? state.output : ""
+  if (metadata.workflowID && metadata.workflowID !== input.workflow.id) return []
+  if (metadata.queued !== true && !/Queued workflow command/i.test(output)) return []
+  const commandInput = typeof state.input === "object" && state.input ? state.input : {}
+  const action = typeof commandInput.action === "string" ? commandInput.action : undefined
+  if (!action || !["milestone_status", "plan_complete", "force_complete", "force_skip"].includes(action)) return []
+  const milestoneID = typeof commandInput.milestoneID === "string" ? commandInput.milestoneID : undefined
+  if (!milestoneID) return []
+  const milestoneStatus = typeof commandInput.milestoneStatus === "string" ? commandInput.milestoneStatus : undefined
+  const sourceSessionID =
+    typeof commandInput.sourceSessionID === "string" ? SessionID.make(commandInput.sourceSessionID) : input.sessionID
+  const message = typeof commandInput.message === "string" ? commandInput.message : "Recovered legacy queued workflow command."
+  return [
+    {
+      ...commandInput,
+      id: `legacy-queued:${String(input.part.id ?? `${sourceSessionID}:${action}:${milestoneID}`)}`,
+      action,
+      workflowID: input.workflow.id,
+      sourceSessionID,
+      sourceAgent: "workflow-legacy-queued-recovery",
+      milestoneID: WorkflowMilestoneID.make(milestoneID),
+      ...(milestoneStatus ? { milestoneStatus } : {}),
+      message,
+    },
+  ]
+}
+
+function legacyQueuedWorkflowCommandStillRelevant(command: WorkflowToolCommand, milestone: WorkflowMilestoneInfo | undefined) {
+  if (!milestone) return false
+  const currentStatus = canonicalMilestoneStatus(milestone.status)
+  if (command.action === "milestone_status") {
+    const targetStatus = command.milestoneStatus ? canonicalMilestoneStatus(command.milestoneStatus) : undefined
+    return currentStatus === "planning" && (targetStatus === "done" || targetStatus === "approved")
+  }
+  if (command.action === "plan_complete") return currentStatus === "planning" || currentStatus === "blocked"
+  if (command.action === "force_complete" || command.action === "force_skip") {
+    return ["pending", "planning", "blocked", "rejected", "failed"].includes(currentStatus)
+  }
+  return false
+}
+
+function legacyQueuedWorkflowCommandPriority(workflow: WorkflowInfo, command: WorkflowToolCommand) {
+  const sourceIsManager = command.sourceSessionID === workflow.rootSessionID || command.sourceSessionID === workflow.pmSessionID
+  const targetStatus = command.milestoneStatus ? canonicalMilestoneStatus(command.milestoneStatus) : undefined
+  if (sourceIsManager && command.action === "milestone_status" && (targetStatus === "done" || targetStatus === "approved")) return 0
+  if (command.action === "force_complete" || command.action === "force_skip") return 1
+  if (command.action === "plan_complete") return 2
+  return 3
+}
+
 function workflowStateContextEpochRows(sessions: ReturnType<typeof workflowStateSessionSnapshot>[]) {
   return sessions.flatMap((session) => {
     const row = session.contextEpoch
@@ -4207,7 +5140,7 @@ function workflowStateWorkflowRow(workflow: WorkflowInfo) {
     directory: workflow.directory,
     path: workflow.path,
     xml: workflow.xml,
-    status: workflow.status,
+    status: normalizeWorkflowStateWorkflowStatus(workflow.status),
     staffing: workflow.staffing ?? null,
     model: workflow.model ?? null,
     model_whitelist: workflow.modelWhitelist ?? null,
@@ -4226,9 +5159,11 @@ function workflowStateMilestoneRow(workflow: WorkflowInfo, milestone: WorkflowMi
     id: milestone.id,
     title: milestone.title,
     department: milestone.department,
+    review: milestone.review,
+    waiting_for: milestone.waitingFor,
     prompt: milestone.prompt,
     depends_on: milestone.dependsOn ?? [],
-    status: milestone.status,
+    status: normalizeWorkflowStateMilestoneStatus(milestone.status),
     attempt: milestone.attempt ?? 0,
     plan_path: workflowStoredPath(workflow, milestone.planPath, milestone.id, "plan.md"),
     review_path: milestone.reviewPath ? rewriteWorkflowStoredPath(workflow, milestone.reviewPath) : undefined,
@@ -4248,6 +5183,10 @@ function workflowStateMemberRow(member: WorkflowMemberInfo) {
     session_id: member.sessionID,
     capacity: member.capacity,
     status: member.status,
+    availability: member.availability ?? null,
+    current_focus: member.currentFocus ?? null,
+    blockers: member.blockers ?? [],
+    progress_note: member.progressNote ?? null,
     model: member.model ?? null,
     model_weight: member.modelWeight ?? null,
     model_cache_until: member.modelCacheUntil ?? null,
@@ -4275,6 +5214,28 @@ function workflowStateConsultationRow(consultation: WorkflowConsultationInfo) {
   }
 }
 
+function workflowStateConsultationMessageRow(consultation: WorkflowConsultationInfo) {
+  return {
+    workflow_id: consultation.workflowID,
+    id: consultation.id,
+    kind: "consultation",
+    from_session_id: consultation.fromSessionID,
+    from_role: consultation.fromRole,
+    to_session_id: consultation.toSessionID,
+    to_role: consultation.toRole,
+    milestone_id: consultation.milestoneID ?? null,
+    timing: consultation.timing ?? null,
+    body: consultation.question,
+    response: consultation.answer,
+    attachments: null,
+    status: consultation.status,
+    time_created: consultation.time.created,
+    time_delivered: null,
+    time_closed: ["answered", "expired", "failed"].includes(consultation.status) ? consultation.time.updated : null,
+    time_updated: consultation.time.updated,
+  }
+}
+
 function workflowStateInterventionRow(intervention: WorkflowInterventionInfo) {
   return {
     workflow_id: intervention.workflowID,
@@ -4288,6 +5249,28 @@ function workflowStateInterventionRow(intervention: WorkflowInterventionInfo) {
     path: intervention.path,
     status: intervention.status,
     time_created: intervention.time.created,
+    time_updated: intervention.time.updated,
+  }
+}
+
+function workflowStateInterventionMessageRow(intervention: WorkflowInterventionInfo) {
+  return {
+    workflow_id: intervention.workflowID,
+    id: intervention.id,
+    kind: intervention.message.includes("Attachments:") ? "handoff" : "intervention",
+    from_session_id: intervention.fromSessionID ?? null,
+    from_role: null,
+    to_session_id: intervention.targetSessionID ?? null,
+    to_role: intervention.targetRole,
+    milestone_id: null,
+    timing: intervention.timing,
+    body: intervention.message,
+    response: intervention.response ?? null,
+    attachments: null,
+    status: intervention.status,
+    time_created: intervention.time.created,
+    time_delivered: intervention.status === "delivered" || intervention.status === "acked" ? intervention.time.updated : null,
+    time_closed: ["acked", "expired", "failed"].includes(intervention.status) ? intervention.time.updated : null,
     time_updated: intervention.time.updated,
   }
 }
@@ -4308,18 +5291,560 @@ async function writeWorkflowStateFile(file: string, state: unknown) {
   await writeFileEnsured(file, content)
 }
 
+function workflowManifest(workflow: WorkflowInfo) {
+  return {
+    schema: 2,
+    workflowID: workflow.id,
+    projectID: workflow.projectID,
+    title: workflow.title,
+    created: workflow.time.created,
+    ownership: {
+      "views/**": "engine",
+      "archive/**": "engine",
+      "inbox/**": "engine",
+      "journal/**": "engine-append",
+      "graph/**": "engine-append",
+      "work/**": "agent",
+      "manifest.json": "engine",
+      "workflow.xml": "engine",
+      "workflow-state.json": "engine",
+      "planning/**": "engine",
+      "organization.md": "engine",
+      "progress.md": "engine",
+      "reference/**": "engine",
+      "sessions/**": "engine",
+      "interventions/**": "engine",
+      "standups/**": "engine-append",
+      "final/**": "engine",
+    },
+  }
+}
+
+async function readWorkflowManifestFileUnchecked(file: string) {
+  return JSON.parse(await readFile(file, "utf8"))
+}
+
+function workflowStateFileVersion(state) {
+  const version = state?.schema ?? state?.version ?? 1
+  return Number.isInteger(version) ? version : undefined
+}
+
+function normalizeWorkflowStateWorkflowStatus(status) {
+  if (status === "running") return "executing"
+  return status
+}
+
+function normalizeWorkflowStateMilestoneStatus(status) {
+  if (status === "completed" || status === "complete" || status === "finished") return "done"
+  if (status === "running" || status === "in_progress" || status === "inprogress") return "executing"
+  if (status === "approval" || status === "approve" || status === "accepted") return "approved"
+  return status
+}
+
+function normalizeWorkflowStateFile(state) {
+  return {
+    ...state,
+    schema: workflowStateSchemaVersion,
+    version: workflowStateSchemaVersion,
+    workflow: {
+      ...state.workflow,
+      status: normalizeWorkflowStateWorkflowStatus(state.workflow?.status),
+      directory: ".",
+    },
+    milestones: Array.isArray(state.milestones)
+      ? state.milestones.map((milestone) => ({
+          ...milestone,
+          status: normalizeWorkflowStateMilestoneStatus(milestone?.status),
+        }))
+      : [],
+    journal: state.journal ?? {},
+  }
+}
+
+function workflowStateSnapshot(state) {
+  const version = workflowStateFileVersion(state)
+  if (!version || version > workflowStateSchemaVersion || !state?.workflow?.id) return
+  return {
+    state: normalizeWorkflowStateFile(state),
+    legacy:
+      version < workflowStateSchemaVersion ||
+      state.schema !== workflowStateSchemaVersion ||
+      state.version !== workflowStateSchemaVersion,
+  }
+}
+
 async function readWorkflowStateFile(file: string) {
   const parsed = JSON.parse(await readFile(file, "utf8"))
-  if (parsed?.version !== 1 || !parsed.workflow?.id) return
-  return parsed
+  return workflowStateSnapshot(parsed)
+}
+
+async function readWorkflowStateFileUnchecked(file: string) {
+  return JSON.parse(await readFile(file, "utf8"))
 }
 
 async function workflowStateFiles(directory: string) {
   const root = path.join(directory, workflowDir)
   const entries = await readdir(root, { withFileTypes: true }).catch(() => [])
   return entries
-    .filter((entry) => entry.isDirectory())
+    .filter((entry) => entry.isDirectory() && !entry.name.includes(".orphaned-"))
     .map((entry) => path.join(root, entry.name, workflowStateFileName))
+}
+
+async function workflowDirectoryEntries(directory: string) {
+  return readdir(path.join(directory, workflowDir), { withFileTypes: true }).catch(() => [])
+}
+
+async function workflowDirectoriesForID(directory: string, workflowID: WorkflowID) {
+  const root = path.join(directory, workflowDir)
+  const entries = await workflowDirectoryEntries(directory)
+  const matches = await Promise.all(
+    entries
+      .filter((entry) => entry.isDirectory() && !entry.name.includes(".orphaned-"))
+      .map(async (entry) => {
+        const relative = path.join(workflowDir, entry.name)
+        if (entry.name === workflowFolderID(workflowID)) return relative
+        const manifest = await readWorkflowManifestFileUnchecked(path.join(root, entry.name, workflowManifestFileName)).catch(() => undefined)
+        if (manifest?.workflowID === workflowID) return relative
+        const state = await readWorkflowStateFileUnchecked(path.join(root, entry.name, workflowStateFileName)).catch(() => undefined)
+        return state?.workflow?.id === workflowID ? relative : undefined
+      }),
+  )
+  return matches.filter((item): item is string => Boolean(item))
+}
+
+async function workflowDirectoryJournalScore(directory: string, relative: string) {
+  const highWater = async (name: string) => {
+    const file = path.join(directory, relative, "journal", name)
+    const text = await readFile(file, "utf8").catch((error) => {
+      if (nodeErrorCode(error) === "ENOENT") return ""
+      throw error
+    })
+    return Math.max(
+      0,
+      ...text
+        .split(/\r?\n/)
+        .filter((line) => line.trim().length > 0)
+        .flatMap((line) => {
+          try {
+            const row = JSON.parse(line)
+            return Number.isInteger(row?.seq) ? [row.seq] : []
+          } catch {
+            return []
+          }
+        }),
+    )
+  }
+  const updated = await stat(path.join(directory, relative))
+    .then((info) => info.mtimeMs)
+    .catch(() => 0)
+  const [commands, messages, events] = await Promise.all([
+    highWater("commands.jsonl"),
+    highWater("messages.jsonl"),
+    highWater("events.jsonl"),
+  ])
+  return {
+    path: relative,
+    commands,
+    messages,
+    events,
+    highWater: commands + messages + events,
+    maxHighWater: Math.max(commands, messages, events),
+    updated,
+  }
+}
+
+function workflowDirectoryJournalDescription(score: Awaited<ReturnType<typeof workflowDirectoryJournalScore>>) {
+  return `${score.path} (highWater=${score.highWater}, commands=${score.commands}, messages=${score.messages}, events=${score.events})`
+}
+
+function compareWorkflowDirectoryScore(
+  left: Awaited<ReturnType<typeof workflowDirectoryJournalScore>>,
+  right: Awaited<ReturnType<typeof workflowDirectoryJournalScore>>,
+  canonicalPath: string,
+  currentPath: string,
+) {
+  const highWater = right.highWater - left.highWater
+  if (highWater !== 0) return highWater
+  const maxHighWater = right.maxHighWater - left.maxHighWater
+  if (maxHighWater !== 0) return maxHighWater
+  const canonical = Number(path.normalize(right.path) === path.normalize(canonicalPath)) - Number(path.normalize(left.path) === path.normalize(canonicalPath))
+  if (canonical !== 0) return canonical
+  const current = Number(path.normalize(right.path) === path.normalize(currentPath)) - Number(path.normalize(left.path) === path.normalize(currentPath))
+  if (current !== 0) return current
+  const updated = right.updated - left.updated
+  if (updated !== 0) return updated
+  return left.path.localeCompare(right.path)
+}
+
+async function workflowTempFiles(directory: string, workflow: WorkflowInfo) {
+  const entries = await readdir(path.join(directory, workflow.path), { withFileTypes: true }).catch(() => [])
+  return entries.filter((entry) => entry.isFile() && entry.name.startsWith(".tmp-")).map((entry) => path.join(workflow.path, entry.name))
+}
+
+async function removeWorkflowTempFiles(directory: string, workflow: WorkflowInfo) {
+  await Promise.all((await workflowTempFiles(directory, workflow)).map((file) => rm(path.join(directory, file), { force: true })))
+}
+
+async function repairWorkflowJournalTails(directory: string, workflow: WorkflowInfo) {
+  await Promise.all(
+    ["commands.jsonl", "messages.jsonl", "events.jsonl"].map((name) =>
+      repairWorkflowJournalTail({ directory, workflow, name }),
+    ),
+  )
+}
+
+async function repairWorkflowJournalSequences(directory: string, workflow: WorkflowInfo) {
+  await Promise.all(
+    ["commands.jsonl", "messages.jsonl", "events.jsonl"].map((name) =>
+      repairWorkflowJournalSequence({ directory, workflow, name }),
+    ),
+  )
+}
+
+async function repairWorkflowJournalTail(input: {
+  workflow: WorkflowInfo
+  directory: string
+  name: string
+}) {
+  const file = path.join(input.directory, input.workflow.path, "journal", input.name)
+  const text = await readFile(file, "utf8").catch((error) => {
+    if (nodeErrorCode(error) === "ENOENT") return undefined
+    throw error
+  })
+  if (!text) return
+  const entries = text
+    .split(/\r?\n/)
+    .map((line, index) => ({ line, index }))
+    .filter((item) => item.line.trim().length > 0)
+    .map((item) => {
+      try {
+        JSON.parse(item.line)
+        return { ...item, valid: true }
+      } catch {
+        return { ...item, valid: false }
+      }
+    })
+  const firstInvalid = entries.findIndex((item) => !item.valid)
+  if (firstInvalid === -1) return
+  if (entries.slice(firstInvalid + 1).some((item) => item.valid)) return
+  const repaired = entries
+    .slice(0, firstInvalid)
+    .map((item) => item.line)
+    .join("\n")
+  await writeFileEnsured(file, repaired ? `${repaired}\n` : "")
+}
+
+async function repairWorkflowJournalSequence(input: {
+  workflow: WorkflowInfo
+  directory: string
+  name: string
+}) {
+  const file = path.join(input.directory, input.workflow.path, "journal", input.name)
+  const text = await readFile(file, "utf8").catch((error) => {
+    if (nodeErrorCode(error) === "ENOENT") return undefined
+    throw error
+  })
+  if (!text) return
+  const lines = text.split(/\r?\n/).filter((line) => line.trim().length > 0)
+  const rows: Record<string, unknown>[] = []
+  for (const line of lines) {
+    const data = (() => {
+      try {
+        return JSON.parse(line)
+      } catch {
+        return undefined
+      }
+    })()
+    if (data === undefined) return
+    if (typeof data !== "object" || data === null || Array.isArray(data)) return
+    rows.push(data as Record<string, unknown>)
+  }
+  const repaired = rows.map((row, index) => JSON.stringify({ ...row, seq: index + 1 })).join("\n")
+  const content = repaired ? `${repaired}\n` : ""
+  if (content === text) return
+  await writeFileEnsured(file, content)
+}
+
+async function workflowJournalIssues(input: {
+  workflow: WorkflowInfo
+  directory: string
+  name: string
+}) {
+  const file = path.join(input.directory, input.workflow.path, "journal", input.name)
+  const relative = path.join(input.workflow.path, "journal", input.name)
+  const text = await readFile(file, "utf8").catch((error) => {
+    if (nodeErrorCode(error) === "ENOENT") return undefined
+    throw error
+  })
+  if (!text) return []
+  const parsed = text
+    .split(/\r?\n/)
+    .map((line, index) => ({ line, index }))
+    .filter((item) => item.line.trim().length > 0)
+    .map((item) => {
+      try {
+        return { ...item, data: JSON.parse(item.line) }
+      } catch (error) {
+        return {
+          ...item,
+          issue: {
+            severity: "error" as const,
+            code: "invalid_journal_json",
+            workflowID: input.workflow.id,
+            path: relative,
+            message: `${input.name} line ${item.index + 1} is not valid JSON: ${
+              error instanceof globalThis.Error ? error.message : String(error)
+            }`,
+          },
+        }
+      }
+    })
+  const issues = parsed.flatMap((item) => (item.issue ? [item.issue] : []))
+  const rows = parsed.filter((item) => item.data !== undefined)
+  if (rows.length === 0) return issues
+  const seqRows = rows.filter((item) => Object.prototype.hasOwnProperty.call(item.data, "seq"))
+  if (seqRows.length === 0) {
+    return [
+      ...issues,
+      {
+        severity: "warning" as const,
+        code: "missing_journal_seq",
+        workflowID: input.workflow.id,
+        path: relative,
+        message: `${input.name} has entries without seq; journal order cannot be used as a recovery high-water mark`,
+      },
+    ]
+  }
+  return [
+    ...issues,
+    ...rows.flatMap((item, index) => {
+      const seq = item.data.seq
+      if (seq === undefined) {
+        return [
+          {
+            severity: "warning" as const,
+            code: "missing_journal_seq",
+            workflowID: input.workflow.id,
+            path: relative,
+            message: `${input.name} line ${item.index + 1} is missing seq`,
+          },
+        ]
+      }
+      if (!Number.isInteger(seq) || seq <= 0) {
+        return [
+          {
+            severity: "error" as const,
+            code: "invalid_journal_seq",
+            workflowID: input.workflow.id,
+            path: relative,
+            message: `${input.name} line ${item.index + 1} has invalid seq ${String(seq)}`,
+          },
+        ]
+      }
+      if (seq !== index + 1) {
+        return [
+          {
+            severity: "error" as const,
+            code: "journal_seq_gap",
+            workflowID: input.workflow.id,
+            path: relative,
+            message: `${input.name} line ${item.index + 1} has seq ${seq}; expected ${index + 1}`,
+          },
+        ]
+      }
+      return []
+    }),
+  ]
+}
+
+async function writeWorkflowGraphRevision(directory: string, workflow: WorkflowInfo, xml: string) {
+  const graphRoot = path.join(directory, workflowArtifactPath(workflow, "graph"))
+  const revisions = (await readdir(graphRoot, { withFileTypes: true }).catch(() => []))
+    .filter((entry) => entry.isFile())
+    .flatMap((entry) => {
+      const match = /^rev-(\d+)\.xml$/.exec(entry.name)
+      return match ? [{ name: entry.name, revision: Number(match[1]) }] : []
+    })
+  const latest = revisions.toSorted((a, b) => b.revision - a.revision)[0]
+  if ((await readFile(path.join(graphRoot, latest?.name ?? ""), "utf8").catch(() => undefined)) === xml) return
+  const relative = workflowArtifactPath(
+    workflow,
+    "graph",
+    `rev-${String((latest?.revision ?? 0) + 1).padStart(3, "0")}.xml`,
+  )
+  await writeFileEnsured(path.join(directory, relative), xml)
+  return relative
+}
+
+async function workflowJournalExists(input: {
+  workflow: WorkflowInfo
+  directory: string
+  name: string
+}) {
+  const info = await stat(path.join(input.directory, input.workflow.path, "journal", input.name)).catch((error) => {
+    if (nodeErrorCode(error) === "ENOENT") return undefined
+    throw error
+  })
+  return info?.isFile() === true
+}
+
+async function workflowJournalSnapshot(input: {
+  workflow: WorkflowInfo
+  directory: string
+  name: string
+  useLineSequence?: boolean
+}) {
+  const file = path.join(input.directory, input.workflow.path, "journal", input.name)
+  const text = await readFile(file, "utf8").catch((error) => {
+    if (nodeErrorCode(error) === "ENOENT") return ""
+    throw error
+  })
+  const rows = text
+    .split(/\r?\n/)
+    .filter((line) => line.trim().length > 0)
+    .flatMap((line, index) => {
+      try {
+        const row = JSON.parse(line)
+        if (input.useLineSequence && !Number.isInteger(row?.seq)) return [{ ...row, seq: index + 1 }]
+        return [row]
+      } catch {
+        return []
+      }
+    })
+  const seqs = rows.map((row) => row?.seq).filter((seq) => Number.isInteger(seq))
+  return {
+    path: path.join("journal", input.name).replaceAll("\\", "/"),
+    entries: rows.length,
+    highWater: seqs.length > 0 ? Math.max(...seqs) : 0,
+  }
+}
+
+async function workflowJournalState(directory: string, workflow: WorkflowInfo) {
+  return {
+    commands: await workflowJournalSnapshot({ workflow, directory, name: "commands.jsonl" }),
+    messages: await workflowJournalSnapshot({ workflow, directory, name: "messages.jsonl", useLineSequence: true }),
+    events: await workflowJournalSnapshot({ workflow, directory, name: "events.jsonl" }),
+  }
+}
+
+async function workflowCommandJournalReplayRows(input: { directory: string; workflow: WorkflowInfo; highWater: number }) {
+  const text = await readFile(projectWorkflowPath(input.directory, input.workflow, workflowCommandJournalPath()), "utf8").catch(
+    (error) => {
+      if (nodeErrorCode(error) === "ENOENT") return ""
+      throw error
+    },
+  )
+  const rows = text
+    .trim()
+    .split(/\r?\n/)
+    .filter(Boolean)
+    .flatMap((line) => {
+      try {
+        return [JSON.parse(line)]
+      } catch {
+        return []
+      }
+    })
+    .filter((row) => Number.isInteger(row?.seq))
+    .toSorted((a, b) => a.seq - b.seq)
+  return {
+    highWater: rows.length > 0 ? Math.max(...rows.map((row) => row.seq)) : 0,
+    rows: rows.filter((row) => row.seq > input.highWater && row.outcome === "applied"),
+  }
+}
+
+async function workflowCommandJournalIDs(input: { directory: string; workflow: WorkflowInfo }) {
+  const text = await readFile(projectWorkflowPath(input.directory, input.workflow, workflowCommandJournalPath()), "utf8").catch(
+    (error) => {
+      if (nodeErrorCode(error) === "ENOENT") return ""
+      throw error
+    },
+  )
+  return new Set(
+    text
+      .trim()
+      .split(/\r?\n/)
+      .filter(Boolean)
+      .flatMap((line) => {
+        try {
+          const row = JSON.parse(line)
+          return typeof row?.id === "string" ? [row.id] : []
+        } catch {
+          return []
+        }
+      }),
+  )
+}
+
+async function workflowMessageJournalReplayRows(input: { directory: string; workflow: WorkflowInfo; highWater: number }) {
+  const text = await readFile(projectWorkflowPath(input.directory, input.workflow, workflowMessageJournalPath()), "utf8").catch(
+    (error) => {
+      if (nodeErrorCode(error) === "ENOENT") return ""
+      throw error
+    },
+  )
+  const rows = text
+    .trim()
+    .split(/\r?\n/)
+    .filter(Boolean)
+    .flatMap((line, index) => {
+      try {
+        const row = JSON.parse(line)
+        return [{ ...row, seq: Number.isInteger(row?.seq) ? row.seq : index + 1 }]
+      } catch {
+        return []
+      }
+    })
+    .filter((row) => Number.isInteger(row?.seq))
+    .toSorted((a, b) => a.seq - b.seq)
+  return {
+    highWater: rows.length > 0 ? Math.max(...rows.map((row) => row.seq)) : 0,
+    rows: rows.filter((row) => row.seq > input.highWater && typeof row.messageID === "string"),
+  }
+}
+
+async function workflowEventJournalReplayRows(input: { directory: string; workflow: WorkflowInfo; highWater: number }) {
+  const text = await readFile(projectWorkflowPath(input.directory, input.workflow, workflowEventJournalPath()), "utf8").catch(
+    (error) => {
+      if (nodeErrorCode(error) === "ENOENT") return ""
+      throw error
+    },
+  )
+  const rows = text
+    .trim()
+    .split(/\r?\n/)
+    .filter(Boolean)
+    .flatMap((line) => {
+      try {
+        return [JSON.parse(line)]
+      } catch {
+        return []
+      }
+    })
+    .filter((row) => Number.isInteger(row?.seq))
+    .toSorted((a, b) => a.seq - b.seq)
+  return {
+    highWater: rows.length > 0 ? Math.max(...rows.map((row) => row.seq)) : 0,
+    rows: rows.filter((row) => row.seq > input.highWater && typeof row.action === "string"),
+  }
+}
+
+function workflowJournalRowTime(row: { ts?: unknown }, fallback: number) {
+  if (typeof row.ts !== "string") return fallback
+  const parsed = Date.parse(row.ts)
+  return Number.isFinite(parsed) ? parsed : fallback
+}
+
+function workflowJournalRowResponse(row: { response?: unknown; answer?: unknown }) {
+  if (typeof row.response === "string") return row.response
+  if (typeof row.answer === "string") return row.answer
+}
+
+function workflowHasControlHistory(workflow: WorkflowInfo, milestones: WorkflowMilestoneInfo[]) {
+  return (
+    !["pending", "running", "planning"].includes(workflow.status) ||
+    milestones.some((milestone) => milestone.attempt > 0 || milestone.session.length > 0 || milestone.status !== "pending")
+  )
 }
 
 export const layer: Layer.Layer<
@@ -4338,15 +5863,102 @@ export const layer: Layer.Layer<
     const workflowManagedMessageKeys = new Set<string>()
     const observedWorkflowMessageKeys = new Set<string>()
     const observedRequesterMessageKeys = new Set<string>()
+    const workflowToolCommandResults = new Map<string, WorkflowToolCommandRuntimeResult>()
+    const workflowToolCommandInflight = new Map<
+      string,
+      {
+        promise: Promise<WorkflowToolCommandRuntimeResult>
+        resolve: (value: WorkflowToolCommandRuntimeResult) => void
+        reject: (reason: unknown) => void
+      }
+    >()
+    const workflowToolCommandDeferred = () => {
+      let resolve = (_value: WorkflowToolCommandRuntimeResult) => {}
+      let reject = (_reason: unknown) => {}
+      const promise = new Promise<WorkflowToolCommandRuntimeResult>((done, fail) => {
+        resolve = done
+        reject = fail
+      })
+      promise.catch(() => {})
+      return { promise, resolve, reject }
+    }
+    const rememberWorkflowToolCommandResult = (id: string, value: WorkflowToolCommandRuntimeResult) => {
+      workflowToolCommandResults.set(id, value)
+      if (workflowToolCommandResults.size > 500) {
+        workflowToolCommandResults.delete(workflowToolCommandResults.keys().next().value)
+      }
+    }
+    const withWorkflowToolCommandQueue = (workflowID: WorkflowID, effect: Effect.Effect<void>) => {
+      const previous = workflowToolCommandChains.get(workflowID) ?? Promise.resolve()
+      let release = () => {}
+      const current = new Promise<void>((done) => {
+        release = done
+      })
+      const chain = previous.catch(() => {}).then(() => current)
+      workflowToolCommandChains.set(workflowID, chain)
+      return Effect.gen(function* () {
+        yield* Effect.promise(() => previous.catch(() => {}))
+        return yield* effect
+      }).pipe(
+        Effect.ensuring(
+          Effect.sync(() => {
+            release()
+            if (workflowToolCommandChains.get(workflowID) === chain) workflowToolCommandChains.delete(workflowID)
+          }),
+        ),
+      )
+    }
+    const withWorkflowMemberAssignmentQueue = <A, E, R>(workflowID: WorkflowID, effect: Effect.Effect<A, E, R>) => {
+      const previous = workflowMemberAssignmentChains.get(workflowID) ?? Promise.resolve()
+      let release = () => {}
+      const current = new Promise<void>((done) => {
+        release = done
+      })
+      const chain = previous.catch(() => {}).then(() => current)
+      workflowMemberAssignmentChains.set(workflowID, chain)
+      return Effect.gen(function* () {
+        yield* Effect.promise(() => previous.catch(() => {}))
+        return yield* effect
+      }).pipe(
+        Effect.ensuring(
+          Effect.sync(() => {
+            release()
+            if (workflowMemberAssignmentChains.get(workflowID) === chain) workflowMemberAssignmentChains.delete(workflowID)
+          }),
+        ),
+      )
+    }
     const observedWorkflowFiles = new Map<string, string>()
     const workflowMessageKey = (sessionID: SessionID, messageID: MessageID) => `${sessionID}:${messageID}`
 
+    const recoverLegacyQueuedWorkflowCommands = Effect.fn("Workflow.recoverLegacyQueuedWorkflowCommands")(function* (
+      workflowID: WorkflowID,
+      commands: WorkflowToolCommand[],
+    ) {
+      if (commands.length === 0) return false
+      let attempted = false
+      for (const command of commands) {
+        const current = command.milestoneID
+          ? (yield* milestones(workflowID)).find((item) => item.id === command.milestoneID)
+          : undefined
+        if (!legacyQueuedWorkflowCommandStillRelevant(command, current)) continue
+        attempted = true
+        yield* handleWorkflowToolCommand({
+          ...command,
+          workflowID,
+        }).pipe(Effect.ignore)
+      }
+      if (attempted) yield* publishUpdated(workflowID).pipe(Effect.ignore)
+      return attempted
+    })
+
     const syncWorkflowStateFile = Effect.fn("Workflow.syncWorkflowStateFile")(function* (file: string) {
       const ctx = yield* InstanceState.context
-      const state = yield* Effect.promise(() => readWorkflowStateFile(file)).pipe(
+      const snapshot = yield* Effect.promise(() => readWorkflowStateFile(file)).pipe(
         Effect.catchCause(() => Effect.succeed(undefined)),
       )
-      if (!state) return false
+      if (!snapshot) return false
+      const state = snapshot.state
       const storedPath = workflowStateStoredPath(state.workflow.path, workflowStateFileDirectory(ctx, file))
       if (!storedPath) return false
       const stateTimeCreated = state.workflow.time?.created ?? Date.now()
@@ -4362,6 +5974,19 @@ export const layer: Layer.Layer<
           completed: state.workflow.time?.completed,
         },
       }
+      const snapshotCommandHighWater = state.journal?.commands?.highWater ?? 0
+      const commandJournalReplay = yield* Effect.promise(() =>
+        workflowCommandJournalReplayRows({ directory: ctx.directory, workflow, highWater: snapshotCommandHighWater }),
+      )
+      const commandJournalIDs = yield* Effect.promise(() => workflowCommandJournalIDs({ directory: ctx.directory, workflow }))
+      const snapshotMessageHighWater = state.journal?.messages?.highWater ?? 0
+      const messageJournalReplay = yield* Effect.promise(() =>
+        workflowMessageJournalReplayRows({ directory: ctx.directory, workflow, highWater: snapshotMessageHighWater }),
+      )
+      const snapshotEventHighWater = state.journal?.events?.highWater ?? 0
+      const eventJournalReplay = yield* Effect.promise(() =>
+        workflowEventJournalReplayRows({ directory: ctx.directory, workflow, highWater: snapshotEventHighWater }),
+      )
       const milestoneItems = (Array.isArray(state.milestones) ? state.milestones : []).map((milestone) => ({
         ...milestone,
         planPath: workflowStateStoredPath(milestone.planPath, workflowArtifactPath(workflow, milestone.id, "plan.md")),
@@ -4384,11 +6009,13 @@ export const layer: Layer.Layer<
         path: workflowStateStoredPath(intervention.path, workflowArtifactPath(workflow, workflowInterventionPath(intervention.id))),
         time: intervention.time ?? { created: workflow.time.created, updated: workflow.time.updated },
       }))
-      const sessionByID = new Map(
+      const sessionStatesFromDisk = yield* Effect.all(
         (Array.isArray(state.sessions) ? state.sessions : [])
           .filter((item) => item?.id)
-          .map((item) => [item.id, item]),
+          .map((item) => Effect.promise(() => readWorkflowStateSessionSnapshot(ctx.directory, workflow, item))),
+        { concurrency: 4 },
       )
+      const sessionByID = new Map(sessionStatesFromDisk.filter((item) => item?.id).map((item) => [item.id, item]))
       const sessionRefs = workflowStateSessionRefs({
         workflow,
         milestones: milestoneItems,
@@ -4432,12 +6059,28 @@ export const layer: Layer.Layer<
           contextEpoch: state.contextEpoch,
         }
       })
+      const legacyQueuedCommands = legacyQueuedWorkflowCommands({
+        workflow,
+        sessions: sessionStates,
+        legacy: snapshot.legacy,
+        existingCommandIDs: commandJournalIDs,
+      })
+      const storedSessionIDs = new Set(
+        sessionRows.length === 0
+          ? []
+          : Database.use((db) =>
+              db
+                .select({ id: SessionTable.id })
+                .from(SessionTable)
+                .where(inArray(SessionTable.id, sessionRows.map((row) => row.id)))
+                .all(),
+            ).map((row) => row.id),
+      )
       const persistedMessages = workflowStateMessageRows(sessionStates)
       const persistedParts = persistedMessages.flatMap((item) => item.parts)
-      const persistedSessionIDs = new Set(persistedMessages.map((item) => item.message.session_id))
       const restoreMessages = workflowRestoreMessageRows(
         workflow,
-        sessionStates.filter((sessionState) => !persistedSessionIDs.has(sessionState.id)),
+        sessionStates.filter((sessionState) => !storedSessionIDs.has(sessionState.id)),
       )
       const durableMessages = workflowStateDurableMessageRows(sessionStates)
       const durableInputs = workflowStateDurableInputRows(sessionStates)
@@ -4447,38 +6090,38 @@ export const layer: Layer.Layer<
       const durableMessageIDs = durableMessages.map((row) => row.id)
       const durableInputIDs = durableInputs.map((row) => row.id)
       const contextEpochSessionIDs = contextEpochs.map((row) => row.session_id)
-      const storedMessageTimes = new Map(
+      const storedMessages = new Map(
         messageIDs.length === 0
           ? []
           : Database.use((db) =>
               db
-                .select({ id: MessageTable.id, timeUpdated: MessageTable.time_updated })
+                .select({ id: MessageTable.id, timeUpdated: MessageTable.time_updated, data: MessageTable.data })
                 .from(MessageTable)
                 .where(inArray(MessageTable.id, messageIDs))
                 .all(),
-            ).map((row) => [row.id, row.timeUpdated]),
+            ).map((row) => [row.id, { timeUpdated: row.timeUpdated, hash: workflowStateContentHash(row.data) }]),
       )
-      const storedPartTimes = new Map(
+      const storedParts = new Map(
         partIDs.length === 0
           ? []
           : Database.use((db) =>
               db
-                .select({ id: PartTable.id, timeUpdated: PartTable.time_updated })
+                .select({ id: PartTable.id, timeUpdated: PartTable.time_updated, data: PartTable.data })
                 .from(PartTable)
                 .where(inArray(PartTable.id, partIDs))
                 .all(),
-            ).map((row) => [row.id, row.timeUpdated]),
+            ).map((row) => [row.id, { timeUpdated: row.timeUpdated, hash: workflowStateContentHash(row.data) }]),
       )
-      const storedDurableMessageTimes = new Map(
+      const storedDurableMessages = new Map(
         durableMessageIDs.length === 0
           ? []
           : Database.use((db) =>
               db
-                .select({ id: SessionMessageTable.id, timeUpdated: SessionMessageTable.time_updated })
+                .select({ id: SessionMessageTable.id, timeUpdated: SessionMessageTable.time_updated, data: SessionMessageTable.data })
                 .from(SessionMessageTable)
                 .where(inArray(SessionMessageTable.id, durableMessageIDs))
                 .all(),
-            ).map((row) => [row.id, row.timeUpdated]),
+            ).map((row) => [row.id, { timeUpdated: row.timeUpdated, hash: workflowStateContentHash(row.data) }]),
       )
       const storedDurableInputs = new Map(
         durableInputIDs.length === 0
@@ -4505,6 +6148,8 @@ export const layer: Layer.Layer<
               db
                 .select({
                   sessionID: SessionContextEpochTable.session_id,
+                  baseline: SessionContextEpochTable.baseline,
+                  snapshot: SessionContextEpochTable.snapshot,
                   baselineSeq: SessionContextEpochTable.baseline_seq,
                 })
                 .from(SessionContextEpochTable)
@@ -4512,27 +6157,186 @@ export const layer: Layer.Layer<
                 .all(),
             ).map((row) => [row.sessionID, row]),
       )
+      const edgeRows = workflowStateEdgeRows(
+        workflow.id,
+        (Array.isArray(state.edges) ? state.edges : []).filter((edge) => edge?.from && edge?.to),
+      )
       const existing = Database.use((db) => db.select().from(WorkflowTable).where(eq(WorkflowTable.id, workflow.id)).get())
-      const missingSessions =
-        sessionRows.length === 0
-          ? 0
-          : sessionRows.length -
+      const stateMilestoneSignature = JSON.stringify(
+        milestoneItems
+          .map((item) => ({
+            id: item.id,
+            status: item.status,
+            attempt: item.attempt,
+            waitingFor: item.waitingFor,
+            planPath: item.planPath,
+            reviewPath: item.reviewPath,
+            session: item.session,
+          }))
+          .toSorted((a, b) => String(a.id).localeCompare(String(b.id))),
+      )
+      const storedMilestoneSignature = existing
+        ? JSON.stringify(
             Database.use((db) =>
               db
-                .select({ id: SessionTable.id })
-                .from(SessionTable)
-                .where(inArray(SessionTable.id, sessionRows.map((row) => row.id)))
+                .select()
+                .from(WorkflowMilestoneTable)
+                .where(eq(WorkflowMilestoneTable.workflow_id, workflow.id))
                 .all(),
-            ).length
+            )
+              .map((row) => ({
+                id: row.id,
+                status: row.status,
+                attempt: row.attempt,
+                waitingFor: row.waiting_for ?? undefined,
+                planPath: row.plan_path ?? undefined,
+                reviewPath: row.review_path ?? undefined,
+                session: row.session,
+              }))
+              .toSorted((a, b) => String(a.id).localeCompare(String(b.id))),
+          )
+        : ""
+      const stateMemberSignature = JSON.stringify(
+        memberItems
+          .map((item) => ({
+            id: item.id,
+            role: item.role,
+            specialty: item.specialty,
+            sessionID: item.sessionID,
+            status: item.status,
+            availability: item.availability,
+          }))
+          .toSorted((a, b) => String(a.id).localeCompare(String(b.id))),
+      )
+      const storedMemberSignature = existing
+        ? JSON.stringify(
+            Database.use((db) =>
+              db.select().from(WorkflowMemberTable).where(eq(WorkflowMemberTable.workflow_id, workflow.id)).all(),
+            )
+              .map((row) => ({
+                id: row.id,
+                role: row.role,
+                specialty: row.specialty,
+                sessionID: row.session_id,
+                status: row.status,
+                availability: row.availability ?? undefined,
+              }))
+              .toSorted((a, b) => String(a.id).localeCompare(String(b.id))),
+          )
+        : ""
+      const stateConsultationSignature = JSON.stringify(
+        consultationItems
+          .map((item) => ({
+            id: item.id,
+            fromSessionID: item.fromSessionID,
+            toSessionID: item.toSessionID,
+            fromRole: item.fromRole,
+            toRole: item.toRole,
+            milestoneID: item.milestoneID,
+            question: item.question,
+            answer: item.answer,
+            status: item.status,
+          }))
+          .toSorted((a, b) => String(a.id).localeCompare(String(b.id))),
+      )
+      const storedConsultationSignature = existing
+        ? JSON.stringify(
+            Database.use((db) =>
+              db.select().from(WorkflowConsultationTable).where(eq(WorkflowConsultationTable.workflow_id, workflow.id)).all(),
+            )
+              .map((row) => ({
+                id: row.id,
+                fromSessionID: row.from_session_id,
+                toSessionID: row.to_session_id,
+                fromRole: row.from_role,
+                toRole: row.to_role,
+                milestoneID: row.milestone_id ?? undefined,
+                question: row.question,
+                answer: row.answer,
+                status: row.status,
+              }))
+              .toSorted((a, b) => String(a.id).localeCompare(String(b.id))),
+          )
+        : ""
+      const stateInterventionSignature = JSON.stringify(
+        interventionItems
+          .map((item) => ({
+            id: item.id,
+            fromSessionID: item.fromSessionID,
+            targetSessionID: item.targetSessionID,
+            targetRole: item.targetRole,
+            timing: item.timing,
+            message: item.message,
+            response: item.response,
+            status: item.status,
+          }))
+          .toSorted((a, b) => String(a.id).localeCompare(String(b.id))),
+      )
+      const storedInterventionSignature = existing
+        ? JSON.stringify(
+            Database.use((db) =>
+              db.select().from(WorkflowInterventionTable).where(eq(WorkflowInterventionTable.workflow_id, workflow.id)).all(),
+            )
+              .map((row) => ({
+                id: row.id,
+                fromSessionID: row.from_session_id ?? undefined,
+                targetSessionID: row.target_session_id ?? undefined,
+                targetRole: row.target_role,
+                timing: row.timing,
+                message: row.message,
+                response: row.response ?? undefined,
+                status: row.status,
+              }))
+              .toSorted((a, b) => String(a.id).localeCompare(String(b.id))),
+          )
+        : ""
+      const stateEdgeSignature = JSON.stringify(
+        edgeRows
+          .map((row) => ({
+            from: row.from_id,
+            to: row.to_id,
+            data: row.data,
+          }))
+          .toSorted((a, b) => `${a.from}->${a.to}`.localeCompare(`${b.from}->${b.to}`)),
+      )
+      const storedEdgeSignature = existing
+        ? JSON.stringify(
+            Database.use((db) => db.select().from(WorkflowEdgeTable).where(eq(WorkflowEdgeTable.workflow_id, workflow.id)).all())
+              .map((row) => ({
+                from: row.from_id,
+                to: row.to_id,
+                data: row.data,
+              }))
+              .toSorted((a, b) => `${a.from}->${a.to}`.localeCompare(`${b.from}->${b.to}`)),
+          )
+        : ""
+      const staleWorkflowTables =
+        stateMilestoneSignature !== storedMilestoneSignature ||
+        stateMemberSignature !== storedMemberSignature ||
+        stateConsultationSignature !== storedConsultationSignature ||
+        stateInterventionSignature !== storedInterventionSignature ||
+        stateEdgeSignature !== storedEdgeSignature
+      const missingSessions = sessionRows.filter((row) => !storedSessionIDs.has(row.id)).length
       const staleMessages =
-        persistedMessages.filter((item) => (storedMessageTimes.get(item.message.id) ?? -1) < item.message.time_updated).length +
-        restoreMessages.filter((item) => !storedMessageTimes.has(item.message.id)).length
+        persistedMessages.filter((item) => {
+          const stored = storedMessages.get(item.message.id)
+          if (!stored) return true
+          if (stored.timeUpdated < item.message.time_updated) return true
+          return stored.hash !== workflowStateContentHash(item.message.data)
+        }).length + restoreMessages.filter((item) => !storedMessages.has(item.message.id)).length
       const staleParts =
-        persistedParts.filter((row) => (storedPartTimes.get(row.id) ?? -1) < row.time_updated).length +
-        restoreMessages.filter((item) => !storedPartTimes.has(item.part.id)).length
-      const staleDurableMessages = durableMessages.filter(
-        (row) => (storedDurableMessageTimes.get(row.id) ?? -1) < row.time_updated,
-      ).length
+        persistedParts.filter((row) => {
+          const stored = storedParts.get(row.id)
+          if (!stored) return true
+          if (stored.timeUpdated < row.time_updated) return true
+          return stored.hash !== workflowStateContentHash(row.data)
+        }).length + restoreMessages.filter((item) => !storedParts.has(item.part.id)).length
+      const staleDurableMessages = durableMessages.filter((row) => {
+        const stored = storedDurableMessages.get(row.id)
+        if (!stored) return true
+        if (stored.timeUpdated < row.time_updated) return true
+        return stored.hash !== workflowStateContentHash(row.data)
+      }).length
       const staleDurableInputs = durableInputs.filter((row) => {
         const stored = storedDurableInputs.get(row.id)
         if (!stored) return true
@@ -4542,7 +6346,13 @@ export const layer: Layer.Layer<
         return JSON.stringify(stored.prompt) !== JSON.stringify(row.prompt)
       }).length
       const staleContextEpochs = contextEpochs.filter(
-        (row) => (storedContextEpochs.get(row.session_id)?.baselineSeq ?? -1) < row.baseline_seq,
+        (row) => {
+          const stored = storedContextEpochs.get(row.session_id)
+          if (!stored) return true
+          if (stored.baselineSeq < row.baseline_seq) return true
+          if (stored.baseline !== row.baseline) return true
+          return workflowStateContentHash(stored.snapshot) !== workflowStateContentHash(row.snapshot)
+        },
       ).length
       if (
         existing &&
@@ -4552,18 +6362,71 @@ export const layer: Layer.Layer<
         staleDurableMessages === 0 &&
         staleDurableInputs === 0 &&
         staleContextEpochs === 0 &&
+        !staleWorkflowTables &&
         existing.time_updated >= workflow.time.updated &&
         existing.directory === ctx.directory &&
-        path.normalize(existing.path) === path.normalize(workflow.path)
+        path.normalize(existing.path) === path.normalize(workflow.path) &&
+        commandJournalReplay.rows.length === 0 &&
+        messageJournalReplay.rows.length === 0 &&
+        eventJournalReplay.rows.length === 0
       ) {
+        if (snapshot.legacy) {
+          if (yield* recoverLegacyQueuedWorkflowCommands(workflow.id, legacyQueuedCommands)) return true
+          yield* Effect.promise(() => writeWorkflowStateFile(file, state)).pipe(Effect.ignore)
+          return true
+        }
+        if (
+          commandJournalReplay.highWater > snapshotCommandHighWater ||
+          messageJournalReplay.highWater > snapshotMessageHighWater ||
+          eventJournalReplay.highWater > snapshotEventHighWater
+        ) {
+          if (eventJournalReplay.highWater > snapshotEventHighWater) {
+            yield* events.publish(Event.GraphUpdated, { workflowID: workflow.id }).pipe(Effect.ignore)
+          }
+          yield* publishUpdated(workflow.id).pipe(Effect.ignore)
+          return true
+        }
         return false
       }
-      const edgeRows = workflowStateEdgeRows(
-        workflow.id,
-        (Array.isArray(state.edges) ? state.edges : []).filter((edge) => edge?.from && edge?.to),
-      )
       Database.transaction((tx) => {
-        if (sessionRows.length > 0) tx.insert(SessionTable).values(sessionRows).onConflictDoNothing().run()
+        if (sessionRows.length > 0) {
+          tx.insert(SessionTable)
+            .values(sessionRows)
+            .onConflictDoUpdate({
+              target: SessionTable.id,
+              set: {
+                project_id: sql`excluded.project_id`,
+                workspace_id: sql`excluded.workspace_id`,
+                parent_id: sql`excluded.parent_id`,
+                slug: sql`excluded.slug`,
+                directory: sql`excluded.directory`,
+                path: sql`excluded.path`,
+                title: sql`excluded.title`,
+                version: sql`excluded.version`,
+                share_url: sql`excluded.share_url`,
+                summary_additions: sql`excluded.summary_additions`,
+                summary_deletions: sql`excluded.summary_deletions`,
+                summary_files: sql`excluded.summary_files`,
+                summary_diffs: sql`excluded.summary_diffs`,
+                metadata: sql`excluded.metadata`,
+                cost: sql`excluded.cost`,
+                tokens_input: sql`excluded.tokens_input`,
+                tokens_output: sql`excluded.tokens_output`,
+                tokens_reasoning: sql`excluded.tokens_reasoning`,
+                tokens_cache_read: sql`excluded.tokens_cache_read`,
+                tokens_cache_write: sql`excluded.tokens_cache_write`,
+                revert: sql`excluded.revert`,
+                permission: sql`excluded.permission`,
+                agent: sql`excluded.agent`,
+                model: sql`excluded.model`,
+                time_created: sql`excluded.time_created`,
+                time_updated: sql`excluded.time_updated`,
+                time_compacting: sql`excluded.time_compacting`,
+                time_archived: sql`excluded.time_archived`,
+              },
+            })
+            .run()
+        }
         if (persistedMessages.length > 0) {
           tx.insert(MessageTable)
             .values(persistedMessages.map((item) => item.message))
@@ -4653,6 +6516,7 @@ export const layer: Layer.Layer<
         tx.delete(WorkflowMemberTable).where(eq(WorkflowMemberTable.workflow_id, workflow.id)).run()
         tx.delete(WorkflowConsultationTable).where(eq(WorkflowConsultationTable.workflow_id, workflow.id)).run()
         tx.delete(WorkflowInterventionTable).where(eq(WorkflowInterventionTable.workflow_id, workflow.id)).run()
+        tx.delete(WorkflowMessageTable).where(eq(WorkflowMessageTable.workflow_id, workflow.id)).run()
         tx.delete(WorkflowEdgeTable).where(eq(WorkflowEdgeTable.workflow_id, workflow.id)).run()
         if (milestoneItems.length > 0) {
           tx.insert(WorkflowMilestoneTable).values(milestoneItems.map((item) => workflowStateMilestoneRow(workflow, item))).run()
@@ -4664,9 +6528,106 @@ export const layer: Layer.Layer<
         if (interventionItems.length > 0) {
           tx.insert(WorkflowInterventionTable).values(interventionItems.map(workflowStateInterventionRow)).run()
         }
+        const messageRows = [
+          ...consultationItems.map(workflowStateConsultationMessageRow),
+          ...interventionItems.map(workflowStateInterventionMessageRow),
+        ]
+        if (messageRows.length > 0) tx.insert(WorkflowMessageTable).values(messageRows).run()
         if (edgeRows.length > 0) tx.insert(WorkflowEdgeTable).values(edgeRows).run()
+        for (const row of commandJournalReplay.rows) {
+          const updated = workflowJournalRowTime(row, Date.now())
+          const workflowStatus = typeof row.to?.workflowStatus === "string" ? row.to.workflowStatus : undefined
+          if (workflowStatus) {
+            const terminal = workflowStatus === "completed" || workflowStatus === "failed" || workflowStatus === "cancelled"
+            tx.update(WorkflowTable)
+              .set({
+                status: workflowStatus,
+                time_updated: updated,
+                ...(terminal ? { time_completed: updated } : { time_completed: null }),
+              })
+              .where(eq(WorkflowTable.id, workflow.id))
+              .run()
+          }
+          const milestoneID = typeof row.milestoneID === "string" ? row.milestoneID : undefined
+          const milestoneStatus = typeof row.to?.milestoneStatus === "string" ? row.to.milestoneStatus : undefined
+          if (milestoneID && milestoneStatus) {
+            tx.update(WorkflowMilestoneTable)
+              .set({ status: milestoneStatus, time_updated: updated })
+              .where(and(eq(WorkflowMilestoneTable.workflow_id, workflow.id), eq(WorkflowMilestoneTable.id, milestoneID)))
+              .run()
+          }
+        }
+        for (const row of messageJournalReplay.rows) {
+          const messageID = typeof row.messageID === "string" ? row.messageID : undefined
+          const updated = workflowJournalRowTime(row, Date.now())
+          const status = typeof row.status === "string" ? row.status : undefined
+          const response = workflowJournalRowResponse(row)
+          if (messageID && row.kind === "consultation") {
+            const consultationStatus = status && ["pending", "answered", "expired", "failed"].includes(status) ? status : undefined
+            const answer = row.action === "send" ? undefined : response
+            const set = {
+              time_updated: updated,
+              ...(consultationStatus ? { status: consultationStatus } : {}),
+              ...(answer !== undefined ? { answer } : {}),
+            }
+            tx.update(WorkflowConsultationTable)
+              .set(set)
+              .where(and(eq(WorkflowConsultationTable.workflow_id, workflow.id), eq(WorkflowConsultationTable.id, messageID)))
+              .run()
+          }
+          if (messageID && (row.kind === "intervention" || row.kind === "handoff")) {
+            const interventionStatus = status && ["queued", "delivered", "acked", "blocked", "expired", "failed"].includes(status) ? status : undefined
+            const interventionResponse = row.action === "send" ? undefined : response
+            const set = {
+              time_updated: updated,
+              ...(interventionStatus ? { status: interventionStatus } : {}),
+              ...(interventionResponse !== undefined ? { response: interventionResponse } : {}),
+            }
+            tx.update(WorkflowInterventionTable)
+              .set(set)
+              .where(and(eq(WorkflowInterventionTable.workflow_id, workflow.id), eq(WorkflowInterventionTable.id, messageID)))
+              .run()
+          }
+        }
       })
-      yield* events.publish(Event.Created, { workflowID: workflow.id, info: workflow }).pipe(Effect.ignore)
+      if (restoreMessages.length > 0) {
+        for (const item of restoreMessages) {
+          yield* session
+            .updateMessage({
+              ...item.message.data,
+              id: item.message.id,
+              sessionID: item.message.session_id,
+            })
+            .pipe(Effect.catchCause(() => Effect.void))
+          yield* session
+            .updatePart({
+              ...item.part.data,
+              id: item.part.id,
+              messageID: item.part.message_id,
+              sessionID: item.part.session_id,
+            })
+            .pipe(Effect.catchCause(() => Effect.void))
+        }
+      }
+      if (
+        commandJournalReplay.rows.length > 0 ||
+        commandJournalReplay.highWater > snapshotCommandHighWater ||
+        messageJournalReplay.rows.length > 0 ||
+        messageJournalReplay.highWater > snapshotMessageHighWater ||
+        eventJournalReplay.rows.length > 0 ||
+        eventJournalReplay.highWater > snapshotEventHighWater
+      ) {
+        if (eventJournalReplay.rows.some((row) => row.action === "graph.revised")) {
+          yield* events.publish(Event.GraphUpdated, { workflowID: workflow.id }).pipe(Effect.ignore)
+        }
+        yield* publishUpdated(workflow.id).pipe(Effect.ignore)
+      } else {
+        yield* events.publish(Event.Created, { workflowID: workflow.id, info: workflow }).pipe(Effect.ignore)
+      }
+      if (snapshot.legacy) {
+        if (yield* recoverLegacyQueuedWorkflowCommands(workflow.id, legacyQueuedCommands)) return true
+        yield* Effect.promise(() => writeWorkflowStateFile(file, state)).pipe(Effect.ignore)
+      }
       return true
     })
 
@@ -4675,6 +6636,20 @@ export const layer: Layer.Layer<
       const files = yield* Effect.promise(() => workflowStateFiles(ctx.directory))
       const results = yield* Effect.all(
         files.map((file) => syncWorkflowStateFile(file).pipe(Effect.catchCause(() => Effect.succeed(false)))),
+        { concurrency: 1 },
+      )
+      return results.some(Boolean)
+    })
+
+    const syncWorkflowStateFromDisk = Effect.fn("Workflow.syncWorkflowStateFromDisk")(function* (workflowID: WorkflowID) {
+      const ctx = yield* InstanceState.context
+      const directories = yield* Effect.promise(() => workflowDirectoriesForID(ctx.directory, workflowID))
+      const results = yield* Effect.all(
+        directories.map((directory) =>
+          syncWorkflowStateFile(path.join(ctx.directory, directory, workflowStateFileName)).pipe(
+            Effect.catchCause(() => Effect.succeed(false)),
+          ),
+        ),
         { concurrency: 1 },
       )
       return results.some(Boolean)
@@ -4691,16 +6666,46 @@ export const layer: Layer.Layer<
     const ensureAuditablePath = Effect.fn("Workflow.ensureAuditablePath")(function* (workflow: WorkflowInfo) {
       if (!isLegacyWorkflowPath(workflow)) return workflow
       const ctx = yield* InstanceState.context
-      const nextPath = workflowFolderPath(workflow.time.created, workflow.title)
+      const oldPath = workflow.path
+      const nextPath = workflowFolderPath(workflow.id)
       yield* Effect.promise(() => ensureWorkflowDirectory(ctx.directory, workflow.path, nextPath))
-      Database.use((db) =>
-        db
-          .update(WorkflowTable)
-          .set({ path: nextPath, time_updated: Date.now() })
+      const rewrite = (value: string | undefined) => (value ? rewriteStoredPathPrefix(value, oldPath, nextPath) : value)
+      const now = Date.now()
+      Database.transaction((tx) => {
+        tx.update(WorkflowTable)
+          .set({
+            path: nextPath,
+            ...(workflow.testPath ? { test_path: rewrite(workflow.testPath) } : {}),
+            time_updated: now,
+          })
           .where(eq(WorkflowTable.id, workflow.id))
-          .run(),
-      )
-      return { ...workflow, path: nextPath, time: { ...workflow.time, updated: Date.now() } }
+          .run()
+        for (const milestone of tx
+          .select()
+          .from(WorkflowMilestoneTable)
+          .where(eq(WorkflowMilestoneTable.workflow_id, workflow.id))
+          .all()) {
+          tx.update(WorkflowMilestoneTable)
+            .set({
+              ...(milestone.plan_path ? { plan_path: rewrite(milestone.plan_path) } : {}),
+              ...(milestone.review_path ? { review_path: rewrite(milestone.review_path) } : {}),
+              time_updated: now,
+            })
+            .where(and(eq(WorkflowMilestoneTable.workflow_id, workflow.id), eq(WorkflowMilestoneTable.id, milestone.id)))
+            .run()
+        }
+        for (const intervention of tx
+          .select()
+          .from(WorkflowInterventionTable)
+          .where(eq(WorkflowInterventionTable.workflow_id, workflow.id))
+          .all()) {
+          tx.update(WorkflowInterventionTable)
+            .set({ path: rewrite(intervention.path) ?? intervention.path, time_updated: now })
+            .where(and(eq(WorkflowInterventionTable.workflow_id, workflow.id), eq(WorkflowInterventionTable.id, intervention.id)))
+            .run()
+        }
+      })
+      return { ...workflow, path: nextPath, testPath: rewrite(workflow.testPath), time: { ...workflow.time, updated: now } }
     })
 
     const get = Effect.fn("Workflow.get")(function* (workflowID: WorkflowID) {
@@ -4991,6 +6996,104 @@ export const layer: Layer.Layer<
       )
     })
 
+    const fixWorkflowDirectories = Effect.fn("Workflow.fixWorkflowDirectories")(function* (workflow: WorkflowInfo) {
+      const ctx = yield* InstanceState.context
+      const directories = yield* Effect.promise(() => workflowDirectoriesForID(ctx.directory, workflow.id))
+      if (directories.length < 2) return
+      const canonical = workflowFolderPath(workflow.id)
+      const winner = (yield* Effect.promise(() =>
+        Promise.all(directories.map((item) => workflowDirectoryJournalScore(ctx.directory, item))),
+      )).toSorted((a, b) => compareWorkflowDirectoryScore(a, b, canonical, workflow.path))[0]
+      if (!winner) return
+      const stamp = new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d+Z$/, "")
+      const moved = new Set<string>()
+      const orphanPath = (item: string, suffix: string) =>
+        path.join(ctx.directory, `${item}.orphaned-${stamp}${suffix}`)
+      if (path.normalize(winner.path) !== path.normalize(canonical)) {
+        const canonicalFullPath = path.join(ctx.directory, canonical)
+        const winnerFullPath = path.join(ctx.directory, winner.path)
+        if (yield* Effect.promise(() => exists(canonicalFullPath))) {
+          yield* Effect.promise(() => rename(canonicalFullPath, orphanPath(canonical, "-replaced")))
+          moved.add(path.normalize(canonical))
+        }
+        yield* Effect.promise(async () => {
+          await mkdir(path.dirname(canonicalFullPath), { recursive: true })
+          await rename(winnerFullPath, canonicalFullPath)
+        })
+        moved.add(path.normalize(winner.path))
+      }
+      const extras = directories.filter((item) => {
+        const normalized = path.normalize(item)
+        if (moved.has(normalized)) return false
+        if (normalized === path.normalize(canonical)) return false
+        if (normalized === path.normalize(winner.path)) return false
+        return true
+      })
+      if (extras.length === 0) return
+      yield* Effect.all(
+        extras.map((item, index) =>
+          Effect.promise(() =>
+            rename(
+              path.join(ctx.directory, item),
+              path.join(ctx.directory, `${item}.orphaned-${stamp}${index === 0 ? "" : `-${index + 1}`}`),
+            ),
+          ),
+        ),
+        { concurrency: 1 },
+      )
+    })
+
+    const fixWorkflowOrphanActiveMilestones = Effect.fn("Workflow.fixWorkflowOrphanActiveMilestones")(function* (
+      workflow: WorkflowInfo,
+    ) {
+      const milestoneItems = yield* milestones(workflow.id)
+      const activeJobIDs = new Set(
+        (yield* background.list()).filter((job) => job.status === "running").map((job) => job.id),
+      )
+      const orphanIDs = milestoneItems
+        .filter((milestone) => ["planning", "executing", "reviewing", "running"].includes(milestone.status))
+        .filter((milestone) => !activeJobIDs.has(milestoneJobID(workflow.id, milestone.id, milestone.attempt)))
+        .map((milestone) => milestone.id)
+      if (orphanIDs.length === 0) return false
+      const now = Date.now()
+      const message = `workflow doctor --fix blocked orphan active milestone(s): ${orphanIDs.join(", ")}. Resume explicitly after inspecting the owning session archive.`
+      Database.transaction((tx) => {
+        tx.update(WorkflowMilestoneTable)
+          .set({ status: "blocked", time_updated: now })
+          .where(and(eq(WorkflowMilestoneTable.workflow_id, workflow.id), inArray(WorkflowMilestoneTable.id, orphanIDs)))
+          .run()
+        tx.update(WorkflowTable)
+          .set({ status: "blocked", error: message, time_updated: now })
+          .where(eq(WorkflowTable.id, workflow.id))
+          .run()
+      })
+      yield* publishUpdated(workflow.id).pipe(Effect.ignore)
+      return true
+    })
+
+    const doctorWorkflows = Effect.fn("Workflow.doctorWorkflows")(function* (input?: DoctorInput) {
+      const ctx = yield* InstanceState.context
+      yield* syncWorkflowStatesFromDisk().pipe(Effect.ignore)
+      const rows = Database.use((db) => {
+        if (input?.workflowID) {
+          const row = db
+            .select()
+            .from(WorkflowTable)
+            .where(and(eq(WorkflowTable.project_id, ctx.project.id), eq(WorkflowTable.id, input.workflowID)))
+            .get()
+          return row ? [row] : []
+        }
+        return db
+          .select()
+          .from(WorkflowTable)
+          .where(eq(WorkflowTable.project_id, ctx.project.id))
+          .orderBy(asc(WorkflowTable.time_created))
+          .all()
+      })
+      if (input?.workflowID && rows.length === 0) return yield* new Error({ message: `Workflow not found: ${input.workflowID}` })
+      return rows.map(toInfo)
+    })
+
     const workflowEdges = Effect.fn("Workflow.workflowEdges")(function* (workflowID: WorkflowID) {
       return Database.use((db) =>
         db
@@ -4999,6 +7102,409 @@ export const layer: Layer.Layer<
           .where(eq(WorkflowEdgeTable.workflow_id, workflowID))
           .all()
           .map((row) => row.data ?? { id: `${row.from_id}->${row.to_id}`, from: String(row.from_id), to: String(row.to_id) }),
+      )
+    })
+
+    const doctorWorkflow = Effect.fn("Workflow.doctorWorkflow")(function* (workflow: WorkflowInfo) {
+      const ctx = yield* InstanceState.context
+      const issues: DoctorIssue[] = []
+      const workflowRoot = path.join(ctx.directory, workflow.path)
+      const expectedPath = workflowPath(workflow.id)
+      const milestoneItems = yield* milestones(workflow.id)
+      const staffItems = yield* members(workflow.id)
+      const consultationItems = yield* consultations(workflow.id)
+      const interventionItems = yield* interventions(workflow.id)
+      if (path.normalize(workflow.path) !== path.normalize(expectedPath)) {
+        issues.push({
+          severity: "error",
+          code: "noncanonical_path",
+          workflowID: workflow.id,
+          path: workflow.path,
+          message: `workflow path is ${workflow.path}; expected ${expectedPath}`,
+        })
+      }
+      const directories = yield* Effect.promise(() => workflowDirectoriesForID(ctx.directory, workflow.id))
+      if (directories.length > 1) {
+        const directoryScores = yield* Effect.promise(() =>
+          Promise.all(directories.map((item) => workflowDirectoryJournalScore(ctx.directory, item))),
+        )
+        issues.push({
+          severity: "error",
+          code: "duplicate_directory",
+          workflowID: workflow.id,
+          message: `workflow has multiple local directories: ${directoryScores
+            .toSorted((a, b) => compareWorkflowDirectoryScore(a, b, expectedPath, workflow.path))
+            .map(workflowDirectoryJournalDescription)
+            .join(", ")}`,
+        })
+      }
+      const rootStat = yield* Effect.tryPromise({
+        try: () => stat(workflowRoot),
+        catch: (error) => error,
+      }).pipe(
+        Effect.catch((error: unknown) =>
+          nodeErrorCode(error) === "ENOENT" ? Effect.succeed(undefined) : Effect.fail(error as globalThis.Error),
+        ),
+      )
+      if (!rootStat?.isDirectory()) {
+        issues.push({
+          severity: "error",
+          code: "missing_directory",
+          workflowID: workflow.id,
+          path: workflow.path,
+          message: `workflow directory does not exist: ${workflow.path}`,
+        })
+        return issues
+      }
+      const manifestPath = path.join(workflowRoot, workflowManifestFileName)
+      const manifest = yield* Effect.tryPromise({
+        try: () => readWorkflowManifestFileUnchecked(manifestPath),
+        catch: (error) => error,
+      }).pipe(
+        Effect.catch((error: unknown) => {
+          issues.push({
+            severity: "error",
+            code: nodeErrorCode(error) === "ENOENT" ? "missing_manifest" : "invalid_manifest_json",
+            workflowID: workflow.id,
+            path: path.join(workflow.path, workflowManifestFileName),
+            message:
+              nodeErrorCode(error) === "ENOENT"
+                ? `manifest.json is missing for ${workflow.id}`
+                : `manifest.json is not valid JSON: ${
+                    error instanceof globalThis.Error ? error.message : String(error)
+                  }`,
+          })
+          return Effect.succeed(undefined)
+        }),
+      )
+      if (manifest) {
+        if (manifest.schema !== 2) {
+          issues.push({
+            severity: "warning",
+            code: "unsupported_manifest_schema",
+            workflowID: workflow.id,
+            path: path.join(workflow.path, workflowManifestFileName),
+            message: `manifest.json schema is ${manifest.schema ?? "<missing>"}; expected 2`,
+          })
+        }
+        if (manifest.workflowID !== workflow.id) {
+          issues.push({
+            severity: "error",
+            code: "manifest_workflow_mismatch",
+            workflowID: workflow.id,
+            path: path.join(workflow.path, workflowManifestFileName),
+            message: `manifest.json belongs to ${manifest.workflowID ?? "<missing>"} instead of ${workflow.id}`,
+          })
+        }
+        if (manifest.projectID && manifest.projectID !== workflow.projectID) {
+          issues.push({
+            severity: "error",
+            code: "manifest_project_mismatch",
+            workflowID: workflow.id,
+            path: path.join(workflow.path, workflowManifestFileName),
+            message: `manifest.json project is ${manifest.projectID} but DB project is ${workflow.projectID}`,
+          })
+        }
+        const ownership = manifest.ownership && typeof manifest.ownership === "object" ? manifest.ownership : {}
+        ;["workflow.xml", "workflow-state.json", "journal/**", "work/**"].forEach((key) => {
+          if (Object.prototype.hasOwnProperty.call(ownership, key)) return
+          issues.push({
+            severity: "warning",
+            code: "manifest_missing_ownership",
+            workflowID: workflow.id,
+            path: path.join(workflow.path, workflowManifestFileName),
+            message: `manifest.json ownership is missing ${key}`,
+          })
+        })
+      }
+      const statePath = path.join(workflowRoot, workflowStateFileName)
+      const state = yield* Effect.tryPromise({
+        try: () => readWorkflowStateFileUnchecked(statePath),
+        catch: (error) => error,
+      }).pipe(
+        Effect.catch((error: unknown) => {
+          issues.push({
+            severity: "error",
+            code: nodeErrorCode(error) === "ENOENT" ? "missing_state" : "invalid_state_json",
+            workflowID: workflow.id,
+            path: path.join(workflow.path, workflowStateFileName),
+            message:
+              nodeErrorCode(error) === "ENOENT"
+                ? `workflow-state.json is missing for ${workflow.id}`
+                : `workflow-state.json is not valid JSON: ${
+                    error instanceof globalThis.Error ? error.message : String(error)
+                  }`,
+          })
+          return Effect.succeed(undefined)
+        }),
+      )
+      if (state) {
+        const stateVersion = workflowStateFileVersion(state)
+        if (!stateVersion || stateVersion > workflowStateSchemaVersion) {
+          issues.push({
+            severity: "warning",
+            code: "unsupported_state_version",
+            workflowID: workflow.id,
+            path: path.join(workflow.path, workflowStateFileName),
+            message: `workflow-state.json version is ${stateVersion ?? "<missing>"}; supported version is ${workflowStateSchemaVersion}`,
+          })
+        }
+        if (state.workflow?.id !== workflow.id) {
+          issues.push({
+            severity: "error",
+            code: "state_workflow_mismatch",
+            workflowID: workflow.id,
+            path: path.join(workflow.path, workflowStateFileName),
+            message: `workflow-state.json belongs to ${state.workflow?.id ?? "<missing>"} instead of ${workflow.id}`,
+          })
+        }
+        if (state.workflow?.status && state.workflow.status !== workflow.status) {
+          issues.push({
+            severity: "error",
+            code: "state_status_mismatch",
+            workflowID: workflow.id,
+            path: path.join(workflow.path, workflowStateFileName),
+            message: `DB status is ${workflow.status} but workflow-state.json status is ${state.workflow.status}`,
+          })
+        }
+        const stateMilestones = new Map(
+          (Array.isArray(state.milestones) ? state.milestones : [])
+            .filter((item) => item?.id)
+            .map((item) => [String(item.id), item]),
+        )
+        milestoneItems.forEach((milestone) => {
+          const snapshot = stateMilestones.get(String(milestone.id))
+          if (!snapshot) {
+            issues.push({
+              severity: "warning",
+              code: "state_missing_milestone",
+              workflowID: workflow.id,
+              message: `workflow-state.json is missing milestone ${milestone.id}`,
+            })
+            return
+          }
+          if (snapshot.status && snapshot.status !== milestone.status) {
+            issues.push({
+              severity: "error",
+              code: "milestone_status_mismatch",
+              workflowID: workflow.id,
+              path: path.join(workflow.path, workflowStateFileName),
+              message: `milestone ${milestone.id} DB status is ${milestone.status} but state status is ${snapshot.status}`,
+            })
+          }
+        })
+        for (const stateSession of Array.isArray(state.sessions) ? state.sessions : []) {
+          const sessionPath = workflowStateRelativePath(stateSession?.path)
+          if (!sessionPath) continue
+          yield* Effect.tryPromise({
+            try: () => readFile(projectWorkflowPath(ctx.directory, workflow, sessionPath), "utf8").then((text) => JSON.parse(text)),
+            catch: (error) => error,
+          }).pipe(
+            Effect.map((sessionState) => {
+              if (
+                typeof stateSession?.contentHash === "string" &&
+                workflowStateContentHash(sessionState) !== stateSession.contentHash
+              ) {
+                issues.push({
+                  severity: "error",
+                  code: "session_state_hash_mismatch",
+                  workflowID: workflow.id,
+                  path: path.join(workflow.path, sessionPath),
+                  message: `session state content hash does not match workflow-state.json index: ${sessionPath}`,
+                })
+              }
+            }),
+            Effect.catch((error: unknown) => {
+              issues.push({
+                severity: "error",
+                code: nodeErrorCode(error) === "ENOENT" ? "missing_session_state" : "invalid_session_state_json",
+                workflowID: workflow.id,
+                path: path.join(workflow.path, sessionPath),
+                message:
+                  nodeErrorCode(error) === "ENOENT"
+                    ? `session state is missing: ${sessionPath}`
+                    : `session state is not valid JSON: ${
+                        error instanceof globalThis.Error ? error.message : String(error)
+                      }`,
+              })
+              return Effect.succeed(undefined)
+            }),
+          )
+        }
+      }
+      const jobs = yield* background.list()
+      const activeJobIDs = new Set(jobs.filter((job) => job.status === "running").map((job) => job.id))
+      milestoneItems
+        .filter((milestone) => ["planning", "executing", "reviewing", "running"].includes(milestone.status))
+        .filter((milestone) => !activeJobIDs.has(milestoneJobID(workflow.id, milestone.id, milestone.attempt)))
+        .forEach((milestone) =>
+          issues.push({
+            severity: "warning",
+            code: "orphan_active_milestone",
+            workflowID: workflow.id,
+            message: `milestone ${milestone.id} is ${milestone.status} with sessions but no running workflow.milestone job`,
+          }),
+        )
+      if (
+        workflowHasControlHistory(workflow, milestoneItems) &&
+        !(yield* Effect.promise(() => workflowJournalExists({ workflow, directory: ctx.directory, name: "commands.jsonl" })))
+      ) {
+        issues.push({
+          severity: "warning",
+          code: "missing_command_journal",
+          workflowID: workflow.id,
+          path: path.join(workflow.path, "journal", "commands.jsonl"),
+          message:
+            "active workflow has control-plane history but no journal/commands.jsonl; queued/applied/rejected command claims cannot be audited",
+        })
+      }
+      if (
+        (consultationItems.length > 0 || interventionItems.length > 0) &&
+        !(yield* Effect.promise(() => workflowJournalExists({ workflow, directory: ctx.directory, name: "messages.jsonl" })))
+      ) {
+        issues.push({
+          severity: "warning",
+          code: "missing_message_journal",
+          workflowID: workflow.id,
+          path: path.join(workflow.path, "journal", "messages.jsonl"),
+          message:
+            "workflow has consultations or interventions but no journal/messages.jsonl; message delivery claims cannot be audited",
+        })
+      }
+      const now = Date.now()
+      interventionItems
+        .filter((intervention) => ["queued", "delivered"].includes(intervention.status))
+        .filter((intervention) => now - intervention.time.updated >= workflowInterventionTimeoutMillis)
+        .forEach((intervention) =>
+          issues.push({
+            severity: "warning",
+            code: "stale_intervention",
+            workflowID: workflow.id,
+            path: intervention.path,
+            message: `intervention ${intervention.id} is ${intervention.status} and has not advanced for ${Math.round(
+              (now - intervention.time.updated) / 60000,
+            )} minutes`,
+          }),
+        )
+      const projectionIssues = yield* Effect.all(
+        workflowProjectionPaths(workflow, staffItems).map((projectionPath) =>
+          Effect.tryPromise({
+            try: () => stat(path.join(ctx.directory, projectionPath)),
+            catch: (error) => error,
+          }).pipe(
+            Effect.map((fileStat) =>
+              fileStat.isFile() && fileStat.size > 0
+                ? undefined
+                : {
+                    severity: "warning" as const,
+                    code: "empty_projection",
+                    workflowID: workflow.id,
+                    path: projectionPath,
+                    message: `workflow projection is empty or not a file and can be rebuilt with workflow doctor --fix: ${projectionPath}`,
+                  },
+            ),
+            Effect.catch((error: unknown) =>
+              nodeErrorCode(error) === "ENOENT"
+                ? Effect.succeed({
+                    severity: "warning" as const,
+                    code: "missing_projection",
+                    workflowID: workflow.id,
+                    path: projectionPath,
+                    message: `workflow projection is missing and can be rebuilt with workflow doctor --fix: ${projectionPath}`,
+                  })
+                : Effect.fail(error as globalThis.Error),
+            ),
+          ),
+        ),
+        { concurrency: 4 },
+      )
+      issues.push(...projectionIssues.filter((issue): issue is DoctorIssue => !!issue))
+      issues.push(...(yield* Effect.promise(() => workflowTempFiles(ctx.directory, workflow))).map((file) => ({
+        severity: "warning" as const,
+        code: "temporary_file",
+        workflowID: workflow.id,
+        path: file,
+        message: `temporary workflow write file remains: ${file}`,
+      })))
+      issues.push(...(yield* Effect.promise(() => workflowJournalIssues({ workflow, directory: ctx.directory, name: "commands.jsonl" }))))
+      issues.push(...(yield* Effect.promise(() => workflowJournalIssues({ workflow, directory: ctx.directory, name: "messages.jsonl" }))))
+      issues.push(...(yield* Effect.promise(() => workflowJournalIssues({ workflow, directory: ctx.directory, name: "events.jsonl" }))))
+      return issues
+    })
+
+    const doctor = Effect.fn("Workflow.doctor")(function* (input?: DoctorInput) {
+      yield* InstanceState.get(initState)
+      const workflows = yield* doctorWorkflows(input)
+      const migrated = input?.migrate
+        ? yield* Effect.all(workflows.map((workflow) => ensureAuditablePath(workflow)), { concurrency: 1 })
+        : workflows
+      if (input?.migrate) {
+        yield* Effect.all(migrated.map((workflow) => writeWorkflowState(workflow.id)), { concurrency: 1 })
+      }
+      if (input?.fix || input?.migrate) {
+        const ctx = yield* InstanceState.context
+        const fixPass = (targets: WorkflowInfo[]) =>
+          Effect.gen(function* () {
+            yield* Effect.all(targets.map((workflow) => fixWorkflowDirectories(workflow)), { concurrency: 1 })
+            yield* Effect.all(targets.map((workflow) => Effect.promise(() => removeWorkflowTempFiles(ctx.directory, workflow))), { concurrency: 1 })
+            yield* Effect.all(targets.map((workflow) => Effect.promise(() => repairWorkflowJournalTails(ctx.directory, workflow))), { concurrency: 1 })
+            yield* Effect.all(targets.map((workflow) => Effect.promise(() => repairWorkflowJournalSequences(ctx.directory, workflow))), { concurrency: 1 })
+            const orphanTargets = yield* doctorWorkflows(input)
+            const fixedOrphans = yield* Effect.all(orphanTargets.map((workflow) => fixWorkflowOrphanActiveMilestones(workflow)), { concurrency: 1 })
+            if (fixedOrphans.some(Boolean)) {
+              yield* Effect.all(orphanTargets.map((workflow) => writeWorkflowState(workflow.id)), { concurrency: 1 })
+            }
+            const stateRepairTargets = yield* doctorWorkflows(input)
+            const stateRepairIssues = (
+              yield* Effect.all(stateRepairTargets.map((workflow) => doctorWorkflow(workflow)), { concurrency: 1 })
+            ).flat()
+            const workflowsNeedingStateRewrite = new Set(
+              stateRepairIssues
+                .filter((issue) => issue.workflowID && workflowStateDoctorFixCodes.has(issue.code))
+                .map((issue) => issue.workflowID),
+            )
+            if (workflowsNeedingStateRewrite.size > 0) {
+              yield* Effect.all(
+                stateRepairTargets
+                  .filter((workflow) => workflowsNeedingStateRewrite.has(workflow.id))
+                  .map((workflow) => writeWorkflowState(workflow.id)),
+                { concurrency: 1 },
+              )
+            }
+            const projectionRepairTargets = yield* doctorWorkflows(input)
+            yield* Effect.all(projectionRepairTargets.map((workflow) => rebuildWorkflowProjections(workflow.id)), {
+              concurrency: 1,
+            })
+            return yield* doctorWorkflows(input)
+          })
+        const afterFirstPass = yield* fixPass(migrated)
+        if (input?.fix) yield* fixPass(afterFirstPass)
+      }
+      const checked = input?.fix || input?.migrate ? yield* doctorWorkflows(input) : migrated
+      const issues = (yield* Effect.all(checked.map((workflow) => doctorWorkflow(workflow)), { concurrency: 4 })).flat()
+      return {
+        ok: !issues.some((issue) => issue.severity === "error"),
+        checked: checked.length,
+        issues,
+      }
+    })
+
+    const blockWorkflowResumeForDoctorIssues = Effect.fn("Workflow.blockWorkflowResumeForDoctorIssues")(function* (
+      workflowID: WorkflowID,
+      reason: string,
+    ) {
+      const report = yield* doctor({ workflowID })
+      const blockers = report.issues.filter(
+        (issue) => issue.severity === "error" && workflowResumeDoctorBlockingCodes.has(issue.code),
+      )
+      if (blockers.length === 0) return
+      const workflow = yield* get(workflowID)
+      return yield* blockWorkflow(
+        workflow,
+        [
+          `Workflow doctor blocked ${reason}: ${blockers.map((issue) => `${issue.code}${issue.path ? ` at ${issue.path}` : ""}`).join("; ")}.`,
+          "Run `opencode workflow doctor <workflowID> --fix` or `opencode workflow doctor <workflowID> --migrate` before resuming so the scheduler does not continue from contradictory workflow files.",
+        ].join(" "),
       )
     })
 
@@ -5024,7 +7530,9 @@ export const layer: Layer.Layer<
           session.get(ref.sessionID).pipe(
             Effect.flatMap((info) =>
               Effect.all({
-                messages: MessageV2.stream(ref.sessionID).pipe(Effect.catchCause(() => Effect.succeed([]))),
+                messages: session.messages({ sessionID: ref.sessionID }).pipe(
+                  Effect.catchCause(() => Effect.succeed([])),
+                ),
                 durable: workflowDurableSessionSnapshot(ref.sessionID),
               }).pipe(
                 Effect.map(({ messages, durable }) => ({
@@ -5040,20 +7548,38 @@ export const layer: Layer.Layer<
         { concurrency: 4 },
       )
       const edges = yield* workflowEdges(workflowID)
+      const manifest = workflowManifest(workflow)
+      const journal = yield* Effect.promise(() => workflowJournalState(ctx.directory, workflow))
+      const sessionIndex = sessions.map(workflowStateSessionIndexEntry)
       yield* Effect.promise(() =>
-        writeWorkflowStateFile(
-          path.join(ctx.directory, workflowStatePath(workflow)),
-          {
-            version: 1,
-            workflow: workflowStateDirectory(workflow),
-            milestones: milestoneItems,
-            members: memberItems,
-            consultations: consultationItems,
-            interventions: interventionItems,
-            edges,
-            sessions,
-          },
-        ),
+        Promise.all([
+          writeWorkflowStateFile(
+            path.join(ctx.directory, workflowArtifactPath(workflow, workflowManifestFileName)),
+            manifest,
+          ),
+          ...sessions.map((snapshot) =>
+            writeWorkflowStateFile(
+              path.join(ctx.directory, workflowArtifactPath(workflow, workflowStateSessionSnapshotPath(snapshot.id))),
+              snapshot,
+            ),
+          ),
+          writeWorkflowStateFile(
+            path.join(ctx.directory, workflowStatePath(workflow)),
+            {
+              schema: workflowStateSchemaVersion,
+              version: workflowStateSchemaVersion,
+              manifest,
+              journal,
+              workflow: workflowStateDirectory(workflow),
+              milestones: milestoneItems,
+              members: memberItems,
+              consultations: consultationItems,
+              interventions: interventionItems,
+              edges,
+              sessions: sessionIndex,
+            },
+          ),
+        ]),
       )
     })
 
@@ -5114,6 +7640,435 @@ export const layer: Layer.Layer<
         ),
         { discard: true },
       )
+    })
+
+    const rebuildWorkflowProjections = Effect.fn("Workflow.rebuildWorkflowProjections")(function* (workflowID: WorkflowID) {
+      yield* writeInterventionArtifacts(workflowID).pipe(Effect.ignore)
+      yield* writeReferenceIndex(workflowID).pipe(Effect.ignore)
+      yield* writeArchiveIndex(workflowID).pipe(Effect.ignore)
+      yield* writeOrganization(workflowID).pipe(Effect.ignore)
+    })
+
+    const upsertWorkflowMessage = Effect.fn("Workflow.upsertWorkflowMessage")(function* (input: {
+      workflowID: WorkflowID
+      id: string
+      kind: WorkflowMessageKind
+      fromSessionID?: SessionID | null
+      fromRole?: WorkflowSessionRef["role"] | null
+      toSessionID?: SessionID | null
+      toRole?: WorkflowSessionRef["role"] | null
+      milestoneID?: WorkflowMilestoneID | null
+      timing?: WorkflowCommunicationTiming | null
+      body: string
+      response?: string | null
+      attachments?: readonly string[] | null
+      status: string
+      timeCreated: number
+      timeDelivered?: number | null
+      timeClosed?: number | null
+      timeUpdated: number
+    }) {
+      Database.use((db) =>
+        db
+          .insert(WorkflowMessageTable)
+          .values({
+            workflow_id: input.workflowID,
+            id: input.id,
+            kind: input.kind,
+            from_session_id: input.fromSessionID ?? null,
+            from_role: input.fromRole ?? null,
+            to_session_id: input.toSessionID ?? null,
+            to_role: input.toRole ?? null,
+            milestone_id: input.milestoneID ?? null,
+            timing: input.timing ?? null,
+            body: input.body,
+            response: input.response ?? null,
+            attachments: input.attachments ?? null,
+            status: input.status,
+            time_created: input.timeCreated,
+            time_delivered: input.timeDelivered ?? null,
+            time_closed: input.timeClosed ?? null,
+            time_updated: input.timeUpdated,
+          })
+          .onConflictDoUpdate({
+            target: [WorkflowMessageTable.workflow_id, WorkflowMessageTable.id],
+            set: {
+              kind: input.kind,
+              from_session_id: input.fromSessionID ?? null,
+              from_role: input.fromRole ?? null,
+              to_session_id: input.toSessionID ?? null,
+              to_role: input.toRole ?? null,
+              milestone_id: input.milestoneID ?? null,
+              timing: input.timing ?? null,
+              body: input.body,
+              response: input.response ?? null,
+              attachments: input.attachments ?? null,
+              status: input.status,
+              time_delivered: input.timeDelivered ?? null,
+              time_closed: input.timeClosed ?? null,
+              time_updated: input.timeUpdated,
+            },
+          })
+          .run(),
+      )
+    })
+
+    const mirrorWorkflowMessageJournalEvent = Effect.fn("Workflow.mirrorWorkflowMessageJournalEvent")(function* (
+      workflowID: WorkflowID,
+      event: Record<string, unknown>,
+    ) {
+      const messageID = typeof event.messageID === "string" ? event.messageID : undefined
+      const kind = workflowMessageKind(event.kind)
+      const status = typeof event.status === "string" ? event.status : undefined
+      if (!messageID || !kind || !status) return
+      const existing = Database.use((db) =>
+        db
+          .select()
+          .from(WorkflowMessageTable)
+          .where(and(eq(WorkflowMessageTable.workflow_id, workflowID), eq(WorkflowMessageTable.id, messageID)))
+          .get(),
+      )
+      const now = Date.now()
+      const body =
+        existing?.body ??
+        (typeof event.request === "string" ? event.request : undefined) ??
+        (typeof event.response === "string" ? event.response : undefined) ??
+        `${kind} ${messageID}`
+      const attachments = Array.isArray(event.attachments)
+        ? event.attachments.filter((item) => typeof item === "string")
+        : existing?.attachments
+      const sessionID = typeof event.sessionID === "string" ? event.sessionID : undefined
+      const sourceSessionID = typeof event.sourceSessionID === "string" ? event.sourceSessionID : undefined
+      const targetSessionID = typeof event.targetSessionID === "string" ? event.targetSessionID : undefined
+      const closedStatuses = ["acked", "answered", "expired", "failed", "rejected"]
+      yield* upsertWorkflowMessage({
+        workflowID,
+        id: messageID,
+        kind: workflowMessageKind(existing?.kind) ?? kind,
+        fromSessionID: existing?.from_session_id ?? sourceSessionID ?? null,
+        fromRole: existing?.from_role ?? (event.sourceRole as WorkflowSessionRef["role"] | undefined) ?? null,
+        toSessionID: existing?.to_session_id ?? targetSessionID ?? sessionID ?? null,
+        toRole: existing?.to_role ?? (event.targetRole as WorkflowSessionRef["role"] | undefined) ?? null,
+        milestoneID: existing?.milestone_id ?? null,
+        timing: existing?.timing ?? null,
+        body,
+        response: typeof event.response === "string" ? event.response : existing?.response ?? null,
+        attachments,
+        status,
+        timeCreated: existing?.time_created ?? now,
+        timeDelivered: status === "delivered" ? existing?.time_delivered ?? now : existing?.time_delivered ?? null,
+        timeClosed: closedStatuses.includes(status) ? now : existing?.time_closed ?? null,
+        timeUpdated: now,
+      })
+    })
+
+    const appendWorkflowMessageRuntimeJournal = Effect.fn("Workflow.appendWorkflowMessageRuntimeJournal")(function* (
+      workflowID: WorkflowID,
+      event: Record<string, unknown>,
+    ) {
+      const workflow = yield* get(workflowID)
+      const ctx = yield* InstanceState.context
+      const file = projectWorkflowPath(ctx.directory, workflow, workflowMessageJournalPath())
+      const existing = yield* Effect.promise(() => readFile(file, "utf8")).pipe(
+        Effect.catchCause(() => Effect.succeed("")),
+      )
+      yield* Effect.promise(() =>
+        appendFileEnsured(
+          file,
+          `${JSON.stringify({
+            seq: existing.trim() ? existing.trim().split(/\r?\n/).filter(Boolean).length + 1 : 1,
+            ts: new Date().toISOString(),
+            workflowID,
+            ...event,
+          })}\n`,
+        ),
+      )
+      yield* mirrorWorkflowMessageJournalEvent(workflowID, event).pipe(Effect.ignore)
+    })
+
+    const appendWorkflowEventRuntimeJournal = Effect.fn("Workflow.appendWorkflowEventRuntimeJournal")(function* (
+      workflowID: WorkflowID,
+      event: Record<string, unknown>,
+    ) {
+      const workflow = yield* get(workflowID)
+      const ctx = yield* InstanceState.context
+      const file = projectWorkflowPath(ctx.directory, workflow, workflowEventJournalPath())
+      const existing = yield* Effect.promise(() => readFile(file, "utf8")).pipe(
+        Effect.catchCause(() => Effect.succeed("")),
+      )
+      yield* Effect.promise(() =>
+        appendFileEnsured(
+          file,
+          `${JSON.stringify({
+            seq: existing.trim() ? existing.trim().split(/\r?\n/).filter(Boolean).length + 1 : 1,
+            ts: new Date().toISOString(),
+            workflowID,
+            ...event,
+          })}\n`,
+        ),
+      )
+    })
+
+    const rejectWorkflowMessageDispatchMisuse = Effect.fn("Workflow.rejectWorkflowMessageDispatchMisuse")(function* (input: {
+      workflowID: WorkflowID
+      sourceSessionID: SessionID
+      sourceRole: WorkflowSessionRef["role"]
+      sourceMilestoneID?: WorkflowMilestoneID
+      sourceAttempt?: number
+      text: string
+      response?: string
+    }) {
+      yield* appendWorkflowMessageRuntimeJournal(input.workflowID, {
+        action: "reject",
+        kind: "consultation",
+        sourceSessionID: input.sourceSessionID,
+        sourceRole: input.sourceRole,
+        milestoneID: input.sourceMilestoneID,
+        attempt: input.sourceAttempt,
+        status: "rejected",
+        request: compactMarkdown(input.text, 700),
+        response:
+          input.response ??
+          "workflow-message is consultation/notification only; use workflow update_xml, resume, plan_complete, force_complete, or scheduler-created milestone sessions for dispatch.",
+      }).pipe(Effect.ignore)
+    })
+
+    const queueExpiredWorkflowMessageIntervention = Effect.fn("Workflow.queueExpiredWorkflowMessageIntervention")(function* (input: {
+      workflow: WorkflowInfo
+      targetSessionID?: SessionID
+      targetRole: WorkflowSessionRef["role"]
+      message: string
+      sourceMessageID: string
+      sourceKind: "consultation" | "intervention"
+    }) {
+      if (!input.targetSessionID) return
+      const id = `expired_${input.sourceKind}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`
+      const interventionPath = workflowArtifactPath(input.workflow, workflowInterventionPath(id))
+      const now = Date.now()
+      Database.use((db) =>
+        db
+          .insert(WorkflowInterventionTable)
+          .values({
+            workflow_id: input.workflow.id,
+            id,
+            target_session_id: input.targetSessionID,
+            target_role: input.targetRole,
+            timing: "temporary-interrupt" as const,
+            message: input.message,
+            path: interventionPath,
+            status: "queued" as const,
+            time_created: now,
+            time_updated: now,
+          })
+          .run(),
+      )
+      yield* appendWorkflowMessageRuntimeJournal(input.workflow.id, {
+        action: "escalate",
+        kind: "intervention",
+        messageID: id,
+        sourceKind: input.sourceKind,
+        sourceMessageID: input.sourceMessageID,
+        targetSessionID: input.targetSessionID,
+        targetRole: input.targetRole,
+        status: "queued",
+        response: input.message,
+      }).pipe(Effect.ignore)
+      const jobID = `${input.workflow.id}:intervention:${id}`
+      yield* background.start({
+        id: jobID,
+        type: "workflow.intervention",
+        title: `${input.workflow.title} expired message escalation`,
+        metadata: { workflowID: input.workflow.id, interventionID: id },
+        run: deliverIntervention(input.workflow.id, id, jobID).pipe(
+          Effect.delay("10 millis"),
+          Effect.catchCause((cause) =>
+            Cause.hasInterruptsOnly(cause)
+              ? Effect.interrupt
+              : updateIntervention(input.workflow.id, id, {
+                  status: "failed",
+                  response: `Workflow expired-message escalation failed: ${errorFromCause(cause)}`,
+                }).pipe(Effect.asVoid),
+          ),
+          Effect.as("workflow expired message escalation delivered"),
+        ),
+      })
+      return id
+    })
+
+    const recordMainPMSystemReport = Effect.fn("Workflow.recordMainPMSystemReport")(function* (
+      workflow: WorkflowInfo,
+      message: string,
+    ) {
+      const mainPMSessionID = workflow.pmSessionID ?? (yield* members(workflow.id)).find((member) => member.role === "main_pm")?.sessionID
+      if (!mainPMSessionID) return
+      const id = `system_report_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`
+      const interventionPath = workflowArtifactPath(workflow, workflowInterventionPath(id))
+      const now = Date.now()
+      Database.use((db) =>
+        db
+          .insert(WorkflowInterventionTable)
+          .values({
+            workflow_id: workflow.id,
+            id,
+            target_session_id: mainPMSessionID,
+            target_role: "main_pm" as const,
+            timing: "temporary-interrupt" as const,
+            message,
+            path: interventionPath,
+            status: "delivered" as const,
+            time_created: now,
+            time_updated: now,
+          })
+          .run(),
+      )
+      yield* appendWorkflowMessageRuntimeJournal(workflow.id, {
+        action: "deliver",
+        kind: "intervention",
+        messageID: id,
+        targetSessionID: mainPMSessionID,
+        targetRole: "main_pm",
+        status: "delivered",
+        response: message,
+      }).pipe(Effect.ignore)
+      yield* writeInterventionArtifacts(workflow.id).pipe(Effect.ignore)
+      yield* writeReferenceIndex(workflow.id).pipe(Effect.ignore)
+      yield* writeArchiveIndex(workflow.id).pipe(Effect.ignore)
+      return id
+    })
+
+    const expireWorkflowMessages = Effect.fn("Workflow.expireWorkflowMessages")(function* (workflowID: WorkflowID) {
+      const workflow = yield* get(workflowID)
+      const now = Date.now()
+      const staleConsultations = Database.use((db) =>
+        db
+          .select()
+          .from(WorkflowConsultationTable)
+          .where(and(eq(WorkflowConsultationTable.workflow_id, workflowID), eq(WorkflowConsultationTable.status, "pending")))
+          .all()
+          .filter((item) => now - item.time_created >= workflowConsultationTimeoutMillis),
+      )
+      const staleInterventions = Database.use((db) =>
+        db
+          .select()
+          .from(WorkflowInterventionTable)
+          .where(eq(WorkflowInterventionTable.workflow_id, workflowID))
+          .all()
+          .filter(
+            (item) =>
+              ["queued", "delivered", "blocked"].includes(item.status) &&
+              now - item.time_created >= workflowInterventionTimeoutMillis,
+          ),
+      )
+      for (const item of staleConsultations) {
+        const response = `Consultation ${item.id} expired without an answer from ${roleSessionTitle(item.to_role)} after 30 minutes.`
+        Database.use((db) =>
+          db
+            .update(WorkflowConsultationTable)
+            .set({ status: "expired", answer: response, time_updated: now })
+            .where(
+              and(
+                eq(WorkflowConsultationTable.workflow_id, workflowID),
+                eq(WorkflowConsultationTable.id, item.id),
+                eq(WorkflowConsultationTable.status, "pending"),
+              ),
+            )
+            .run(),
+        )
+        yield* appendWorkflowMessageRuntimeJournal(workflowID, {
+          action: "expire",
+          kind: "consultation",
+          messageID: item.id,
+          sessionID: item.to_session_id,
+          targetSessionID: item.from_session_id,
+          status: "expired",
+          response,
+        }).pipe(Effect.ignore)
+        yield* queueExpiredWorkflowMessageIntervention({
+          workflow,
+          targetSessionID: item.from_session_id,
+          targetRole: item.from_role,
+          sourceKind: "consultation",
+          sourceMessageID: item.id,
+          message: [
+            response,
+            "",
+            `Original reason: ${item.reason ?? "not provided"}`,
+            `Original question: ${compactMarkdown(item.question, 700)}`,
+            "",
+            "Decide whether to reroute this question, proceed with documented assumptions, or block the workflow for requester direction.",
+          ].join("\n"),
+        }).pipe(Effect.ignore)
+      }
+      for (const item of staleInterventions) {
+        const response = `Intervention ${item.id} expired without acknowledgement from ${roleSessionTitle(item.target_role)} after 30 minutes.`
+        Database.use((db) =>
+          db
+            .update(WorkflowInterventionTable)
+            .set({ status: "expired", response, time_updated: now })
+            .where(
+              and(
+                eq(WorkflowInterventionTable.workflow_id, workflowID),
+                eq(WorkflowInterventionTable.id, item.id),
+                or(
+                  eq(WorkflowInterventionTable.status, "queued"),
+                  eq(WorkflowInterventionTable.status, "delivered"),
+                  eq(WorkflowInterventionTable.status, "blocked"),
+                ),
+              ),
+            )
+            .run(),
+        )
+        const sourceSessionID = item.from_session_id ?? workflow.rootSessionID
+        const sourceRole = sourceSessionID
+          ? yield* workflowToolCommandSourceRole(workflow, sourceSessionID).pipe(Effect.catchCause(() => Effect.succeed(undefined)))
+          : undefined
+        yield* appendWorkflowMessageRuntimeJournal(workflowID, {
+          action: "expire",
+          kind: "intervention",
+          messageID: item.id,
+          sessionID: item.target_session_id,
+          targetSessionID: sourceSessionID,
+          status: "expired",
+          response,
+        }).pipe(Effect.ignore)
+        if (item.target_role === "requester") {
+          yield* blockWorkflow(
+            workflow,
+            [
+              `Workflow message escalation reached requester and expired: ${response}`,
+              "",
+              `Original intervention: ${compactMarkdown(item.message, 700)}`,
+              "",
+              "The requester did not close the escalated message in time. Human direction is required before the workflow can continue.",
+            ].join("\n"),
+          ).pipe(Effect.ignore)
+          continue
+        }
+        yield* queueExpiredWorkflowMessageIntervention({
+          workflow,
+          targetSessionID: sourceSessionID,
+          targetRole: sourceRole ?? "requester",
+          sourceKind: "intervention",
+          sourceMessageID: item.id,
+          message: [
+            response,
+            "",
+            `Original intervention: ${compactMarkdown(item.message, 700)}`,
+            "",
+            "The target session did not close this intervention in time. Decide whether to retry, reroute, or block for human direction.",
+          ].join("\n"),
+        }).pipe(Effect.ignore)
+      }
+      if (staleConsultations.length > 0) {
+        yield* writeConsultationArtifacts(workflow, yield* consultations(workflowID)).pipe(Effect.ignore)
+      }
+      if (staleConsultations.length > 0 || staleInterventions.length > 0) {
+        yield* writeInterventionArtifacts(workflowID).pipe(Effect.ignore)
+        yield* writeReferenceIndex(workflowID).pipe(Effect.ignore)
+        yield* writeArchiveIndex(workflowID).pipe(Effect.ignore)
+        yield* publishUpdated(workflowID).pipe(Effect.ignore)
+      }
+      return staleConsultations.length + staleInterventions.length
     })
 
     const ensureStandupIndex = Effect.fn("Workflow.ensureStandupIndex")(function* (workflowID: WorkflowID) {
@@ -5184,6 +8139,7 @@ export const layer: Layer.Layer<
       const ctx = yield* InstanceState.context
       const info = yield* get(workflowID)
       yield* normalizeWorkflowSessions(info)
+      yield* expireWorkflowMessages(workflowID).pipe(Effect.ignore)
       const next = yield* get(workflowID)
       const items = yield* milestones(workflowID)
       const staff = yield* members(workflowID)
@@ -5271,6 +8227,8 @@ export const layer: Layer.Layer<
       const row = {
         ...(patch.title !== undefined ? { title: patch.title } : {}),
         ...(patch.department !== undefined ? { department: patch.department } : {}),
+        ...(patch.review !== undefined ? { review: patch.review } : {}),
+        ...(patch.waitingFor !== undefined ? { waiting_for: patch.waitingFor } : {}),
         ...(patch.prompt !== undefined ? { prompt: patch.prompt } : {}),
         ...(patch.dependsOn !== undefined ? { depends_on: patch.dependsOn } : {}),
         ...(patch.status !== undefined ? { status: patch.status } : {}),
@@ -5293,7 +8251,27 @@ export const layer: Layer.Layer<
       yield* writeArchiveIndex(workflowID).pipe(Effect.ignore)
       yield* writeOrganization(workflowID).pipe(Effect.ignore)
       yield* writeProgress(workflowID).pipe(Effect.ignore)
+      yield* deliverReadyInterventions(workflowID).pipe(Effect.ignore)
       return milestone
+    })
+
+    const cancelMilestoneBackgroundRuns = Effect.fn("Workflow.cancelMilestoneBackgroundRuns")(function* (
+      workflowID: WorkflowID,
+      milestoneID: WorkflowMilestoneID,
+      attempt: number,
+    ) {
+      for (const job of (yield* background.list()).filter(
+        (job) =>
+          job.status === "running" &&
+          job.type === "workflow.milestone" &&
+          job.metadata?.workflowID === workflowID &&
+          job.metadata?.milestoneID === milestoneID,
+      )) {
+        yield* background.cancel(job.id).pipe(Effect.ignore)
+      }
+      for (const item of Array.from({ length: attempt + 3 }, (_, index) => index + 1)) {
+        yield* background.cancel(milestoneJobID(workflowID, milestoneID, item)).pipe(Effect.ignore)
+      }
     })
 
     const saveDefinition = Effect.fn("Workflow.saveDefinition")(function* (
@@ -5302,6 +8280,7 @@ export const layer: Layer.Layer<
       definition: WorkflowDefinition,
       status: WorkflowInfo["status"] = "dispatching",
     ) {
+      const ctx = yield* InstanceState.context
       const workflow = yield* get(workflowID)
       const edges = edgesFrom(definition)
       const now = Date.now()
@@ -5310,12 +8289,17 @@ export const layer: Layer.Layer<
       const retained = [...existing.values()].filter(
         (milestone) => milestone.session.length > 0 && !definitionIDs.has(milestone.id),
       )
+      for (const milestone of retained.filter((milestone) => interruptedMilestone(milestone.status))) {
+        yield* cancelMilestoneBackgroundRuns(workflowID, milestone.id, milestone.attempt)
+      }
       const rows = [
         ...definition.milestones.map((milestone) => ({
           workflow_id: workflowID,
           id: milestone.id,
           title: milestone.title,
           department: milestone.department,
+          review: milestone.review,
+          waiting_for: milestone.waitingFor,
           prompt: milestone.prompt,
           depends_on: milestone.dependsOn,
           status: existing.get(milestone.id)?.status ?? ("pending" as const),
@@ -5333,9 +8317,11 @@ export const layer: Layer.Layer<
           id: milestone.id,
           title: milestone.title,
           department: milestone.department,
+          review: milestone.review,
+          waiting_for: milestone.waitingFor,
           prompt: milestone.prompt,
           depends_on: milestone.dependsOn.filter((id) => definitionIDs.has(id)),
-          status: "skipped" as const,
+          status: "cancelled" as const,
           attempt: milestone.attempt,
           plan_path: workflowStoredPath(workflow, milestone.planPath, milestone.id, "plan.md"),
           review_path: milestone.reviewPath ? rewriteWorkflowStoredPath(workflow, milestone.reviewPath) : undefined,
@@ -5362,9 +8348,18 @@ export const layer: Layer.Layer<
                 data: edge,
               })),
             )
-            .run()
+          .run()
         }
       })
+      const revisionPath = yield* Effect.promise(() => writeWorkflowGraphRevision(ctx.directory, workflow, xml))
+      if (revisionPath) {
+        yield* appendWorkflowEventRuntimeJournal(workflowID, {
+          action: "graph.revised",
+          path: revisionPath,
+          milestones: rows.length,
+          edges: edges.length,
+        }).pipe(Effect.ignore)
+      }
       yield* events.publish(Event.GraphUpdated, { workflowID })
       yield* writeArchiveIndex(workflowID).pipe(Effect.ignore)
       yield* writeOrganization(workflowID).pipe(Effect.ignore)
@@ -5384,13 +8379,63 @@ export const layer: Layer.Layer<
       if (!xml.trim()) return false
       if (xml === workflow.xml) return false
       const definition = yield* Effect.try({
-        try: () => parseXmlDefinition(xml),
+        try: () => parseXmlDefinition(xml, workflow),
         catch: (error) => new Error({ message: error instanceof globalThis.Error ? error.message : String(error) }),
       })
       yield* saveDefinition(workflowID, xml, definition, status)
       yield* writePrecreatedPlans(yield* get(workflowID), yield* milestones(workflowID))
       yield* publishUpdated(workflowID)
       return true
+    })
+
+    const queueWorkflowArtifactRefresh = Effect.fn("Workflow.queueWorkflowArtifactRefresh")(function* (
+      workflowID: WorkflowID,
+      reason: string,
+    ) {
+      const jobID = `${workflowID}:artifact-refresh`
+      if ((yield* background.list()).some((job) => job.id === jobID && job.status === "running")) return
+      const workflow = yield* get(workflowID)
+      yield* background.start({
+        id: jobID,
+        type: "workflow.artifacts",
+        title: `${workflow.title} artifacts`,
+        metadata: { workflowID, reason },
+        run: Effect.gen(function* () {
+          yield* Effect.sleep("25 millis")
+          yield* writeReferenceIndex(workflowID).pipe(Effect.ignore)
+          yield* writeArchiveIndex(workflowID).pipe(Effect.ignore)
+          yield* writeOrganization(workflowID).pipe(Effect.ignore)
+        }).pipe(
+          Effect.catchCause((cause) =>
+            Cause.hasInterruptsOnly(cause)
+              ? Effect.interrupt
+              : appendWorkflowEventRuntimeJournal(workflowID, {
+                  action: "artifact_refresh.failed",
+                  message: errorFromCause(cause),
+                }).pipe(Effect.ignore),
+          ),
+          Effect.as("workflow artifacts refreshed"),
+        ),
+      })
+    })
+
+    const updateMilestoneSession = Effect.fn("Workflow.updateMilestoneSession")(function* (
+      workflowID: WorkflowID,
+      milestoneID: WorkflowMilestoneID,
+      sessionRefs: WorkflowSessionRef[],
+    ) {
+      Database.use((db) =>
+        db
+          .update(WorkflowMilestoneTable)
+          .set({ session: sessionRefs, time_updated: Date.now() })
+          .where(and(eq(WorkflowMilestoneTable.workflow_id, workflowID), eq(WorkflowMilestoneTable.id, milestoneID)))
+          .run(),
+      )
+      const milestone = (yield* milestones(workflowID)).find((item) => item.id === milestoneID)
+      if (milestone) yield* events.publish(Event.NodeUpdated, { workflowID, milestone }).pipe(Effect.ignore)
+      yield* events.publish(Event.GraphUpdated, { workflowID }).pipe(Effect.ignore)
+      yield* queueWorkflowArtifactRefresh(workflowID, "milestone session assignment").pipe(Effect.ignore)
+      return milestone
     })
 
     const recordConsultation = Effect.fn("Workflow.recordConsultation")(function* (input: {
@@ -5406,12 +8451,14 @@ export const layer: Layer.Layer<
       answer: string
       status: WorkflowConsultationInfo["status"]
     }) {
+      const id = `consult_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`
+      const now = Date.now()
       Database.use((db) =>
         db
           .insert(WorkflowConsultationTable)
           .values({
             workflow_id: input.workflow.id,
-            id: `consult_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`,
+            id,
             from_session_id: input.fromSessionID,
             to_session_id: input.toSessionID,
             from_role: input.fromRole,
@@ -5422,14 +8469,29 @@ export const layer: Layer.Layer<
             question: input.question,
             answer: input.answer,
             status: input.status,
-            time_created: Date.now(),
-            time_updated: Date.now(),
+            time_created: now,
+            time_updated: now,
           })
           .run(),
       )
-      yield* writeReferenceIndex(input.workflow.id).pipe(Effect.ignore)
-      yield* writeOrganization(input.workflow.id).pipe(Effect.ignore)
-      yield* writeProgress(input.workflow.id).pipe(Effect.ignore)
+      yield* upsertWorkflowMessage({
+        workflowID: input.workflow.id,
+        id,
+        kind: "consultation",
+        fromSessionID: input.fromSessionID,
+        fromRole: input.fromRole,
+        toSessionID: input.toSessionID,
+        toRole: input.toRole,
+        milestoneID: input.milestoneID,
+        timing: input.timing,
+        body: input.question,
+        response: input.answer,
+        status: input.status,
+        timeCreated: now,
+        timeClosed: input.status === "answered" || input.status === "expired" || input.status === "failed" ? now : undefined,
+        timeUpdated: now,
+      })
+      yield* queueWorkflowArtifactRefresh(input.workflow.id, "consultation recorded").pipe(Effect.ignore)
       yield* events.publish(Event.GraphUpdated, { workflowID: input.workflow.id })
     })
 
@@ -5475,6 +8537,23 @@ export const layer: Layer.Layer<
       yield* Effect.all(
         pending.map((consultation) =>
           Effect.gen(function* () {
+            yield* upsertWorkflowMessage({
+              workflowID: workflow.id,
+              id: consultation.id,
+              kind: "consultation",
+              fromSessionID: consultation.from_session_id,
+              fromRole: consultation.from_role,
+              toSessionID: requesterSessionID,
+              toRole: "requester",
+              milestoneID: consultation.milestone_id ?? undefined,
+              timing: consultation.timing ?? undefined,
+              body: consultation.question,
+              response: answer,
+              status: "answered",
+              timeCreated: consultation.time_created,
+              timeClosed: Date.now(),
+              timeUpdated: Date.now(),
+            })
             const milestoneID = consultation.milestone_id ?? workflowSessionMilestoneID(items, consultation.from_session_id)
             const milestone = milestoneID ? items.find((item) => item.id === milestoneID) : undefined
             yield* runPrompt(
@@ -5577,7 +8656,7 @@ export const layer: Layer.Layer<
       sourceAttempt: number | undefined,
       text: string,
       depth?: number,
-    ) => Effect.Effect<void, unknown> = Effect.fn("Workflow.resolveConsultRequests")(function* (
+    ) => Effect.Effect<MessageV2.WithParts | undefined, unknown> = Effect.fn("Workflow.resolveConsultRequests")(function* (
       workflowID,
       sourceSessionID,
       sourceAgent,
@@ -5590,8 +8669,20 @@ export const layer: Layer.Layer<
     ) {
       const requests = parseConsultRequests(text)
       if (requests.length === 0) return
+      if (workflowMessageDispatchMisuse(text, sourceRole)) {
+        yield* rejectWorkflowMessageDispatchMisuse({
+          workflowID,
+          sourceSessionID,
+          sourceRole,
+          sourceMilestoneID,
+          sourceAttempt,
+          text,
+        })
+        return
+      }
       const workflow = yield* get(workflowID)
       const items = yield* milestones(workflowID)
+      const sourceResponses: MessageV2.WithParts[] = []
       for (const request of requests) {
         const targetSessionID =
           request.targetSessionID ??
@@ -5644,10 +8735,6 @@ export const layer: Layer.Layer<
             : undefined
         if (pauseStatus && sourceMilestoneID) {
           yield* updateMilestone(workflowID, sourceMilestoneID, { status: "blocked" }).pipe(Effect.ignore)
-          yield* notifyMainPM(
-            workflowID,
-            `Milestone ${sourceMilestoneID} is temporarily waiting for ${roleSessionTitle(targetRole)} consultation before continuing.`,
-          ).pipe(Effect.ignore)
         }
         const answerPrompt = runPrompt(
           targetSessionID,
@@ -5674,7 +8761,7 @@ export const layer: Layer.Layer<
             role: targetRole,
             milestoneID: targetMilestoneID,
           },
-          { consult: false, modelWeight: request.modelWeight },
+          { consult: false, control: false, modelWeight: request.modelWeight },
         )
         const answer =
           pauseStatus && sourceMilestoneID
@@ -5724,53 +8811,64 @@ export const layer: Layer.Layer<
               sourceMilestoneID && sourceAttempt !== undefined
                 ? milestoneJobID(workflowID, sourceMilestoneID, sourceAttempt)
                 : undefined,
+            sourceSessionID: targetSessionID,
+            sourceAgent: targetInfo.agent ?? workflowAgentForRole(targetRole),
           }).pipe(Effect.ignore)
+          if (yield* workflowIsBlocked(workflowID)) return
         }
-        yield* runPrompt(
-          sourceSessionID,
-          sourceAgent,
-          model,
-          [
-            "Workflow consultation response received.",
-            "",
-            `Consulted session: ${targetSessionID}`,
-            `Consulted role: ${roleSessionTitle(targetRole)}`,
-            `Requested timing: ${timing}`,
-            ...(request.reason ? [`Original reason: ${request.reason}`] : []),
-            "",
-            "Original question:",
-            request.question,
-            "",
-            "Response:",
-            answerText,
-            "",
-            "Use this answer to continue your assigned workflow task. Do not repeat the consultation unless something remains unclear.",
-          ].join("\n"),
-          {
-            workflowID,
-            role: sourceRole,
-            milestoneID: sourceMilestoneID,
-            attempt: sourceAttempt,
-          },
-          {
-            consult: false,
-            expect: workflowSessionExpectation({
+        const sourceExpectation = workflowSessionExpectation({
+          role: sourceRole,
+          milestoneID: sourceMilestoneID,
+          milestoneStatus: sourceMilestoneID
+            ? (yield* milestones(workflowID)).find((item) => item.id === sourceMilestoneID)?.status
+            : undefined,
+          workflowStatus: (yield* get(workflowID)).status,
+        })
+        sourceResponses.push(
+          yield* runPrompt(
+            sourceSessionID,
+            sourceAgent,
+            model,
+            [
+              "Workflow consultation response received.",
+              "",
+              `Consulted session: ${targetSessionID}`,
+              `Consulted role: ${roleSessionTitle(targetRole)}`,
+              `Requested timing: ${timing}`,
+              ...(request.reason ? [`Original reason: ${request.reason}`] : []),
+              "",
+              "Original question:",
+              request.question,
+              "",
+              "Response:",
+              answerText,
+              "",
+              "Use this answer to continue your assigned workflow task. Do not repeat the consultation unless something remains unclear.",
+              ...(sourceExpectation
+                ? [
+                    "",
+                    `Required output: ${sourceExpectation.description}`,
+                    "",
+                    sourceExpectation.reminder,
+                  ]
+                : []),
+            ].join("\n"),
+            {
+              workflowID,
               role: sourceRole,
               milestoneID: sourceMilestoneID,
-              milestoneStatus: sourceMilestoneID
-                ? (yield* milestones(workflowID)).find((item) => item.id === sourceMilestoneID)?.status
-                : undefined,
-              workflowStatus: (yield* get(workflowID)).status,
-            }),
-          },
+              attempt: sourceAttempt,
+            },
+            {
+              consult: false,
+              expect: sourceExpectation,
+            },
+          ),
         )
         if (pauseStatus && sourceMilestoneID && !(yield* workflowIsBlocked(workflowID))) {
           yield* updateMilestone(workflowID, sourceMilestoneID, { status: pauseStatus }).pipe(Effect.ignore)
-          yield* notifyMainPM(
-            workflowID,
-            `Temporary consultation for milestone ${sourceMilestoneID} was answered. The milestone returned to ${pauseStatus}.`,
-          ).pipe(Effect.ignore)
         }
+        if (sourceExpectation?.matches(latestText(sourceResponses.at(-1)!))) return sourceResponses.at(-1)
         if (timing === "interrupt") {
           if (sourceMilestoneID) {
             yield* updateMilestone(workflowID, sourceMilestoneID, { status: "blocked" }).pipe(Effect.ignore)
@@ -5782,6 +8880,7 @@ export const layer: Layer.Layer<
           return
         }
       }
+      return sourceResponses.at(-1)
     })
 
     const continuePlanning = Effect.fn("Workflow.continuePlanning")(function* (workflowID: WorkflowID) {
@@ -5794,7 +8893,7 @@ export const layer: Layer.Layer<
         Effect.catchCause(() => Effect.succeed(defaultXml)),
       )
       const definition = yield* Effect.try({
-        try: () => parseXmlDefinition(xml),
+        try: () => parseXmlDefinition(xml, workflow),
         catch: (error) => new Error({ message: error instanceof globalThis.Error ? error.message : String(error) }),
       })
       if (xml === defaultXml) yield* writeNote(workflowArtifactPath(workflow, "workflow.xml"), xml)
@@ -5938,7 +9037,7 @@ export const layer: Layer.Layer<
         milestoneID?: WorkflowMilestoneID
         attempt?: number
       },
-      options?: { consult?: boolean; expect?: WorkflowPromptExpectation; modelWeight?: number },
+      options?: { consult?: boolean; control?: boolean; expect?: WorkflowPromptExpectation; modelWeight?: number },
     ) {
       const runOnce = Effect.fn("Workflow.runPromptOnce")(function* (nextText: string) {
         const basePromptText = archive ? yield* workflowPromptText(sessionID, nextText, archive) : nextText
@@ -6010,29 +9109,108 @@ export const layer: Layer.Layer<
           milestoneID: archive.milestoneID,
           attempt: archive.attempt,
         }).pipe(Effect.ignore)
-        yield* writeReferenceIndex(archive.workflowID).pipe(Effect.ignore)
-        yield* writeArchiveIndex(archive.workflowID).pipe(Effect.ignore)
-        yield* writeOrganization(archive.workflowID).pipe(Effect.ignore)
+        yield* queueWorkflowArtifactRefresh(archive.workflowID, "session prompt archived").pipe(Effect.ignore)
+        const output = latestText(input.result)
+        const dispatchClaim = workflowDispatchClaimWithoutControl(output, archive.role)
+        const dispatchMessageMisuse = workflowMessageDispatchMisuse(output, archive.role)
+        const inferredControlItems = dispatchClaim ? yield* milestones(archive.workflowID) : []
+        const inferredControl = dispatchClaim
+          ? workflowInferredDispatchControl({
+              text: output,
+              role: archive.role,
+              milestoneID: archive.milestoneID,
+              milestoneStatus: archive.milestoneID
+                ? inferredControlItems.find((item) => item.id === archive.milestoneID)?.status
+                : undefined,
+              milestones: inferredControlItems,
+            })
+          : undefined
+        const inferredControlReplay = inferredControl
+          ? yield* handleWorkflowToolCommand(
+              {
+                ...inferredControl,
+                id: Bus.createID(),
+                workflowID: archive.workflowID,
+                sourceSessionID: sessionID,
+                sourceAgent: agent,
+              },
+              {
+                currentJobID:
+                  archive.milestoneID && archive.attempt !== undefined
+                    ? milestoneJobID(archive.workflowID, archive.milestoneID, archive.attempt)
+                    : undefined,
+              },
+            ).pipe(Effect.catchCause(() => Effect.succeed(undefined)))
+          : undefined
+        const inferredControlApplied = inferredControlReplay?.result?.applied === true
+        if (dispatchClaim) {
+          yield* appendWorkflowMessageRuntimeJournal(archive.workflowID, {
+            action: "reject",
+            kind: "consultation",
+            sourceSessionID: sessionID,
+            sourceRole: archive.role,
+            milestoneID: archive.milestoneID,
+            attempt: archive.attempt,
+            status: "rejected",
+            request: compactMarkdown(output, 700),
+            response:
+              "Workflow session claimed milestone dispatch without confirmed workflow control. workflow-message is consultation/notification only; use workflow update_xml, resume, plan_complete, force_complete, or scheduler-created milestone sessions for dispatch.",
+          }).pipe(Effect.ignore)
+        }
         yield* applyWorkflowUpdateFromOutput({
           workflowID: archive.workflowID,
           role: archive.role,
-          output: latestText(input.result),
+          output,
         }).pipe(Effect.ignore)
-        if (options?.consult !== false) {
-          yield* resolveConsultRequests(
-            archive.workflowID,
-            sessionID,
-            agent,
-            input.model,
-            archive.role,
-            archive.milestoneID,
-            archive.attempt,
-            latestText(input.result),
-          ).pipe(Effect.ignore)
+        const controlCommand = parseWorkflowControlCommand(output)
+        const hasWorkflowControl = controlCommand !== undefined || implicitWorkflowResume(output)
+        if (options?.control !== false && hasWorkflowControl) {
+          yield* applyWorkflowControl(archive.workflowID, output, "workflow managed prompt output", {
+            exceptJobID:
+              archive.milestoneID && archive.attempt !== undefined
+                ? milestoneJobID(archive.workflowID, archive.milestoneID, archive.attempt)
+                : undefined,
+            sourceSessionID: sessionID,
+            sourceAgent: agent,
+          }).pipe(Effect.ignore)
         }
+        const followup =
+          options?.consult !== false && !dispatchMessageMisuse && (!dispatchClaim || inferredControlApplied)
+            ? yield* resolveConsultRequests(
+                archive.workflowID,
+                sessionID,
+                agent,
+                input.model,
+                archive.role,
+                archive.milestoneID,
+                archive.attempt,
+                output,
+              )
+            : undefined
+        return { dispatchClaim: dispatchClaim && !inferredControlApplied, followup }
       })
       let current = yield* runOnce(text)
-      yield* archiveResult(current)
+      let archived = yield* archiveResult(current)
+      if (archived?.followup) current = { ...current, result: archived.followup }
+      if (archive && archived?.dispatchClaim) {
+        current = yield* runOnce(
+          workflowDispatchCorrectionPrompt({
+            workflow: yield* get(archive.workflowID),
+            role: archive.role,
+            milestoneID: archive.milestoneID,
+            previous: latestText(current.result),
+          }),
+        )
+        archived = yield* archiveResult(current)
+        if (archived?.followup) current = { ...current, result: archived.followup }
+        if (archived?.dispatchClaim) {
+          yield* blockPlanning(
+            archive.workflowID,
+            "Workflow session claimed milestone dispatch without confirmed workflow control. Workflow messages and natural-language assignments are consultation/notification only; use workflow update_xml, resume, plan_complete, force_complete, or scheduler-created milestone sessions.",
+          )
+          return current.result
+        }
+      }
       const expectation = options?.expect
       if (!expectation) return current.result
       const maxAttempts = Math.max(1, Math.trunc(expectation.maxAttempts ?? 6))
@@ -6040,7 +9218,27 @@ export const layer: Layer.Layer<
         if (expectation.matches(latestText(current.result))) return current.result
         if (archive && (yield* workflowIsBlocked(archive.workflowID))) return current.result
         current = yield* runOnce(workflowExpectedOutputPrompt(expectation, attempt, maxAttempts))
-        yield* archiveResult(current)
+        archived = yield* archiveResult(current)
+        if (archived?.followup) current = { ...current, result: archived.followup }
+        if (archive && archived?.dispatchClaim) {
+          current = yield* runOnce(
+            workflowDispatchCorrectionPrompt({
+              workflow: yield* get(archive.workflowID),
+              role: archive.role,
+              milestoneID: archive.milestoneID,
+              previous: latestText(current.result),
+            }),
+          )
+          archived = yield* archiveResult(current)
+          if (archived?.followup) current = { ...current, result: archived.followup }
+          if (archived?.dispatchClaim) {
+            yield* blockPlanning(
+              archive.workflowID,
+              "Workflow session claimed milestone dispatch without confirmed workflow control. Workflow messages and natural-language assignments are consultation/notification only; use workflow update_xml, resume, plan_complete, force_complete, or scheduler-created milestone sessions.",
+            )
+            return current.result
+          }
+        }
       }
       return current.result
     })
@@ -6116,24 +9314,34 @@ export const layer: Layer.Layer<
     }) {
       const key = workflowMessageKey(input.sessionID, input.messageID)
       if (workflowManagedMessageKeys.has(key) || observedWorkflowMessageKeys.has(key)) return
+      observedWorkflowMessageKeys.add(key)
       const message = (yield* session.messages({ sessionID: input.sessionID, limit: 20 })).find(
         (item) => item.info.id === input.messageID,
       )
-      if (!message) return
+      if (!message) {
+        observedWorkflowMessageKeys.delete(key)
+        return
+      }
       if (
         message.info.role === "assistant" &&
         workflowManagedMessageKeys.has(workflowMessageKey(input.sessionID, message.info.parentID))
       ) {
+        observedWorkflowMessageKeys.delete(key)
         return
       }
       const text = yield* workflowMessageTextWithRetry({
         sessionID: input.sessionID,
         messageID: input.messageID,
       })
-      if (!text.trim()) return
+      if (!text.trim()) {
+        observedWorkflowMessageKeys.delete(key)
+        return
+      }
       const context = yield* workflowSessionContext(input.sessionID)
-      if (!context) return
-      observedWorkflowMessageKeys.add(key)
+      if (!context) {
+        observedWorkflowMessageKeys.delete(key)
+        return
+      }
       yield* archiveWorkflowSession({
         workflowID: context.workflow.id,
         sessionID: input.sessionID,
@@ -6152,10 +9360,13 @@ export const layer: Layer.Layer<
       if (appliedWorkflowUpdate && context.role === "main_pm") {
         yield* queueContinuePlanning(yield* get(context.workflow.id), "main PM workflow update").pipe(Effect.ignore)
       }
-      const controlAction = parseWorkflowControlAction(text)
-      if (context.role === "main_pm" && (controlAction || implicitWorkflowResume(text))) {
-        yield* applyWorkflowControl(context.workflow.id, text, "main PM workflow handoff").pipe(Effect.ignore)
-        if (controlAction === "resume" || implicitWorkflowResume(text)) return
+      const controlCommand = parseWorkflowControlCommand(text)
+      if (controlCommand || implicitWorkflowResume(text)) {
+        yield* applyWorkflowControl(context.workflow.id, text, "workflow session control output", {
+          sourceSessionID: input.sessionID,
+          sourceAgent: input.agent,
+        }).pipe(Effect.ignore)
+        if (controlCommand || implicitWorkflowResume(text)) return
       }
       const contextItems = yield* milestones(context.workflow.id)
       const active = context.milestoneID ? contextItems.find((item) => item.id === context.milestoneID) : undefined
@@ -6166,8 +9377,9 @@ export const layer: Layer.Layer<
         workflowStatus: context.workflow.status,
       })
       const consults = parseConsultRequests(text)
+      const dispatchClaimWithoutControl = workflowDispatchClaimWithoutControl(text, context.role)
       const followup =
-        expectation && !appliedWorkflowUpdate && consults.length === 0 && !expectation.matches(text)
+        !dispatchClaimWithoutControl && expectation && !appliedWorkflowUpdate && consults.length === 0 && !expectation.matches(text)
           ? latestText(
               yield* runPrompt(
                 input.sessionID,
@@ -6189,6 +9401,85 @@ export const layer: Layer.Layer<
         yield* queueContinuePlanning(yield* get(context.workflow.id), "main PM hook workflow update").pipe(Effect.ignore)
       }
       const followupConsults = parseConsultRequests(followup)
+      if (dispatchClaimWithoutControl || workflowDispatchClaimWithoutControl(followup, context.role)) {
+        if (workflowMessageDispatchMisuse(dispatchClaimWithoutControl ? text : followup, context.role)) {
+          yield* rejectWorkflowMessageDispatchMisuse({
+            workflowID: context.workflow.id,
+            sourceSessionID: input.sessionID,
+            sourceRole: context.role,
+            sourceMilestoneID: context.milestoneID,
+            sourceAttempt: context.attempt,
+            text: dispatchClaimWithoutControl ? text : followup,
+          })
+        }
+        const correction = latestText(
+          yield* runPrompt(
+            input.sessionID,
+            input.agent,
+            input.model,
+            workflowDispatchCorrectionPrompt({
+              workflow: context.workflow,
+              role: context.role,
+              milestoneID: context.milestoneID,
+              previous: dispatchClaimWithoutControl ? text : followup,
+            }),
+            {
+              workflowID: context.workflow.id,
+              role: context.role,
+              milestoneID: context.milestoneID,
+              attempt: context.attempt,
+            },
+            { consult: false, expect: workflowDispatchCorrectionExpectation(context.role) },
+          ),
+        )
+        const correctionWorkflowUpdate = yield* applyWorkflowUpdateFromOutput({
+          workflowID: context.workflow.id,
+          role: context.role,
+          output: correction,
+        })
+        if (correctionWorkflowUpdate && context.role === "main_pm") {
+          yield* queueContinuePlanning(yield* get(context.workflow.id), "main PM dispatch correction workflow update").pipe(Effect.ignore)
+        }
+        const correctionControlCommand = parseWorkflowControlCommand(correction)
+        if (correctionControlCommand || implicitWorkflowResume(correction)) {
+          yield* applyWorkflowControl(context.workflow.id, correction, "workflow-message dispatch correction", {
+            sourceSessionID: input.sessionID,
+            sourceAgent: input.agent,
+          }).pipe(Effect.ignore)
+          if (correctionControlCommand || implicitWorkflowResume(correction)) return
+        }
+        const correctionConsults = parseConsultRequests(correction)
+        if (workflowDispatchClaimWithoutControl(correction, context.role)) {
+          yield* blockPlanning(
+            context.workflow.id,
+            "Workflow session claimed milestone dispatch without confirmed workflow control. Workflow messages and natural-language assignments are consultation/notification only; use workflow update_xml, resume, plan_complete, or the scheduler-created milestone sessions.",
+          )
+          return
+        }
+        if (correctionConsults.length > 0) {
+          yield* resolveConsultRequests(
+            context.workflow.id,
+            input.sessionID,
+            input.agent,
+            input.model,
+            context.role,
+            context.milestoneID,
+            context.attempt,
+            correction,
+          ).pipe(Effect.ignore)
+          yield* advanceWorkflowAfterSession(context.workflow.id, "workflow dispatch correction consultation completed")
+          return
+        }
+        if (correctionWorkflowUpdate) {
+          yield* advanceWorkflowAfterSession(context.workflow.id, "workflow dispatch correction completed")
+          return
+        }
+        yield* blockPlanning(
+          context.workflow.id,
+          "Workflow session stopped after a dispatch claim without producing a real workflow update/control/consultation output.",
+        )
+        return
+      }
       if (followupConsults.length === 0) {
         if (appliedWorkflowUpdate || followupWorkflowUpdate || !expectation || expectation.matches(followup)) {
           yield* advanceWorkflowAfterSession(context.workflow.id, "workflow session completed")
@@ -6251,13 +9542,70 @@ export const layer: Layer.Layer<
     }) {
       const key = workflowMessageKey(input.sessionID, input.messageID)
       if (workflowManagedMessageKeys.has(key) || observedRequesterMessageKeys.has(key)) return
-      const workflow = yield* activeRequesterWorkflow(input.sessionID)
-      if (!workflow) return
-      const text = yield* requesterMessageTextWithRetry(input)
-      if (!text) return
       observedRequesterMessageKeys.add(key)
+      const workflow = yield* activeRequesterWorkflow(input.sessionID)
+      if (!workflow) {
+        observedRequesterMessageKeys.delete(key)
+        return
+      }
+      const text = yield* requesterMessageTextWithRetry(input)
+      if (!text) {
+        observedRequesterMessageKeys.delete(key)
+        return
+      }
       yield* answerPendingRequesterConsultations(workflow, input.sessionID, text).pipe(Effect.ignore)
       if (yield* applyRequesterAcceptance(yield* get(workflow.id), text)) return
+      if (workflowMessageDispatchMisuse(text, "requester")) {
+        yield* archiveWorkflowSession({ workflowID: workflow.id, sessionID: input.sessionID, role: "requester" }).pipe(
+          Effect.ignore,
+        )
+        yield* rejectWorkflowMessageDispatchMisuse({
+          workflowID: workflow.id,
+          sourceSessionID: input.sessionID,
+          sourceRole: "requester",
+          text,
+          response:
+            "requester workflow-message assignment is not direct dispatch; converting this requester direction into workflow control so milestone sessions are created by the scheduler.",
+        })
+        const override = yield* applyRequesterDirectExecutionOverride({
+          workflow,
+          sourceSessionID: input.sessionID,
+          message: text,
+        }).pipe(
+          Effect.catchCause((cause) =>
+            Effect.succeed({
+              applied: false,
+              message: `Requester workflow-message dispatch override failed: ${errorFromCause(cause)}`,
+            }),
+          ),
+        )
+        yield* notifyMainPM(
+          workflow.id,
+          `Requester workflow-message dispatch override ${override.applied ? "applied" : "failed"}: ${override.message}`,
+        ).pipe(Effect.ignore)
+        yield* publishUpdated(workflow.id).pipe(Effect.ignore)
+        return
+      }
+      if (parseConsultRequests(text).length > 0) {
+        yield* archiveWorkflowSession({ workflowID: workflow.id, sessionID: input.sessionID, role: "requester" }).pipe(
+          Effect.ignore,
+        )
+        yield* resolveConsultRequests(
+          workflow.id,
+          input.sessionID,
+          "workflow-requester",
+          workflow.model,
+          "requester",
+          undefined,
+          undefined,
+          text,
+        ).pipe(Effect.ignore)
+        yield* writeReferenceIndex(workflow.id).pipe(Effect.ignore)
+        yield* writeArchiveIndex(workflow.id).pipe(Effect.ignore)
+        yield* writeOrganization(workflow.id).pipe(Effect.ignore)
+        yield* publishUpdated(workflow.id).pipe(Effect.ignore)
+        return
+      }
       const target = workflow.pmSessionID
         ? { sessionID: workflow.pmSessionID }
         : yield* ensureCompanyMember({
@@ -6319,12 +9667,26 @@ export const layer: Layer.Layer<
           workflowID: workflow.id,
           role: "main_pm",
         },
+        { consult: false, control: false },
       )
+      const resultText = latestText(result)
+      if (parseConsultRequests(resultText).length > 0) {
+        yield* resolveConsultRequests(
+          workflow.id,
+          target.sessionID,
+          targetInfo.agent ?? "workflow-main-pm",
+          workflow.model,
+          "main_pm",
+          undefined,
+          undefined,
+          resultText,
+        ).pipe(Effect.ignore)
+      }
       Database.use((db) =>
         db
           .update(WorkflowInterventionTable)
           .set({
-            response: latestText(result),
+            response: resultText,
             status: "delivered" as const,
             time_updated: Date.now(),
           })
@@ -6335,14 +9697,17 @@ export const layer: Layer.Layer<
       yield* writeReferenceIndex(workflow.id).pipe(Effect.ignore)
       yield* writeArchiveIndex(workflow.id).pipe(Effect.ignore)
       yield* writeOrganization(workflow.id).pipe(Effect.ignore)
-      yield* applyWorkflowControl(workflow.id, latestText(result), "requester strategic direction").pipe(Effect.ignore)
+      yield* applyWorkflowControl(workflow.id, resultText, "requester strategic direction", {
+        sourceSessionID: target.sessionID,
+        sourceAgent: targetInfo.agent ?? "workflow-main-pm",
+      }).pipe(Effect.ignore)
       yield* publishUpdated(workflow.id).pipe(Effect.ignore)
     })
 
-    const notifyMainPM = Effect.fn("Workflow.notifyMainPM")(function* (
+    const runMainPMNotification = Effect.fn("Workflow.runMainPMNotification")(function* (
       workflowID: WorkflowID,
       message: string,
-      source?: { milestoneID?: WorkflowMilestoneID; jobID?: string },
+      source?: { milestoneID?: WorkflowMilestoneID; jobID?: string; notificationJobID?: string },
     ) {
       const workflow = yield* get(workflowID)
       if (!workflow.pmSessionID) return
@@ -6357,21 +9722,37 @@ export const layer: Layer.Layer<
           "",
           message,
           "",
-          "Update main-plan.md, progress.md, or workflow.xml only if this changes scope, sequencing, risks, or acceptance. Do not do implementation work from the main PM session.",
+          `Update ${workflowMainPlanPath()} or workflow.xml only if this changes scope, sequencing, risks, or acceptance. Do not rewrite progress.md, organization.md, or index.md directly; the runtime regenerates them. Do not do implementation work from the main PM session.`,
         ].join("\n"),
         {
           workflowID,
           role: "main_pm",
         },
+        { consult: false, control: false },
       )
+      const resultText = latestText(result)
+      if (parseConsultRequests(resultText).length > 0) {
+        yield* resolveConsultRequests(
+          workflowID,
+          workflow.pmSessionID,
+          "workflow-main-pm",
+          workflow.model,
+          "main_pm",
+          undefined,
+          undefined,
+          resultText,
+        ).pipe(Effect.ignore)
+      }
       yield* writeProgress(workflowID).pipe(Effect.ignore)
       yield* writeMainPMSupervisionNote({
         workflowID,
         message,
-        output: latestText(result),
+        output: resultText,
       }).pipe(Effect.ignore)
-      const next = yield* applyWorkflowControl(workflowID, latestText(result), "main PM supervision", {
-        exceptJobID: source?.jobID,
+      const next = yield* applyWorkflowControl(workflowID, resultText, "main PM supervision", {
+        exceptJobID: [source?.jobID, source?.notificationJobID].filter((item): item is string => !!item),
+        sourceSessionID: workflow.pmSessionID,
+        sourceAgent: "workflow-main-pm",
       })
       if (next.status === "blocked") {
         if (source?.milestoneID) {
@@ -6393,18 +9774,55 @@ export const layer: Layer.Layer<
       )
     })
 
+    const notifyMainPM = Effect.fn("Workflow.notifyMainPM")(function* (
+      workflowID: WorkflowID,
+      message: string,
+      source?: { milestoneID?: WorkflowMilestoneID; jobID?: string },
+    ) {
+      const workflow = yield* get(workflowID)
+      if (!workflow.pmSessionID) return
+      const jobID = `${workflowID}:main-pm-note:${Date.now().toString(36)}:${Math.random().toString(36).slice(2, 8)}`
+      yield* background.start({
+        id: jobID,
+        type: "workflow.notification",
+        title: `${workflow.title} main PM update`,
+        metadata: { workflowID, reason: "main_pm_notification", milestoneID: source?.milestoneID },
+        run: runMainPMNotification(workflowID, message, { ...source, notificationJobID: jobID }).pipe(
+          Effect.catchCause((cause) =>
+            Cause.hasInterruptsOnly(cause)
+              ? Effect.interrupt
+              : appendWorkflowEventRuntimeJournal(workflowID, {
+                  action: "main_pm_notification.failed",
+                  message: errorFromCause(cause),
+                  milestoneID: source?.milestoneID,
+                }).pipe(Effect.ignore),
+          ),
+          Effect.as("main PM notification completed"),
+        ),
+      })
+    })
+
     const observeWorkflowUserMessage = Effect.fn("Workflow.observeWorkflowUserMessage")(function* (input: {
       sessionID: SessionID
       messageID: MessageID
     }) {
       const key = workflowMessageKey(input.sessionID, input.messageID)
       if (workflowManagedMessageKeys.has(key) || observedWorkflowMessageKeys.has(key)) return
-      const context = yield* workflowSessionContext(input.sessionID)
-      if (!context || context.role === "requester") return
-      const text = yield* requesterMessageTextWithRetry(input)
-      if (!text) return
-      if (/^\/workflow-continue(?:\s|$)/i.test(text.trim())) return
       observedWorkflowMessageKeys.add(key)
+      const context = yield* workflowSessionContext(input.sessionID)
+      if (!context || context.role === "requester") {
+        observedWorkflowMessageKeys.delete(key)
+        return
+      }
+      const text = yield* requesterMessageTextWithRetry(input)
+      if (!text) {
+        observedWorkflowMessageKeys.delete(key)
+        return
+      }
+      if (/^\/workflow-continue(?:\s|$)/i.test(text.trim())) {
+        observedWorkflowMessageKeys.delete(key)
+        return
+      }
       const id = `intervention_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`
       const interventionPath = workflowArtifactPath(context.workflow, workflowInterventionPath(id))
       Database.use((db) =>
@@ -6453,6 +9871,103 @@ export const layer: Layer.Layer<
       return (yield* get(workflowID)).status === "blocked"
     })
 
+    const queueCompanyStandupRequests = Effect.fn("Workflow.queueCompanyStandupRequests")(function* (input: {
+      workflow: WorkflowInfo
+      standupPath: string
+      reason: string
+    }) {
+      const mainPMSessionID =
+        input.workflow.pmSessionID ?? (yield* members(input.workflow.id)).find((member) => member.role === "main_pm")?.sessionID
+      if (!mainPMSessionID) return 0
+      const activeMembers = (yield* members(input.workflow.id)).filter(
+        (member) => member.status === "active" && member.role !== "main_pm",
+      )
+      if (activeMembers.length === 0) return 0
+      const now = Date.now()
+      const requests = activeMembers.map((member) => {
+        const id = `standup_request_${now.toString(36)}_${staffSlug(member.id)}`
+        const interventionPath = workflowArtifactPath(input.workflow, workflowInterventionPath(id))
+        return {
+          id,
+          member,
+          interventionPath,
+          message: [
+            "Workflow company standup request.",
+            "",
+            `Reason: ${input.reason}`,
+            `Standup document: ${input.standupPath}`,
+            "",
+            "Update your workflow member status with workflow action=status_update, including availability, currentFocus, blockers, and progressNote.",
+            "Then acknowledge this standup request with workflow_message action=ack for this message id.",
+          ].join("\n"),
+        }
+      })
+      yield* Effect.all(
+        requests.map((request) =>
+          Effect.sync(() =>
+            Database.use((db) =>
+              db
+                .insert(WorkflowInterventionTable)
+                .values({
+                  workflow_id: input.workflow.id,
+                  id: request.id,
+                  from_session_id: mainPMSessionID,
+                  target_session_id: request.member.sessionID,
+                  target_role: request.member.role,
+                  timing: "after-task" as const,
+                  message: request.message,
+                  path: request.interventionPath,
+                  status: "queued" as const,
+                  time_created: now,
+                  time_updated: now,
+                })
+                .run(),
+            ),
+          ),
+        ),
+        { discard: true, concurrency: 1 },
+      )
+      yield* Effect.all(
+        requests.map((request) =>
+          upsertWorkflowMessage({
+            workflowID: input.workflow.id,
+            id: request.id,
+            kind: "standup",
+            fromSessionID: mainPMSessionID,
+            fromRole: "main_pm",
+            toSessionID: request.member.sessionID,
+            toRole: request.member.role,
+            timing: "after-task",
+            body: request.message,
+            status: "queued",
+            timeCreated: now,
+            timeUpdated: now,
+          }),
+        ),
+        { discard: true },
+      )
+      yield* Effect.all(
+        requests.map((request) =>
+          appendWorkflowMessageRuntimeJournal(input.workflow.id, {
+            action: "send",
+            kind: "standup",
+            messageID: request.id,
+            sourceSessionID: mainPMSessionID,
+            sourceRole: "main_pm",
+            targetSessionID: request.member.sessionID,
+            targetRole: request.member.role,
+            status: "queued",
+            request: request.message,
+          }),
+        ),
+        { discard: true },
+      )
+      yield* writeInterventionArtifacts(input.workflow.id).pipe(Effect.ignore)
+      yield* writeReferenceIndex(input.workflow.id).pipe(Effect.ignore)
+      yield* writeArchiveIndex(input.workflow.id).pipe(Effect.ignore)
+      return requests.length
+    })
+
     const runCompanyStandup = Effect.fn("Workflow.runCompanyStandup")(function* (
       workflowID: WorkflowID,
       reason: string,
@@ -6475,6 +9990,9 @@ export const layer: Layer.Layer<
         [
           "Run a short workflow company standup.",
           "",
+          `Workflow title: ${workflow.title}`,
+          `Workflow request: ${compactMarkdown(workflow.request, 1200)}`,
+          "",
           workflowReferencePrompt(workflow),
           "",
           `Reason: ${reason}`,
@@ -6489,12 +10007,18 @@ export const layer: Layer.Layer<
           workflowID,
           role: "main_pm",
         },
+        { control: false },
       )
       const output = latestText(result)
       yield* writeNote(standupPath, standupMarkdown({ workflow, reason, progress, output }))
       yield* appendStandupIndex(workflow, standupPath, reason)
       yield* writeReferenceIndex(workflowID).pipe(Effect.ignore)
-      yield* applyWorkflowControl(workflowID, output, "company standup", { exceptJobID: jobID }).pipe(Effect.ignore)
+      yield* applyWorkflowControl(workflowID, output, "company standup", {
+        exceptJobID: jobID,
+        sourceSessionID: workflow.pmSessionID,
+        sourceAgent: "workflow-main-pm",
+      }).pipe(Effect.ignore)
+      yield* queueCompanyStandupRequests({ workflow: yield* get(workflowID), standupPath, reason }).pipe(Effect.ignore)
       yield* publishUpdated(workflowID).pipe(Effect.ignore)
     })
 
@@ -6525,22 +10049,38 @@ export const layer: Layer.Layer<
       })
     })
 
-    const blockWorkflow = Effect.fn("Workflow.blockWorkflow")(function* (workflow: WorkflowInfo, message: string) {
+    const blockWorkflow = Effect.fn("Workflow.blockWorkflow")(function* (
+      workflow: WorkflowInfo,
+      message: string,
+      options?: { kind?: "product" | "runtime" },
+    ) {
       const info = yield* setStatus(workflow.id, "blocked", { error: message })
-      const pmSessionID = info.pmSessionID ?? workflow.pmSessionID
+      const pmSessionID =
+        info.pmSessionID ?? workflow.pmSessionID ?? (yield* members(workflow.id)).find((member) => member.role === "main_pm")?.sessionID
       if (pmSessionID) {
+        yield* recordMainPMSystemReport({ ...info, pmSessionID }, message).pipe(Effect.ignore)
         yield* runPrompt(
           pmSessionID,
           "workflow-main-pm",
           workflow.model,
-          [
-            "The workflow is blocked and needs product clarification.",
-            "",
-            `Workflow: ${workflow.id}`,
-            `Reason: ${message}`,
-            "",
-            "Review the original request and provide clarification or revised workflow XML if needed.",
-          ].join("\n"),
+          options?.kind === "runtime"
+            ? [
+                "The workflow runtime detected a scheduling problem.",
+                "",
+                `Workflow: ${workflow.id}`,
+                `Reason: ${message}`,
+                "",
+                "This is a workflow runner or dispatch issue, not product clarification. Do not rewrite product scope or workflow XML unless the graph is actually wrong.",
+                "Inspect the affected session and workflow artifacts, then use workflow resume/continue after the runner state is healthy.",
+              ].join("\n")
+            : [
+                "The workflow is blocked and needs product clarification.",
+                "",
+                `Workflow: ${workflow.id}`,
+                `Reason: ${message}`,
+                "",
+                "Review the original request and provide clarification or revised workflow XML if needed.",
+              ].join("\n"),
           {
             workflowID: workflow.id,
             role: "main_pm",
@@ -6574,21 +10114,17 @@ export const layer: Layer.Layer<
       const ctx = yield* InstanceState.context
       const info = yield* session.get(input.sessionID).pipe(Effect.mapError((error) => new Error({ message: error.message })))
       const role = input.role ?? workflowSessionRole(workflow, yield* milestones(workflow.id), input.sessionID)
+      const messages = yield* session.messages({ sessionID: input.sessionID })
       yield* archiveWorkflowSessionMessages({
         workflow,
         session: info,
+        messages,
         role,
         prompt: input.prompt,
         milestoneID: input.milestoneID,
         attempt: input.attempt,
         file: path.join(ctx.directory, workflowArtifactPath(workflow, workflowSessionArchivePath(input.sessionID))),
       })
-      const messages = (
-        yield* MessageV2.page({
-          sessionID: input.sessionID,
-          limit: 60,
-        }).pipe(Effect.mapError((error) => new Error({ message: error.message })))
-      ).items
       yield* writeNote(
         workflowArtifactPath(workflow, workflowSessionSummaryPath(input.sessionID)),
         archiveSessionSummaryMarkdown({
@@ -6672,7 +10208,7 @@ export const layer: Layer.Layer<
       const workflow = yield* get(input.workflowID)
       if (input.role !== "main_pm" && input.role !== "department_pm") return false
       const definition = yield* Effect.try({
-        try: () => parseXmlDefinition(xml),
+        try: () => parseXmlDefinition(xml, workflow),
         catch: (error) => new Error({ message: error instanceof globalThis.Error ? error.message : String(error) }),
       }).pipe(
         Effect.catchCause((cause) =>
@@ -6727,6 +10263,7 @@ export const layer: Layer.Layer<
     }) {
       const specialty = roleSpecialty(input.role, input.specialty)
       const staff = yield* members(input.workflow.id)
+      const milestoneItems = yield* milestones(input.workflow.id)
       const limit = staffLimitForRole(input.workflow.staffing, input.role)
       const all = staff.filter((member) => member.role === input.role)
       const selectorPrompt = input.prompt ?? specialty
@@ -6734,7 +10271,7 @@ export const layer: Layer.Layer<
         role: input.role,
         specialty,
         members: staff,
-        milestones: yield* milestones(input.workflow.id),
+        milestones: milestoneItems,
         excludeMilestoneID: input.milestoneID,
         limit,
         workflow: input.workflow,
@@ -6742,10 +10279,45 @@ export const layer: Layer.Layer<
         modelWeight: input.modelWeight,
       })
       if (selected && (!input.strictSpecialty || selected.specialty === specialty)) {
-        if (input.workflow.rootSessionID) {
+        if (
+          selected.specialty !== specialty &&
+          ["department_pm", "executor", "expert", "reviewer"].includes(input.role) &&
+          !milestoneItems.some((milestone) =>
+            milestone.session.some((ref) => ref.role === input.role && ref.sessionID === selected.sessionID),
+          )
+        ) {
+          const now = Date.now()
+          const title = input.title ?? workflowMemberTitle(input.role, specialty, all.filter((member) => member.specialty === specialty).length + 1)
+          Database.use((db) =>
+            db
+              .update(WorkflowMemberTable)
+              .set({ specialty, title, time_updated: now })
+              .where(and(eq(WorkflowMemberTable.workflow_id, input.workflow.id), eq(WorkflowMemberTable.id, selected.id)))
+              .run(),
+          )
+          if (input.workflow.rootSessionID && !input.skipAssignmentSideEffects) {
+            yield* session.setParent({ sessionID: selected.sessionID, parentID: input.workflow.rootSessionID }).pipe(Effect.ignore)
+          }
+          if (!input.skipAssignmentSideEffects) {
+            yield* session.setTitle({ sessionID: selected.sessionID, title }).pipe(Effect.ignore)
+            yield* writeOrganization(input.workflow.id).pipe(Effect.ignore)
+          }
+          return {
+            ...selected,
+            specialty,
+            title,
+            time: {
+              ...selected.time,
+              updated: now,
+            },
+          }
+        }
+        if (input.workflow.rootSessionID && !input.skipAssignmentSideEffects) {
           yield* session.setParent({ sessionID: selected.sessionID, parentID: input.workflow.rootSessionID }).pipe(Effect.ignore)
         }
-        yield* session.setTitle({ sessionID: selected.sessionID, title: selected.title }).pipe(Effect.ignore)
+        if (!input.skipAssignmentSideEffects) {
+          yield* session.setTitle({ sessionID: selected.sessionID, title: selected.title }).pipe(Effect.ignore)
+        }
         return selected
       }
 
@@ -6769,6 +10341,24 @@ export const layer: Layer.Layer<
         permission: memberPermission(input.role),
         model: initialModel,
       })
+      const ctx = yield* InstanceState.context
+      Database.use((db) =>
+        db
+          .insert(SessionTable)
+          .values(
+            workflowStateSessionRow({
+              ctx,
+              workflow: input.workflow,
+              session: workflowStateSessionSnapshot({
+                workflow: input.workflow,
+                ref: { sessionID: created.id, role: input.role, title },
+                info: created,
+              }),
+            }),
+          )
+          .onConflictDoNothing()
+          .run(),
+      )
       const now = Date.now()
       const member = {
         workflow_id: input.workflow.id,
@@ -6779,6 +10369,10 @@ export const layer: Layer.Layer<
         session_id: created.id,
         capacity: 1,
         status: "active" as const,
+        availability: "idle" as const,
+        current_focus: null,
+        blockers: [],
+        progress_note: null,
         model: workflowModelRef(initialModel) ?? null,
         model_weight: initialModel ? Math.trunc(workflowModelWeight(initialModel.weight ?? input.modelWeight)) : null,
         model_cache_until: workflowModelCacheUntil(initialModel, now) ?? null,
@@ -6786,7 +10380,7 @@ export const layer: Layer.Layer<
         time_updated: now,
       }
       Database.use((db) => db.insert(WorkflowMemberTable).values(member).run())
-      yield* writeOrganization(input.workflow.id).pipe(Effect.ignore)
+      if (!input.skipAssignmentSideEffects) yield* writeOrganization(input.workflow.id).pipe(Effect.ignore)
       return toMember(member)
     })
 
@@ -6856,6 +10450,92 @@ export const layer: Layer.Layer<
             session: [...milestone.session, ref],
           }
 
+    const assignMilestoneMember = Effect.fn("Workflow.assignMilestoneMember")(function* (input: {
+      workflow: WorkflowInfo
+      milestone: WorkflowMilestoneInfo
+      role: WorkflowSessionRef["role"]
+      specialty: string
+      title: string
+      attempt: number
+      prompt: string
+      modelWeight?: number
+    }) {
+      const member = yield* withWorkflowMemberAssignmentQueue(
+        input.workflow.id,
+        Effect.gen(function* () {
+          const current = (yield* milestones(input.workflow.id)).find((item) => item.id === input.milestone.id)
+          if (!current || ["done", "completed", "skipped", "cancelled"].includes(current.status)) return undefined
+          const member = yield* ensureCompanyMember({
+            workflow: input.workflow,
+            role: input.role,
+            specialty: input.specialty,
+            title: input.title,
+            milestoneID: input.milestone.id,
+            prompt: input.prompt,
+            modelWeight: input.modelWeight,
+            skipAssignmentSideEffects: true,
+          })
+          if (!member) return undefined
+          const latest = (yield* milestones(input.workflow.id)).find((item) => item.id === input.milestone.id)
+          if (!latest || ["done", "completed", "skipped", "cancelled"].includes(latest.status)) return undefined
+          yield* updateMilestoneSession(
+            input.workflow.id,
+            input.milestone.id,
+            appendSession(latest, {
+              role: input.role,
+              sessionID: member.sessionID,
+              milestoneID: input.milestone.id,
+              attempt: input.attempt,
+            }).session,
+          )
+          return member
+        }),
+      )
+      if (!member) return undefined
+      if (input.workflow.rootSessionID) {
+        yield* session.setParent({ sessionID: member.sessionID, parentID: input.workflow.rootSessionID }).pipe(Effect.ignore)
+      }
+      yield* session.setTitle({ sessionID: member.sessionID, title: member.title }).pipe(Effect.ignore)
+      return member
+    })
+
+    const waitForMilestoneMember = Effect.fn("Workflow.waitForMilestoneMember")(function* (input: {
+      workflow: WorkflowInfo
+      milestone: WorkflowMilestoneInfo
+      role: WorkflowSessionRef["role"]
+      specialty: string
+      title: string
+      attempt: number
+      prompt: string
+      modelWeight?: number
+    }) {
+      if (staffLimitForRole(input.workflow.staffing, input.role) <= 0) return undefined
+      while (true) {
+        const workflow = yield* get(input.workflow.id)
+        if (workflow.status === "blocked" || workflow.status === "cancelled" || workflow.status === "completed") return undefined
+        const current = (yield* milestones(input.workflow.id)).find((item) => item.id === input.milestone.id)
+        if (!current || ["done", "completed", "skipped", "cancelled"].includes(current.status)) return undefined
+        const member = yield* assignMilestoneMember({
+          workflow,
+          milestone: current,
+          role: input.role,
+          specialty: input.specialty,
+          title: input.title,
+          attempt: input.attempt,
+          prompt: input.prompt,
+          modelWeight: input.modelWeight,
+        })
+        if (member) {
+          if (current.waitingFor) yield* updateMilestone(input.workflow.id, input.milestone.id, { waitingFor: null }).pipe(Effect.ignore)
+          return member
+        }
+        if (current.waitingFor !== "staffing") {
+          yield* updateMilestone(input.workflow.id, input.milestone.id, { waitingFor: "staffing" }).pipe(Effect.ignore)
+        }
+        yield* Effect.sleep("2 seconds")
+      }
+    })
+
     const runExecutorPeerSync = Effect.fn("Workflow.runExecutorPeerSync")(function* (input: {
       workflow: WorkflowInfo
       milestone: WorkflowMilestoneInfo
@@ -6920,6 +10600,35 @@ export const layer: Layer.Layer<
       return latestText(answer)
     })
 
+    const handleMissingMilestoneOutput = Effect.fn("Workflow.handleMissingMilestoneOutput")(function* (input: {
+      workflow: WorkflowInfo
+      milestone: WorkflowMilestoneInfo
+      attempt: number
+      jobID?: string
+      actor: string
+      requiredOutput: string
+    }) {
+      if (input.attempt >= workflowMilestoneAttemptLimit) {
+        yield* updateMilestone(input.workflow.id, input.milestone.id, { status: "blocked" }).pipe(Effect.ignore)
+        yield* blockWorkflow(
+          input.workflow,
+          `Milestone ${input.milestone.id} exceeded ${workflowMilestoneAttemptLimit} attempts without required ${input.requiredOutput} from ${input.actor}. Inspect the owning session output and resume or force-skip explicitly after the runtime state is healthy.`,
+          { kind: "runtime" },
+        )
+        return
+      }
+      yield* notifyMainPM(
+        input.workflow.id,
+        `${input.actor} did not produce required ${input.requiredOutput} for milestone ${input.milestone.id} on attempt ${input.attempt}/${workflowMilestoneAttemptLimit}. The milestone will retry, but will block instead of retrying forever if the limit is reached.`,
+        { milestoneID: input.milestone.id, jobID: input.jobID },
+      ).pipe(Effect.ignore)
+      const retry = yield* updateMilestone(input.workflow.id, input.milestone.id, { status: "pending" })
+      if (!retry) return
+      yield* Effect.sleep("10 millis")
+      const workflow = yield* setStatus(input.workflow.id, "executing", { error: "" })
+      yield* runMilestone(workflow, retry, input.jobID)
+    })
+
     const runMilestone = Effect.fn("Workflow.runMilestone")(function* (
       workflow: WorkflowInfo,
       milestone: WorkflowMilestoneInfo,
@@ -6934,19 +10643,16 @@ export const layer: Layer.Layer<
       })
       if (!planned) return
 
-      const pm = yield* ensureCompanyMember({
+      const pm = yield* assignMilestoneMember({
         workflow,
         role: "department_pm",
         specialty: milestone.department ?? "product",
         title: workflowSessionTitle("Department PM", milestone.title ?? String(milestone.id)),
-        milestoneID: milestone.id,
+        attempt,
+        milestone,
         prompt: milestone.prompt,
       })
       if (!pm) return yield* blockWorkflow(workflow, `No department PM is available for milestone ${milestone.id}`)
-      yield* updateMilestone(workflow.id, milestone.id, {
-        session: appendSession(planned, { role: "department_pm", sessionID: pm.sessionID, milestoneID: milestone.id, attempt })
-          .session,
-      })
       const pmPrompt = promptDepartmentPm({ workflow, milestone })
       const pmResult = yield* runPrompt(pm.sessionID, "workflow-department-pm", workflow.model, pmPrompt, {
         workflowID: workflow.id,
@@ -6956,9 +10662,14 @@ export const layer: Layer.Layer<
       }, { expect: handoffExpectation("department PM execution plan") })
       if (yield* workflowIsBlocked(workflow.id)) return
       if (!hasHandoffSummary(latestText(pmResult))) {
-        yield* notifyMainPM(workflow.id, `Department PM did not produce a dispatchable plan marker for milestone ${milestone.id}. It will be rescheduled until the plan marker is present.`, milestoneSource).pipe(Effect.ignore)
-        yield* updateMilestone(workflow.id, milestone.id, { status: "pending" }).pipe(Effect.ignore)
-        yield* schedule(workflow.id)
+        yield* handleMissingMilestoneOutput({
+          workflow,
+          milestone,
+          attempt,
+          jobID,
+          actor: "Department PM",
+          requiredOutput: "plan Handoff Summary",
+        })
         return
       }
       yield* writeNote(workflowArtifactPath(workflow, milestone.id, "plan.md"), latestText(pmResult))
@@ -6968,32 +10679,40 @@ export const layer: Layer.Layer<
         milestoneSource,
       )
       if (yield* workflowIsBlocked(workflow.id)) return
-      if (!(yield* milestones(workflow.id)).some((item) => item.id === milestone.id && item.status !== "skipped")) {
+      if (
+        !(yield* milestones(workflow.id)).some(
+          (item) => item.id === milestone.id && item.status !== "skipped" && item.status !== "cancelled",
+        )
+      ) {
         yield* schedule(workflow.id)
         return
       }
       const refreshed = yield* refreshWorkflowXml(workflow.id, "dispatching")
-      if (refreshed && !(yield* milestones(workflow.id)).some((item) => item.id === milestone.id && item.status !== "skipped")) {
+      if (
+        refreshed &&
+        !(yield* milestones(workflow.id)).some(
+          (item) => item.id === milestone.id && item.status !== "skipped" && item.status !== "cancelled",
+        )
+      ) {
         yield* schedule(workflow.id)
         return
       }
 
-      const executing = (yield* milestones(workflow.id)).find((item) => item.id === milestone.id && item.status !== "skipped")
+      const executing = (yield* milestones(workflow.id)).find(
+        (item) => item.id === milestone.id && item.status !== "skipped" && item.status !== "cancelled",
+      )
       if (!executing) return
-      const expert = yield* ensureCompanyMember({
+      const expert = yield* assignMilestoneMember({
         workflow,
         role: "expert",
         specialty: milestone.department ?? "technical-advisory",
         title: workflowSessionTitle("Technical Advisor", milestone.title ?? String(milestone.id)),
-        milestoneID: milestone.id,
+        attempt,
+        milestone,
         prompt: milestone.prompt,
       })
       const expertPath = expert ? workflowArtifactPath(workflow, workflowExpertNotePath(milestone.id, attempt)) : undefined
       if (expert) {
-        yield* updateMilestone(workflow.id, milestone.id, {
-          session: appendSession(executing, { role: "expert", sessionID: expert.sessionID, milestoneID: milestone.id, attempt })
-            .session,
-        })
         const expertResult = yield* runPrompt(
           expert.sessionID,
           "workflow-expert",
@@ -7009,9 +10728,14 @@ export const layer: Layer.Layer<
         )
         if (yield* workflowIsBlocked(workflow.id)) return
         if (!hasHandoffSummary(latestText(expertResult))) {
-          yield* notifyMainPM(workflow.id, `Technical advisor did not produce a handoff marker for milestone ${milestone.id}. The milestone will be rescheduled instead of advancing without evidence.`, milestoneSource).pipe(Effect.ignore)
-          yield* updateMilestone(workflow.id, milestone.id, { status: "pending" }).pipe(Effect.ignore)
-          yield* schedule(workflow.id)
+          yield* handleMissingMilestoneOutput({
+            workflow,
+            milestone,
+            attempt,
+            jobID,
+            actor: "Technical advisor",
+            requiredOutput: "technical Handoff Summary",
+          })
           return
         }
         yield* writeNote(expertPath!, latestText(expertResult))
@@ -7019,20 +10743,18 @@ export const layer: Layer.Layer<
         if (yield* workflowIsBlocked(workflow.id)) return
       }
       yield* updateMilestone(workflow.id, milestone.id, { status: "executing" })
-      const executor = yield* ensureCompanyMember({
+      yield* schedule(workflow.id).pipe(Effect.ignore)
+      if (yield* workflowIsBlocked(workflow.id)) return
+      const executor = yield* waitForMilestoneMember({
         workflow,
         role: "executor",
         specialty: milestone.department ?? "engineering",
         title: workflowSessionTitle("Executor", milestone.title ?? String(milestone.id)),
-        milestoneID: milestone.id,
+        attempt,
+        milestone,
         prompt: milestone.prompt,
       })
       if (!executor) return yield* blockWorkflow(workflow, `No executor is available for milestone ${milestone.id}`)
-      const afterExpert = (yield* milestones(workflow.id)).find((item) => item.id === milestone.id) ?? executing
-      yield* updateMilestone(workflow.id, milestone.id, {
-        session: appendSession(afterExpert, { role: "executor", sessionID: executor.sessionID, milestoneID: milestone.id, attempt })
-          .session,
-      })
       const peerContext = yield* runExecutorPeerSync({
         workflow,
         milestone,
@@ -7055,9 +10777,14 @@ export const layer: Layer.Layer<
       if (yield* workflowIsBlocked(workflow.id)) return
       const executorOutput = latestText(executorResult)
       if (!workflowResultComplete(executorOutput)) {
-        yield* notifyMainPM(workflow.id, `Executor did not produce a completion marker for milestone ${milestone.id}. The milestone will be rescheduled instead of moving to review.`, milestoneSource).pipe(Effect.ignore)
-        yield* updateMilestone(workflow.id, milestone.id, { status: "pending" }).pipe(Effect.ignore)
-        yield* schedule(workflow.id)
+        yield* handleMissingMilestoneOutput({
+          workflow,
+          milestone,
+          attempt,
+          jobID,
+          actor: "Executor",
+          requiredOutput: "completion XML",
+        })
         return
       }
       yield* notifyMainPM(
@@ -7069,6 +10796,17 @@ export const layer: Layer.Layer<
 
       const reviewing = (yield* milestones(workflow.id)).find((item) => item.id === milestone.id)
       if (!reviewing) return
+      if (reviewing.review === "skip") {
+        yield* updateMilestone(workflow.id, milestone.id, { status: "approved" })
+        yield* notifyMainPM(
+          workflow.id,
+          `Milestone ${milestone.id} skipped department PM functional review because workflow.xml sets review="skip".`,
+          milestoneSource,
+        )
+        if (yield* workflowIsBlocked(workflow.id)) return
+        yield* schedule(workflow.id)
+        return
+      }
       yield* updateMilestone(workflow.id, milestone.id, {
         status: "reviewing",
         session: appendSession(reviewing, { role: "department_pm", sessionID: pm.sessionID, milestoneID: milestone.id, attempt })
@@ -7089,7 +10827,7 @@ export const layer: Layer.Layer<
       )
       if (yield* workflowIsBlocked(workflow.id)) return
       const reviewText = latestText(reviewerResult)
-      const reviewPath = workflowArtifactPath(workflow, milestone.id, `review-${attempt}.md`)
+      const reviewPath = workflowArtifactPath(workflow, workflowMilestoneReviewPath(milestone.id, attempt))
       yield* writeNote(reviewPath, reviewText)
       if (approved(reviewText)) {
         yield* updateMilestone(workflow.id, milestone.id, {
@@ -7178,7 +10916,7 @@ export const layer: Layer.Layer<
         role: "tester",
       }, { expect: testExpectation() })
       if (yield* workflowIsBlocked(workflow.id)) return
-      const testPath = workflowArtifactPath(workflow, "test-plan.md")
+      const testPath = workflowArtifactPath(workflow, workflowTestPlanPath())
       const testerOutput = latestText(testerResult)
       yield* writeNote(testPath, testerOutput)
       yield* setStatus(workflow.id, "testing", { testerSessionID: tester.sessionID, testPath })
@@ -7208,7 +10946,7 @@ export const layer: Layer.Layer<
         title: workflowSessionTitle("Technical Advisor", workflow.title),
         prompt: workflow.request,
       })
-      const technicalPath = workflowArtifactPath(workflow, "technical-assessment.md")
+      const technicalPath = workflowArtifactPath(workflow, workflowTechnicalAssessmentPath())
       if (!expert) {
         yield* writeNote(technicalPath, "_No technical advisor configured._")
         yield* writeReferenceIndex(workflow.id).pipe(Effect.ignore)
@@ -7381,7 +11119,7 @@ export const layer: Layer.Layer<
     })
 
     const recoverStaleActiveMilestones = Effect.fn("Workflow.recoverStaleActiveMilestones")(function* (
-      workflowID: WorkflowID,
+      workflow: WorkflowInfo,
       items: WorkflowMilestoneInfo[],
     ) {
       const running = new Set(
@@ -7390,16 +11128,108 @@ export const layer: Layer.Layer<
             (job) =>
               job.status === "running" &&
               job.type === "workflow.milestone" &&
-              job.metadata?.workflowID === workflowID,
+              job.metadata?.workflowID === workflow.id,
           )
           .map((job) => String(job.metadata?.milestoneID ?? "")),
       )
       const stale = items.filter((item) => interruptedMilestone(item.status) && !running.has(String(item.id)))
       if (stale.length === 0) return false
-      for (const item of stale) {
-        yield* updateMilestone(workflowID, item.id, { status: "pending" })
+      const exhausted = stale.filter((item) => item.attempt >= workflowMilestoneAttemptLimit)
+      if (exhausted.length === 0) {
+        for (const item of stale) {
+          yield* updateMilestone(workflow.id, item.id, { status: "pending" })
+        }
+        const staleSummary = stale.map((item) => `${item.id}:${item.status}:attempt${item.attempt}`).join(", ")
+        const staleMessage = `Workflow watchdog found orphaned active milestone job(s) and queued retry: ${staleSummary}.`
+        yield* recordMainPMSystemReport(workflow, staleMessage).pipe(Effect.ignore)
+        yield* notifyMainPM(workflow.id, staleMessage).pipe(Effect.ignore)
+        yield* setStatus(workflow.id, "executing", { error: "" }).pipe(Effect.ignore)
+        return true
       }
+      for (const item of stale) {
+        yield* updateMilestone(workflow.id, item.id, { status: "blocked" })
+      }
+      const staleSummary = exhausted.map((item) => `${item.id}:${item.status}:attempt${item.attempt}`).join(", ")
+      yield* blockWorkflow(
+        workflow,
+        `Workflow watchdog detected orphaned active milestone job(s): ${staleSummary}. These milestones were active, but no running workflow.milestone background job exists. This is a scheduler/runtime dispatch problem; inspect the owning session archive and retry explicitly with workflow resume/continue after the runner state is healthy.`,
+        { kind: "runtime" },
+      )
       return true
+    })
+
+    const escalateStaleWaitingMilestones = Effect.fn("Workflow.escalateStaleWaitingMilestones")(function* (
+      workflow: WorkflowInfo,
+    ) {
+      const now = Date.now()
+      const stale = Database.use((db) =>
+        db
+          .select()
+          .from(WorkflowMilestoneTable)
+          .where(and(eq(WorkflowMilestoneTable.workflow_id, workflow.id), eq(WorkflowMilestoneTable.status, "pending")))
+          .all()
+          .filter(
+            (row) =>
+              (row.waiting_for === "staffing" || row.waiting_for === "scheduling") &&
+              now - row.time_updated >= workflowWaitingTimeoutMillis,
+          )
+          .map(toMilestone),
+      )
+      if (stale.length === 0) return 0
+      const lines = stale.map((item) =>
+        `- ${item.id}: waitingFor=${item.waitingFor}; title=${item.title ?? item.id}; department=${item.department ?? "unspecified"}`,
+      )
+      const result = yield* intervene({
+        workflowID: workflow.id,
+        sourceSessionID: workflow.rootSessionID,
+        targetRole: "main_pm",
+        timing: "temporary-interrupt",
+        message: [
+          "Workflow watchdog found ready milestones waiting too long without dispatch.",
+          "",
+          ...lines,
+          "",
+          "Decide whether to expand staffing, change scheduling mode, force-skip a gate, or block for requester direction. Do not rewrite product scope or workflow.xml unless the graph itself is wrong.",
+        ].join("\n"),
+      }).pipe(
+        Effect.as({ status: "queued" as const }),
+        Effect.catchCause((cause) =>
+          Effect.succeed({
+            status: "failed" as const,
+            error: errorFromCause(cause),
+          }),
+        ),
+      )
+      for (const item of stale) {
+        Database.use((db) =>
+          db
+            .update(WorkflowMilestoneTable)
+            .set({ time_updated: now })
+            .where(
+              and(
+                eq(WorkflowMilestoneTable.workflow_id, workflow.id),
+                eq(WorkflowMilestoneTable.id, item.id),
+                eq(WorkflowMilestoneTable.status, "pending"),
+              ),
+            )
+            .run(),
+        )
+      }
+      yield* appendWorkflowMessageRuntimeJournal(workflow.id, {
+        action: "waiting_watchdog",
+        kind: "intervention",
+        targetRole: "main_pm",
+        milestones: stale.map((item) => ({
+          id: item.id,
+          waitingFor: item.waitingFor,
+          status: item.status,
+        })),
+        ...result,
+      }).pipe(Effect.ignore)
+      yield* writeProgress(workflow.id).pipe(Effect.ignore)
+      yield* writeWorkflowState(workflow.id).pipe(Effect.ignore)
+      yield* publishUpdated(workflow.id).pipe(Effect.ignore)
+      return stale.length
     })
 
     const blockActiveMilestones = Effect.fn("Workflow.blockActiveMilestones")(function* (workflowID: WorkflowID) {
@@ -7412,13 +11242,52 @@ export const layer: Layer.Layer<
 
     const cancelWorkflowRuns = Effect.fn("Workflow.cancelWorkflowRuns")(function* (
       workflowID: WorkflowID,
-      exceptJobID?: string,
+      exceptJobID?: string | string[],
     ) {
+      const exceptJobIDs = new Set(Array.isArray(exceptJobID) ? exceptJobID : exceptJobID ? [exceptJobID] : [])
       for (const job of (yield* background.list()).filter(
-        (job) => job.metadata?.workflowID === workflowID && job.status === "running" && job.id !== exceptJobID,
+        (job) => job.metadata?.workflowID === workflowID && job.status === "running" && !exceptJobIDs.has(job.id),
       )) {
         yield* background.cancel(job.id).pipe(Effect.ignore)
       }
+    })
+
+    const cancelMilestoneRuns = Effect.fn("Workflow.cancelMilestoneRuns")(function* (
+      workflowID: WorkflowID,
+      milestoneID: WorkflowMilestoneID,
+    ) {
+      const current = (yield* milestones(workflowID)).find((item) => item.id === milestoneID)
+      yield* cancelMilestoneBackgroundRuns(workflowID, milestoneID, current?.attempt ?? 0)
+    })
+
+    const hasActiveMilestoneRun = Effect.fn("Workflow.hasActiveMilestoneRun")(function* (
+      workflowID: WorkflowID,
+      milestoneID: WorkflowMilestoneID,
+    ) {
+      return (yield* background.list()).some(
+        (job) =>
+          job.status === "running" &&
+          job.type === "workflow.milestone" &&
+          job.metadata?.workflowID === workflowID &&
+          job.metadata?.milestoneID === milestoneID,
+      )
+    })
+
+    const activeMilestoneRunIsCurrent = Effect.fn("Workflow.activeMilestoneRunIsCurrent")(function* (
+      workflowID: WorkflowID,
+      milestoneID: WorkflowMilestoneID,
+      currentJobID?: string | string[],
+    ) {
+      const currentJobIDs = new Set(Array.isArray(currentJobID) ? currentJobID : currentJobID ? [currentJobID] : [])
+      if (currentJobIDs.size === 0) return false
+      return (yield* background.list()).some(
+        (job) =>
+          job.status === "running" &&
+          job.type === "workflow.milestone" &&
+          job.metadata?.workflowID === workflowID &&
+          job.metadata?.milestoneID === milestoneID &&
+          currentJobIDs.has(job.id),
+      )
     })
 
     const startMilestoneJob = Effect.fn("Workflow.startMilestoneJob")(function* (
@@ -7450,15 +11319,30 @@ export const layer: Layer.Layer<
       return jobID
     })
 
-    const schedule: (workflowID: WorkflowID) => Effect.Effect<WorkflowInfo, unknown> = Effect.fn("Workflow.schedule")(
-      function* (workflowID: WorkflowID) {
+    const schedule: (
+      workflowID: WorkflowID,
+      options?: { bypassStagedGate?: boolean },
+    ) => Effect.Effect<WorkflowInfo, unknown> = Effect.fn("Workflow.schedule")(
+      function* (workflowID: WorkflowID, options?: { bypassStagedGate?: boolean }) {
       const workflow = yield* get(workflowID)
       if (workflow.status === "cancelled" || workflow.status === "completed" || workflow.status === "blocked") return workflow
       const items = yield* milestones(workflowID)
-      if (yield* recoverStaleActiveMilestones(workflowID, items)) return yield* schedule(workflowID)
+      if (yield* recoverStaleActiveMilestones(workflow, items)) return yield* schedule(workflowID, options)
+      yield* deliverReadyInterventions(workflowID).pipe(Effect.ignore)
+      const schedulableItems = items.filter((item) => item.status !== "cancelled")
+      const runningMilestoneIDs = new Set(
+        (yield* background.list())
+          .filter(
+            (job) =>
+              job.status === "running" &&
+              job.type === "workflow.milestone" &&
+              job.metadata?.workflowID === workflowID,
+          )
+          .map((job) => String(job.metadata?.milestoneID ?? "")),
+      )
       const definition: WorkflowDefinition = {
         steps: { type: "parallel", children: [] },
-        milestones: items.map((item) => ({
+        milestones: schedulableItems.map((item) => ({
           type: "milestone",
           id: item.id,
           title: item.title,
@@ -7467,7 +11351,30 @@ export const layer: Layer.Layer<
           dependsOn: item.dependsOn,
         })),
       }
-      if (items.length > 0 && items.every((item) => ["approved", "done", "completed", "skipped"].includes(item.status))) {
+      const unblocked = dependencyUnblockedMilestones(definition, milestoneStates(schedulableItems))
+        .map((candidate) => schedulableItems.find((item) => item.id === candidate.id))
+        .filter((item) => item && item.session.length === 0)
+      if (unblocked.length > 0) {
+        for (const item of unblocked) {
+          yield* updateMilestone(workflowID, item.id, { status: "pending" })
+        }
+        return yield* schedule(workflowID, options)
+      }
+      const blockedByDependency = dependencyBlockedMilestones(definition, milestoneStates(schedulableItems))
+      if (blockedByDependency.length > 0) {
+        for (const item of blockedByDependency) {
+          yield* updateMilestone(workflowID, item.id, { status: "blocked" })
+        }
+        const blockedIDs = blockedByDependency.map((item) => item.id).join(", ")
+        return yield* blockWorkflow(
+          workflow,
+          `Milestones blocked by failed dependencies: ${blockedIDs}. Use force_skip, reopen the failed dependency, update workflow XML, or block for requester direction.`,
+        )
+      }
+      if (
+        schedulableItems.length > 0 &&
+        schedulableItems.every((item) => ["approved", "done", "completed", "skipped"].includes(item.status))
+      ) {
         yield* runTester(workflow)
         return yield* get(workflowID)
       }
@@ -7476,33 +11383,69 @@ export const layer: Layer.Layer<
       ).length
       const activeRoleCount = (role: WorkflowSessionRef["role"]) =>
         new Set(
-          items
+          schedulableItems
             .filter((item) => roleBusyForMilestoneStatus(role, item.status))
             .flatMap((item) => item.session.filter((ref) => ref.role === role).map((ref) => ref.sessionID)),
         ).size
-      const availableStarts = Math.min(
-        staffLimitForRole(workflow.staffing, "department_pm") - activeRoleCount("department_pm"),
-        staffLimitForRole(workflow.staffing, "executor") - activeRoleCount("executor"),
-        staffLimitForRole(workflow.staffing, "expert") - activeRoleCount("expert"),
-      )
-      const ready = readyMilestones(definition, milestoneStates(items)).slice(
+      const availableStarts = staffLimitForRole(workflow.staffing, "department_pm") - activeRoleCount("department_pm")
+      const readyAll = readyMilestones(definition, milestoneStates(schedulableItems))
+      if (
+        workflowSchedulingMode(workflow) === "staged" &&
+        !options?.bypassStagedGate &&
+        activeMilestoneCount === 0 &&
+        readyAll.length > 0 &&
+        schedulableItems.some((item) => item.session.length > 0 || terminalMilestone(item.status))
+      ) {
+        return yield* blockWorkflow(
+          workflow,
+          `Staged scheduling gate reached before ${readyAll.map((item) => item.id).join(", ")}. Use workflow resume to dispatch the next stage.`,
+        )
+      }
+      const activeLimit = workflowSchedulingActiveLimit(workflow)
+      const schedulingCapacity = activeLimit === undefined ? readyAll.length : Math.max(0, activeLimit - activeMilestoneCount)
+      const schedulableByID = new Map(schedulableItems.map((item) => [item.id, item]))
+      const pipelineWaitingReady = readyAll.filter((item) => schedulableByID.get(item.id)?.waitingFor === "pipeline_items")
+      const runnableReady = readyAll.filter((item) => schedulableByID.get(item.id)?.waitingFor !== "pipeline_items")
+      const ready = runnableReady.slice(
         0,
-        Math.max(0, availableStarts),
+        Math.max(0, Math.min(availableStarts, schedulingCapacity)),
       )
+      const waiting = runnableReady.slice(ready.length)
+      const readyIDs = new Set(ready.map((item) => item.id))
+      const readyAllIDs = new Set(readyAll.map((item) => item.id))
+      for (const item of schedulableItems) {
+        if (item.waitingFor === "pipeline_items") continue
+        if (readyIDs.has(item.id) || (item.waitingFor && !readyAllIDs.has(item.id))) {
+          yield* updateMilestone(workflowID, item.id, { waitingFor: null }).pipe(Effect.ignore)
+        }
+      }
+      if (waiting.length > 0) {
+        const reason = availableStarts <= schedulingCapacity ? "staffing" : "scheduling"
+        for (const item of waiting) {
+          const current = schedulableByID.get(item.id)
+          if (current?.waitingFor !== reason) {
+            yield* updateMilestone(workflowID, item.id, { waitingFor: reason }).pipe(Effect.ignore)
+          }
+        }
+      }
+      yield* escalateStaleWaitingMilestones(workflow).pipe(Effect.ignore)
       if (ready.length === 0) {
-        if (items.some((item) => item.status === "rejected")) {
-          for (const item of items.filter((item) => item.status === "rejected")) {
+        if (pipelineWaitingReady.length > 0 || waiting.length > 0) return workflow
+        if (readyAll.length > 0 && (availableStarts <= 0 || schedulingCapacity <= 0)) return workflow
+        if (schedulableItems.some((item) => item.status === "rejected")) {
+          for (const item of schedulableItems.filter((item) => item.status === "rejected")) {
             yield* updateMilestone(workflowID, item.id, { status: "pending" })
           }
-          yield* schedule(workflowID)
+          yield* schedule(workflowID, options)
           return yield* get(workflowID)
         }
         if (activeMilestoneCount > 0) return workflow
+        if (schedulableItems.some((item) => item.status === "blocked" && runningMilestoneIDs.has(String(item.id)))) return workflow
         return yield* blockWorkflow(workflow, "No runnable milestones are available")
       }
       yield* setStatus(workflowID, "executing")
       for (const item of ready) {
-        const current = items.find((milestone) => milestone.id === item.id)
+        const current = schedulableItems.find((milestone) => milestone.id === item.id)
         if (!current) continue
         yield* startMilestoneJob(workflow, current)
       }
@@ -7518,11 +11461,55 @@ export const layer: Layer.Layer<
       workflowID: WorkflowID,
       output: string,
       reason: string,
-      options?: { exceptJobID?: string },
+      options?: { exceptJobID?: string | string[]; sourceSessionID?: SessionID; sourceAgent?: string; deferStart?: boolean },
     ) {
-      const action = parseWorkflowControlAction(output) ?? (implicitWorkflowResume(output) ? "resume" : undefined)
+      const command = parseWorkflowControlCommand(output)
+      const action = command?.action ?? (implicitWorkflowResume(output) ? "resume" : undefined)
       if (!action) return yield* get(workflowID)
       const workflow = yield* get(workflowID)
+      if (command?.action === "resume" && command.message) {
+        const sourceSessionID = options?.sourceSessionID ?? workflow.pmSessionID ?? workflow.rootSessionID
+        const sourceRole = sourceSessionID
+          ? yield* workflowToolCommandSourceRole(workflow, sourceSessionID).pipe(Effect.catchCause(() => Effect.succeed(undefined)))
+          : undefined
+        if (workflowCommandMessageClaimsDispatch(command.message, sourceRole)) {
+          return yield* blockWorkflow(
+            workflow,
+            "Workflow resume control claimed employee dispatch in the message body. Resume only schedules milestones already represented in workflow.xml; use update_xml, plan_complete, or force_complete for real dispatch/control.",
+          )
+        }
+      }
+      if (
+        command &&
+        !["resume", "block"].includes(command.action)
+      ) {
+        const sourceSessionID = options?.sourceSessionID ?? workflow.pmSessionID ?? workflow.rootSessionID
+        if (!sourceSessionID) {
+          return yield* blockWorkflow(
+            workflow,
+            `Workflow control command ${command.action} from ${reason} could not be applied because no source session is known.`,
+          )
+        }
+        const replay = yield* handleWorkflowToolCommand(
+          {
+            ...command,
+            id: Bus.createID(),
+            workflowID,
+            sourceSessionID,
+            ...(options?.sourceAgent ? { sourceAgent: options.sourceAgent } : {}),
+          },
+          {
+            currentJobID: options?.exceptJobID,
+          },
+        )
+        if (!replay.result.applied) {
+          return yield* blockWorkflow(
+            workflow,
+            `Workflow control command ${command.action} from ${reason} was rejected: ${replay.result.message}`,
+          )
+        }
+        return yield* get(workflowID)
+      }
       if (action === "block") {
         yield* cancelWorkflowRuns(workflowID, options?.exceptJobID)
         yield* blockActiveMilestones(workflowID)
@@ -7532,6 +11519,8 @@ export const layer: Layer.Layer<
         )
       }
       if (workflow.status === "cancelled" || workflow.status === "completed") return workflow
+      const doctorBlocked = yield* blockWorkflowResumeForDoctorIssues(workflowID, `${reason} resume`)
+      if (doctorBlocked) return doctorBlocked
       yield* background.cancel(workflowID).pipe(Effect.ignore)
       const items = yield* milestones(workflowID)
       yield* recoverInterruptedProgress(workflowID, items)
@@ -7539,13 +11528,15 @@ export const layer: Layer.Layer<
       const hasMilestoneSessions = recoveredItems.some((item) => item.session.length > 0)
       const shouldContinuePlanning = !!workflow.pmSessionID && !hasMilestoneSessions
       const next = yield* setStatus(workflowID, shouldContinuePlanning ? "planning" : "executing", { error: "" })
-      yield* background.start({
+      const startControl = background.start({
         id: `${workflowID}:control:${Date.now().toString(36)}`,
         type: "workflow",
         title: next.title,
         metadata: { workflowID },
-        run: (shouldContinuePlanning ? continuePlanning(workflowID) : schedule(workflowID)).pipe(
-          Effect.delay("10 millis"),
+        run: Effect.gen(function* () {
+          yield* Effect.sleep("10 millis")
+          yield* (shouldContinuePlanning ? continuePlanning(workflowID) : schedule(workflowID, { bypassStagedGate: true }))
+        }).pipe(
           Effect.catchCause((cause) =>
             Cause.hasInterruptsOnly(cause)
               ? Effect.interrupt
@@ -7554,6 +11545,8 @@ export const layer: Layer.Layer<
           Effect.as("workflow control resumed"),
         ),
       })
+      if (options?.deferStart) return { ...next, afterCommit: startControl }
+      yield* startControl
       return next
     })
 
@@ -7583,102 +11576,732 @@ export const layer: Layer.Layer<
       )?.id
     })
 
+    const workflowToolCommandSourceRole = Effect.fn("Workflow.workflowToolCommandSourceRole")(function* (
+      workflow: WorkflowInfo,
+      sessionID: SessionID,
+    ) {
+      if (workflow.rootSessionID === sessionID) return "requester"
+      if (workflow.pmSessionID === sessionID) return "main_pm"
+      if (workflow.testerSessionID === sessionID) return "tester"
+      const member = Database.use((db) =>
+        db
+          .select()
+          .from(WorkflowMemberTable)
+          .where(and(eq(WorkflowMemberTable.workflow_id, workflow.id), eq(WorkflowMemberTable.session_id, sessionID)))
+          .orderBy(asc(WorkflowMemberTable.time_created))
+          .all()
+          .at(-1),
+      )
+      if (member) return member.role
+      const assignment = workflowSessionAssignment(yield* milestones(workflow.id), sessionID)
+      return assignment?.ref.role
+    })
+
+    const workflowCommandAfterCommit = (result: Record<string, unknown>, afterCommit: Effect.Effect<unknown>) => ({
+      ...result,
+      afterCommit,
+    })
+
+    const queueWorkflowSchedule = Effect.fn("Workflow.queueWorkflowSchedule")(function* (
+      workflowID: WorkflowID,
+      reason: string,
+      options?: { bypassStagedGate?: boolean; delay?: "10 millis" | "50 millis" },
+    ) {
+      const workflow = yield* get(workflowID)
+      yield* background.start({
+        id: `${workflowID}:schedule:${Date.now().toString(36)}:${Math.random().toString(36).slice(2, 8)}`,
+        type: "workflow",
+        title: `${workflow.title} schedule`,
+        metadata: { workflowID, reason },
+        run: Effect.gen(function* () {
+          yield* Effect.sleep(options?.delay ?? "10 millis")
+          yield* schedule(
+            workflowID,
+            options?.bypassStagedGate === undefined ? undefined : { bypassStagedGate: options.bypassStagedGate },
+          )
+        }).pipe(
+          Effect.catchCause((cause) =>
+            Cause.hasInterruptsOnly(cause)
+              ? Effect.interrupt
+              : blockPlanning(workflowID, `Workflow scheduled dispatch failed after ${reason}: ${errorFromCause(cause)}`).pipe(
+                  Effect.asVoid,
+                ),
+          ),
+          Effect.as("workflow schedule completed"),
+        ),
+      })
+    })
+
+    const applyMilestoneToolStatus = Effect.fn("Workflow.applyMilestoneToolStatus")(function* (
+      workflowID: WorkflowID,
+      milestoneID: WorkflowMilestoneID,
+      status: WorkflowMilestoneInfo["status"],
+    ) {
+      const workflow = yield* get(workflowID)
+      const updated = yield* updateMilestone(workflowID, milestoneID, { status })
+      if (!updated) {
+        return workflowCommandRejection("unknown_milestone", `Milestone ${milestoneID} was not found.`)
+      }
+      if (status === "blocked") {
+        yield* blockWorkflow(workflow, `Workflow tool blocked milestone ${milestoneID}`).pipe(Effect.ignore)
+        return { workflowID, applied: true, message: `Milestone ${milestoneID} was blocked.` }
+      }
+      if (status === "failed") {
+        yield* setStatus(workflowID, "executing", { error: "" }).pipe(Effect.ignore)
+        return workflowCommandAfterCommit(
+          { workflowID, applied: true, message: `Milestone ${milestoneID} was marked failed and scheduling was requested.` },
+          queueWorkflowSchedule(workflowID, "milestone_status failed"),
+        )
+      }
+      if (status === "cancelled") {
+        yield* setStatus(workflowID, "executing", { error: "" }).pipe(Effect.ignore)
+        return workflowCommandAfterCommit(
+          { workflowID, applied: true, message: `Milestone ${milestoneID} was cancelled and scheduling was requested.` },
+          queueWorkflowSchedule(workflowID, "milestone_status cancelled"),
+        )
+      }
+      yield* setStatus(workflowID, "executing", { error: "" }).pipe(Effect.ignore)
+      return workflowCommandAfterCommit(
+        { workflowID, applied: true, message: `Milestone ${milestoneID} was set to ${status} and scheduling was requested.` },
+        queueWorkflowSchedule(workflowID, `milestone_status ${status}`),
+      )
+    })
+
     const applyWorkflowToolCommand = Effect.fn("Workflow.applyWorkflowToolCommand")(function* (
       input: WorkflowToolCommand,
+      options?: { currentJobID?: string | string[] },
     ) {
       const workflowID = yield* workflowToolCommandWorkflowID(input)
-      if (!workflowID) return
+      if (!workflowID) return workflowCommandRejection("workflow_not_active", "No workflow is associated with this command.")
       const workflow = yield* get(workflowID)
+      const sourceRole = yield* workflowToolCommandSourceRole(workflow, input.sourceSessionID)
+      const sourceRoleName = sourceRole ? roleSessionTitle(sourceRole) : "unknown"
       if (input.action === "status") {
+        yield* expireWorkflowMessages(workflowID).pipe(Effect.ignore)
+        const recovered = yield* recoverStaleActiveMilestones(workflow, yield* milestones(workflowID)).pipe(
+          Effect.catchCause(() => Effect.succeed(false)),
+        )
+        if (!recovered) yield* escalateStaleWaitingMilestones(workflow).pipe(Effect.ignore)
+        yield* deliverReadyInterventions(workflowID).pipe(Effect.ignore)
         yield* publishUpdated(workflowID).pipe(Effect.ignore)
-        return
+        return recovered
+          ? workflowCommandAfterCommit(
+              { workflowID, applied: true, message: "Workflow status was refreshed and scheduling was requested." },
+              queueWorkflowSchedule(workflowID, "status recovery"),
+            )
+          : { workflowID, applied: true, message: "Workflow status was refreshed." }
+      }
+      if (input.action === "status_update") {
+        if (!input.availability) {
+          return {
+            workflowID,
+            ...workflowCommandRejection("precondition_failed", "status_update requires availability."),
+          }
+        }
+        const member = Database.use((db) =>
+          db
+            .select()
+            .from(WorkflowMemberTable)
+            .where(and(eq(WorkflowMemberTable.workflow_id, workflowID), eq(WorkflowMemberTable.session_id, input.sourceSessionID)))
+            .get(),
+        )
+        if (!member) {
+          return {
+            workflowID,
+            ...workflowCommandRejection(
+              "not_authorized",
+              "Only workflow employee sessions can update their workflow member status.",
+            ),
+          }
+        }
+        Database.use((db) =>
+          db
+            .update(WorkflowMemberTable)
+            .set({
+              availability: input.availability,
+              current_focus: input.currentFocus ? compactMarkdown(input.currentFocus, 500) : null,
+              blockers: (input.blockers ?? []).map((blocker) => compactMarkdown(blocker, 300)).filter(Boolean).slice(0, 20),
+              progress_note: input.progressNote ? compactMarkdown(input.progressNote, 500) : null,
+              time_updated: Date.now(),
+            })
+            .where(and(eq(WorkflowMemberTable.workflow_id, workflowID), eq(WorkflowMemberTable.id, member.id)))
+            .run(),
+        )
+        yield* writeOrganization(workflowID).pipe(Effect.ignore)
+        yield* writeProgress(workflowID).pipe(Effect.ignore)
+        yield* writeWorkflowState(workflowID).pipe(Effect.ignore)
+        yield* publishUpdated(workflowID).pipe(Effect.ignore)
+        return {
+          workflowID,
+          applied: true,
+          message: `Workflow member ${member.title} reported availability=${input.availability}.`,
+        }
+      }
+      if (input.action === "scheduling") {
+        if (!input.schedulingMode) {
+          return {
+            workflowID,
+            ...workflowCommandRejection("precondition_failed", "scheduling requires schedulingMode."),
+          }
+        }
+        if (input.schedulingMode === "economical" && !input.schedulingMaxActive) {
+          return {
+            workflowID,
+            ...workflowCommandRejection("precondition_failed", "economical scheduling requires schedulingMaxActive."),
+          }
+        }
+        if (!sourceRole || !["requester", "main_pm"].includes(sourceRole)) {
+          return {
+            workflowID,
+            ...workflowCommandRejection(
+              "not_authorized",
+              `Role ${sourceRoleName} cannot change workflow scheduling. Ask requester or main PM to use this control.`,
+            ),
+          }
+        }
+        if (workflow.status === "cancelled" || workflow.status === "completed") {
+          return {
+            workflowID,
+            ...workflowCommandRejection(
+              "workflow_not_active",
+              `Workflow is ${workflow.status}; scheduling cannot be changed after it is terminal.`,
+            ),
+          }
+        }
+        const scheduling = normalizeScheduling({
+          mode: input.schedulingMode,
+          ...(input.schedulingMode === "economical" ? { maxActive: input.schedulingMaxActive } : {}),
+        })
+        Database.use((db) =>
+          db
+            .update(WorkflowTable)
+            .set({
+              scheduling,
+              status: workflow.status === "blocked" ? "executing" : workflow.status,
+              error: null,
+              time_updated: Date.now(),
+            })
+            .where(eq(WorkflowTable.id, workflowID))
+            .run(),
+        )
+        yield* writeProgress(workflowID).pipe(Effect.ignore)
+        yield* writeWorkflowState(workflowID).pipe(Effect.ignore)
+        yield* publishUpdated(workflowID).pipe(Effect.ignore)
+        return workflowCommandAfterCommit(
+          {
+            workflowID,
+            applied: true,
+            message: `Workflow scheduling changed to ${scheduling.mode}${scheduling.mode === "economical" ? ` maxActive=${scheduling.maxActive}` : ""} and scheduling was requested.`,
+          },
+          queueWorkflowSchedule(workflowID, "scheduling command", { bypassStagedGate: input.schedulingMode !== "staged" }),
+        )
       }
       if (input.action === "resume") {
-        yield* applyWorkflowControl(
+        if (workflowCommandMessageClaimsDispatch(input.message, sourceRole)) {
+          return {
+            workflowID,
+            ...workflowCommandRejection(
+              "precondition_failed",
+              "resume message cannot assign, dispatch, route, or start employee sessions. Resume only schedules milestones already represented in workflow.xml. To create work, update workflow.xml/update_xml; to close a planning gate, use plan_complete or force_complete and confirm applied=true.",
+            ),
+          }
+        }
+        const resumed = yield* applyWorkflowControl(
           workflowID,
           workflowToolResumeBlock(input.message ?? "workflow tool requested resume"),
           "workflow tool",
-        ).pipe(Effect.ignore)
-        return
+          {
+            sourceSessionID: input.sourceSessionID,
+            sourceAgent: input.sourceAgent,
+            deferStart: true,
+          },
+        )
+        return resumed.afterCommit
+          ? workflowCommandAfterCommit(
+              { workflowID, applied: true, message: "Workflow resume was applied and scheduling was requested." },
+              resumed.afterCommit,
+            )
+          : { workflowID, applied: true, message: "Workflow resume was applied." }
       }
       if (input.action === "block") {
         yield* cancelWorkflowRuns(workflowID)
         yield* blockActiveMilestones(workflowID)
         yield* blockWorkflow(workflow, `Workflow tool block: ${input.message ?? "blocked"}`).pipe(Effect.ignore)
-        return
+        return { workflowID, applied: true, message: "Workflow was blocked and active work was cancelled." }
       }
       if (input.action === "update_xml") {
-        if (!input.xml?.trim()) return
+        if (!input.xml?.trim()) {
+          return {
+            workflowID,
+            ...workflowCommandRejection("precondition_failed", "update_xml requires XML."),
+          }
+        }
         const xml = input.xml
-        const definition = yield* Effect.try({
-          try: () => parseXmlDefinition(xml),
+        const parsed = yield* Effect.try({
+          try: () => parseXmlDefinition(xml, workflow),
           catch: (error) => new Error({ message: error instanceof globalThis.Error ? error.message : String(error) }),
         }).pipe(
-          Effect.catch((error: Error) =>
-            blockWorkflow(workflow, `Workflow tool XML update failed: ${error.message}`).pipe(
-              Effect.as(undefined as WorkflowDefinition | undefined),
-            ),
-          ),
+          Effect.map((definition) => ({ definition })),
+          Effect.catch((error: Error) => Effect.succeed({ error })),
         )
-        if (!definition) return
+        if (parsed.error) {
+          yield* blockWorkflow(workflow, `Workflow tool XML update failed: ${parsed.error.message}`).pipe(Effect.ignore)
+          return {
+            workflowID,
+            ...workflowCommandRejection("invalid_xml", `XML update failed validation: ${parsed.error.message}`),
+          }
+        }
+        const definition = parsed.definition
         yield* writeNote(workflowArtifactPath(workflow, "workflow.xml"), xml)
         yield* saveDefinition(workflowID, xml, definition, "dispatching")
         yield* writePrecreatedPlans(yield* get(workflowID), yield* milestones(workflowID))
-        yield* applyWorkflowControl(
-          workflowID,
-          workflowToolResumeBlock(input.message ?? "workflow XML updated by workflow tool"),
-          "workflow tool XML update",
-        ).pipe(Effect.ignore)
-        return
+        return workflowCommandAfterCommit(
+          { workflowID, applied: true, message: "Workflow XML was saved, validated, and scheduling was requested." },
+          schedule(workflowID, { bypassStagedGate: true }),
+        )
       }
       if (input.action === "milestone_status") {
-        if (!input.milestoneID || !input.milestoneStatus) return
-        yield* updateMilestone(workflowID, input.milestoneID, { status: input.milestoneStatus })
-        if (input.milestoneStatus === "blocked") {
-          yield* blockWorkflow(
-            yield* get(workflowID),
-            `Workflow tool blocked milestone ${input.milestoneID}: ${input.message ?? "blocked"}`,
-          ).pipe(Effect.ignore)
-          return
+        if (!input.milestoneID || !input.milestoneStatus) {
+          return {
+            workflowID,
+            ...workflowCommandRejection("precondition_failed", "milestone_status requires milestoneID and milestoneStatus."),
+          }
         }
-        if (input.milestoneStatus === "failed") {
-          yield* setStatus(workflowID, "failed", {
-            error: `Workflow tool marked milestone ${input.milestoneID} failed${input.message ? `: ${input.message}` : ""}`,
-          }).pipe(Effect.ignore)
-          return
+        const current = (yield* milestones(workflowID)).find((item) => item.id === input.milestoneID)
+        if (!current) {
+          return {
+            workflowID,
+            ...workflowCommandRejection("unknown_milestone", `Milestone ${input.milestoneID} was not found.`),
+          }
         }
+        const targetStatus = canonicalMilestoneStatus(input.milestoneStatus)
+        const currentStatus = canonicalMilestoneStatus(current.status)
+        if (targetStatus === currentStatus) {
+          return {
+            workflowID,
+            applied: true,
+            message: `Milestone ${input.milestoneID} is already ${targetStatus}.`,
+          }
+        }
+        if (
+          currentStatus === "planning" &&
+          sourceRole === "department_pm" &&
+          (targetStatus === "approved" || targetStatus === "done") &&
+          current.session.some(
+            (ref) =>
+              ref.role === "department_pm" &&
+              ref.sessionID === input.sourceSessionID &&
+              ref.milestoneID === current.id,
+          )
+        ) {
+          if (yield* activeMilestoneRunIsCurrent(workflowID, input.milestoneID, options?.currentJobID)) {
+            return {
+              workflowID,
+              applied: true,
+              message: `Milestone ${input.milestoneID} accepted milestone_status=${input.milestoneStatus} from its owning department PM as plan_complete; the active milestone run will continue to executor dispatch.`,
+            }
+          }
+          if (yield* hasActiveMilestoneRun(workflowID, input.milestoneID)) {
+            yield* cancelMilestoneRuns(workflowID, input.milestoneID)
+          }
+          yield* updateMilestone(workflowID, input.milestoneID, { status: "pending" })
+          yield* setStatus(workflowID, "executing", { error: "" }).pipe(Effect.ignore)
+          return workflowCommandAfterCommit(
+            {
+              workflowID,
+              applied: true,
+              message: `Milestone ${input.milestoneID} accepted milestone_status=${input.milestoneStatus} from its owning department PM as plan_complete and scheduling was requested for executor dispatch.`,
+            },
+            queueWorkflowSchedule(workflowID, "owning department PM milestone_status alias"),
+          )
+        }
+        if (
+          currentStatus === "planning" &&
+          (sourceRole === "requester" || sourceRole === "main_pm") &&
+          (targetStatus === "approved" || targetStatus === "done")
+        ) {
+          yield* cancelMilestoneRuns(workflowID, input.milestoneID)
+          const result = yield* applyMilestoneToolStatus(workflowID, input.milestoneID, "done")
+          return {
+            ...result,
+            message: `Milestone ${input.milestoneID} accepted milestone_status=${input.milestoneStatus} from ${sourceRoleName} as force_complete for a planning gate, cancelled stale active runs, and requested scheduling.`,
+          }
+        }
+        const allowed = legalMilestoneTransitions(current.status).map(canonicalMilestoneStatus)
+        if (!allowed.includes(targetStatus)) {
+          const guidance = milestoneTransitionGuidance({ currentStatus: current.status, targetStatus })
+          return {
+            workflowID,
+            ...workflowCommandRejection(
+              "illegal_transition",
+              `Milestone ${input.milestoneID} cannot transition from ${current.status} to ${input.milestoneStatus}.${guidance}`,
+              [...new Set(allowed)],
+            ),
+          }
+        }
+        yield* cancelMilestoneRuns(workflowID, input.milestoneID)
+        return yield* applyMilestoneToolStatus(workflowID, input.milestoneID, targetStatus)
+      }
+      if (input.action === "plan_complete") {
+        if (!input.milestoneID) {
+          return {
+            workflowID,
+            ...workflowCommandRejection("precondition_failed", "plan_complete requires milestoneID."),
+          }
+        }
+        if (!sourceRole || !["requester", "main_pm", "department_pm"].includes(sourceRole)) {
+          return {
+            workflowID,
+            ...workflowCommandRejection(
+              "not_authorized",
+              `Role ${sourceRoleName} cannot complete milestone planning. Ask the department PM or main PM to close the plan gate.`,
+            ),
+          }
+        }
+        const current = (yield* milestones(workflowID)).find((item) => item.id === input.milestoneID)
+        if (!current) {
+          return {
+            workflowID,
+            ...workflowCommandRejection("unknown_milestone", `Milestone ${input.milestoneID} was not found.`),
+          }
+        }
+        if (!["pending", "planning", "blocked"].includes(current.status)) {
+          return {
+            workflowID,
+            ...workflowCommandRejection(
+              "illegal_transition",
+              `Milestone ${input.milestoneID} cannot apply plan_complete from ${current.status}.`,
+              ["pending", "planning", "blocked"],
+            ),
+          }
+        }
+        if (
+          sourceRole === "department_pm" &&
+          (yield* activeMilestoneRunIsCurrent(workflowID, input.milestoneID, options?.currentJobID))
+        ) {
+          return {
+            workflowID,
+            applied: true,
+            message: `Milestone ${input.milestoneID} planning gate was acknowledged; the active milestone run will continue to executor dispatch.`,
+          }
+        }
+        const staleActiveRun = yield* hasActiveMilestoneRun(workflowID, input.milestoneID)
+        if (staleActiveRun) {
+          yield* cancelMilestoneRuns(workflowID, input.milestoneID)
+        }
+        if (current.status !== "pending") yield* updateMilestone(workflowID, input.milestoneID, { status: "pending" })
         yield* setStatus(workflowID, "executing", { error: "" }).pipe(Effect.ignore)
-        yield* schedule(workflowID).pipe(Effect.ignore)
-        return
+        return workflowCommandAfterCommit(
+          {
+            workflowID,
+            applied: true,
+            message:
+              sourceRole === "department_pm"
+                ? staleActiveRun
+                  ? `Milestone ${input.milestoneID} planning gate was acknowledged, stale active planning runs were cancelled, and scheduling was requested for executor dispatch.`
+                  : `Milestone ${input.milestoneID} planning gate was acknowledged and scheduling was requested for executor dispatch.`
+                : `Milestone ${input.milestoneID} planning gate was acknowledged by ${sourceRoleName}, stale active planning runs were cancelled, and scheduling was requested for executor dispatch.`,
+          },
+          queueWorkflowSchedule(workflowID, "plan_complete"),
+        )
+      }
+      if (input.action === "force_complete" || input.action === "force_skip") {
+        if (!input.milestoneID) {
+          return {
+            workflowID,
+            ...workflowCommandRejection("precondition_failed", `${input.action} requires milestoneID.`),
+          }
+        }
+        if (!sourceRole || !["requester", "main_pm"].includes(sourceRole)) {
+          return {
+            workflowID,
+            ...workflowCommandRejection(
+              "not_authorized",
+              `Role ${sourceRoleName} cannot ${input.action}. Ask requester or main PM to use this override.`,
+            ),
+          }
+        }
+        const current = (yield* milestones(workflowID)).find((item) => item.id === input.milestoneID)
+        if (!current) {
+          return {
+            workflowID,
+            ...workflowCommandRejection("unknown_milestone", `Milestone ${input.milestoneID} was not found.`),
+          }
+        }
+        if (terminalMilestone(current.status) && current.status !== "approved") {
+          return {
+            workflowID,
+            applied: true,
+            message: `Milestone ${input.milestoneID} is already terminal (${current.status}).`,
+          }
+        }
+        yield* cancelMilestoneRuns(workflowID, input.milestoneID)
+        const status = input.action === "force_complete" ? "done" : "skipped"
+        const result = yield* applyMilestoneToolStatus(workflowID, input.milestoneID, status)
+        return {
+          ...result,
+          message: `Milestone ${input.milestoneID} was ${status === "done" ? "force-completed" : "force-skipped"} by ${sourceRoleName} and scheduling was requested.`,
+        }
       }
       if (input.action === "workflow_status") {
-        if (!input.workflowStatus) return
+        if (!input.workflowStatus) {
+          return {
+            workflowID,
+            ...workflowCommandRejection("precondition_failed", "workflow_status requires workflowStatus."),
+          }
+        }
         if (input.workflowStatus === "blocked") {
           yield* blockWorkflow(workflow, `Workflow tool status block: ${input.message ?? "blocked"}`).pipe(Effect.ignore)
-          return
+          return { workflowID, applied: true, message: "Workflow was blocked." }
         }
         yield* setStatus(workflowID, input.workflowStatus, { error: "" }).pipe(Effect.ignore)
         if (["pending", "running", "planning", "dispatching", "executing", "reviewing"].includes(input.workflowStatus)) {
-          yield* applyWorkflowControl(
+          const resumed = yield* applyWorkflowControl(
             workflowID,
             workflowToolResumeBlock(input.message ?? `workflow tool set status ${input.workflowStatus}`),
             "workflow tool status",
-          ).pipe(Effect.ignore)
+            {
+              sourceSessionID: input.sourceSessionID,
+              sourceAgent: input.sourceAgent,
+              deferStart: true,
+            },
+          )
+          if (resumed.afterCommit) {
+            return workflowCommandAfterCommit(
+              { workflowID, applied: true, message: `Workflow status was set to ${input.workflowStatus} and scheduling was requested.` },
+              resumed.afterCommit,
+            )
+          }
         }
-        return
+        return { workflowID, applied: true, message: `Workflow status was set to ${input.workflowStatus}.` }
       }
       if (input.action === "complete") {
         const items = yield* milestones(workflowID)
         if (!items.every((item) => ["approved", "done", "completed", "skipped", "testing"].includes(item.status))) {
           yield* setStatus(workflowID, "executing", { error: "" }).pipe(Effect.ignore)
-          yield* schedule(workflowID).pipe(Effect.ignore)
-          return
+          return workflowCommandAfterCommit(
+            { workflowID, applied: true, message: "Workflow still has unfinished milestones; scheduling was requested." },
+            queueWorkflowSchedule(workflowID, "complete unfinished"),
+          )
         }
         for (const item of items.filter((item) => item.status === "approved" || item.status === "testing")) {
           yield* updateMilestone(workflowID, item.id, { status: "done" })
         }
         yield* setStatus(workflowID, "completed", { error: "" }).pipe(Effect.ignore)
+        return { workflowID, applied: true, message: "Workflow was completed." }
       }
+      return {
+        workflowID,
+        ...workflowCommandRejection("precondition_failed", `Unsupported workflow action: ${input.action}.`),
+      }
+    })
+
+    const publishWorkflowToolCommandResult = Effect.fn("Workflow.publishWorkflowToolCommandResult")(function* (
+      input: WorkflowToolCommand,
+      result: { workflowID?: WorkflowID; applied: boolean; message: string; rejection?: WorkflowToolCommandRejection },
+    ) {
+      if (!input.id) return
+      yield* bus.publish(WorkflowToolCommandResultEvent, workflowToolCommandResultPayload(input, result))
+    })
+
+    const workflowToolCommandResultPayload = (
+      input: WorkflowToolCommand,
+      result: { workflowID?: WorkflowID; applied: boolean; message: string; rejection?: WorkflowToolCommandRejection },
+    ) => ({
+      id: input.id ?? Bus.createID(),
+      action: input.action,
+      applied: result.applied,
+      ...(result.workflowID ? { workflowID: result.workflowID } : {}),
+      ...(result.rejection ? { rejection: result.rejection } : {}),
+      message: result.message,
+    })
+
+    const workflowToolCommandSnapshot = Effect.fn("Workflow.workflowToolCommandSnapshot")(function* (
+      workflowID: WorkflowID,
+      input: WorkflowToolCommand,
+    ) {
+      const workflow = yield* get(workflowID)
+      const milestone = input.milestoneID
+        ? (yield* milestones(workflowID)).find((item) => item.id === input.milestoneID)
+        : undefined
+      return {
+        workflowStatus: workflow.status,
+        ...(milestone ? { milestoneStatus: milestone.status } : {}),
+      }
+    })
+
+    const appendWorkflowToolCommandJournal = Effect.fn("Workflow.appendWorkflowToolCommandJournal")(function* (
+      input: WorkflowToolCommand,
+      result: { workflowID?: WorkflowID; applied: boolean; message: string; rejection?: WorkflowToolCommandRejection },
+      before?: { workflowStatus?: string; milestoneStatus?: string },
+      after?: { workflowStatus?: string; milestoneStatus?: string },
+    ) {
+      const workflowID = result.workflowID ?? input.workflowID
+      if (!workflowID) return
+      const workflow = yield* get(workflowID)
+      const ctx = yield* InstanceState.context
+      const file = projectWorkflowPath(ctx.directory, workflow, workflowCommandJournalPath())
+      const existing = yield* Effect.promise(() => readFile(file, "utf8")).pipe(
+        Effect.catchCause(() => Effect.succeed("")),
+      )
+      const sourceRole = yield* workflowToolCommandSourceRole(workflow, input.sourceSessionID).pipe(
+        Effect.catchCause(() => Effect.succeed(undefined)),
+      )
+      yield* Effect.promise(() =>
+        appendFileEnsured(
+          file,
+          `${JSON.stringify({
+            seq: existing.trim() ? existing.trim().split(/\r?\n/).length + 1 : 1,
+            id: input.id ?? `anonymous-${Date.now().toString(36)}`,
+            ts: new Date().toISOString(),
+            source: {
+              sessionID: input.sourceSessionID,
+              role: sourceRole ?? "unknown",
+              ...(input.sourceAgent ? { agent: input.sourceAgent } : {}),
+            },
+            action: input.action,
+            ...(input.milestoneID ? { milestoneID: input.milestoneID } : {}),
+            from: before ?? {},
+            to: after ?? {},
+            outcome: result.applied ? "applied" : "rejected",
+            ...(result.rejection ? { rejection: result.rejection } : {}),
+            message: result.message,
+          })}\n`,
+        ),
+      )
+    })
+
+    const replayWorkflowToolCommandJournalResult = Effect.fn("Workflow.replayWorkflowToolCommandJournalResult")(function* (
+      workflowID: WorkflowID,
+      input: WorkflowToolCommand,
+    ) {
+      if (!input.id) return
+      const workflow = yield* get(workflowID)
+      const ctx = yield* InstanceState.context
+      const text = yield* Effect.promise(() =>
+        readFile(projectWorkflowPath(ctx.directory, workflow, workflowCommandJournalPath()), "utf8"),
+      ).pipe(Effect.catchCause(() => Effect.succeed("")))
+      const rows = yield* Effect.all(
+        text
+          .trim()
+          .split(/\r?\n/)
+          .filter(Boolean)
+          .map((line) =>
+            Effect.try({
+              try: () => JSON.parse(line),
+              catch: () => undefined,
+            }).pipe(Effect.catchCause(() => Effect.succeed(undefined))),
+          ),
+      )
+      const row = rows.find((item) => item?.id === input.id)
+      if (!row) return
+      const action = typeof row.action === "string" ? row.action : input.action
+      const result = {
+        workflowID,
+        applied: row.outcome === "applied",
+        message:
+          typeof row.message === "string"
+            ? row.message
+            : `Workflow command ${action} was previously ${row.outcome === "applied" ? "applied" : "rejected"}.`,
+        ...(row.rejection ? { rejection: row.rejection } : {}),
+      }
+      return {
+        input: { ...input, action, workflowID },
+        result,
+      }
+    })
+
+    const applyAndPublishWorkflowToolCommand = Effect.fn("Workflow.applyAndPublishWorkflowToolCommand")(function* (
+      input: WorkflowToolCommand,
+      workflowID: WorkflowID | undefined,
+      pending?: ReturnType<typeof workflowToolCommandDeferred>,
+      options?: { currentJobID?: string | string[] },
+    ) {
+      const journalReplay =
+        input.id && workflowID
+          ? yield* replayWorkflowToolCommandJournalResult(workflowID, input).pipe(
+              Effect.catchCause(() => Effect.succeed(undefined)),
+            )
+          : undefined
+      if (input.id && pending && journalReplay) {
+        rememberWorkflowToolCommandResult(input.id, journalReplay)
+        workflowToolCommandInflight.delete(input.id)
+        pending.resolve(journalReplay)
+        yield* publishWorkflowToolCommandResult(journalReplay.input, journalReplay.result).pipe(Effect.ignore)
+        return journalReplay
+      }
+      const before = workflowID
+        ? yield* workflowToolCommandSnapshot(workflowID, input).pipe(Effect.catchCause(() => Effect.succeed(undefined)))
+        : undefined
+      const result = yield* applyWorkflowToolCommand(input, options).pipe(
+        Effect.catchCause((cause) => {
+          if (workflowCommandDurabilityFailure(cause)) return Effect.failCause(cause)
+          const message = `Workflow command failed: ${errorFromCause(cause)}`
+          return Effect.succeed({
+            ...((workflowID ?? input.workflowID) ? { workflowID: workflowID ?? input.workflowID } : {}),
+            ...workflowCommandRejection("precondition_failed", message),
+          })
+        }),
+      )
+      const afterWorkflowID = result.workflowID ?? workflowID
+      const after = afterWorkflowID
+        ? yield* workflowToolCommandSnapshot(afterWorkflowID, input).pipe(Effect.catchCause(() => Effect.succeed(undefined)))
+        : undefined
+      const afterCommit = result.afterCommit
+      const replayResult = { ...result }
+      delete replayResult.afterCommit
+      const replay = { input, result: replayResult }
+      yield* appendWorkflowToolCommandJournal(input, replayResult, before, after)
+      yield* publishWorkflowToolCommandResult(input, replayResult).pipe(Effect.ignore)
+      if (afterCommit) yield* afterCommit.pipe(Effect.ignore)
+      if (input.id && pending) {
+        rememberWorkflowToolCommandResult(input.id, replay)
+        workflowToolCommandInflight.delete(input.id)
+        pending.resolve(replay)
+      }
+      return replay
+    })
+
+    const handleWorkflowToolCommand = Effect.fn("Workflow.handleWorkflowToolCommand")(function* (
+      input: WorkflowToolCommand,
+      options?: { currentJobID?: string | string[] },
+    ) {
+      const cached = input.id ? workflowToolCommandResults.get(input.id) : undefined
+      if (cached) {
+        yield* publishWorkflowToolCommandResult(cached.input, cached.result).pipe(Effect.ignore)
+        return cached
+      }
+      const inflight = input.id ? workflowToolCommandInflight.get(input.id) : undefined
+      if (inflight) {
+        const replay = yield* Effect.promise(() => inflight.promise)
+        yield* publishWorkflowToolCommandResult(replay.input, replay.result).pipe(Effect.ignore)
+        return replay
+      }
+      const pending = input.id ? workflowToolCommandDeferred() : undefined
+      if (input.id && pending) workflowToolCommandInflight.set(input.id, pending)
+      const workflowID = yield* workflowToolCommandWorkflowID(input).pipe(Effect.catchCause(() => Effect.succeed(undefined)))
+      const run = applyAndPublishWorkflowToolCommand(input, workflowID, pending, options).pipe(
+        Effect.catchCause((cause) =>
+          Effect.gen(function* () {
+            if (input.id && pending) {
+              yield* Effect.sync(() => {
+                workflowToolCommandInflight.delete(input.id)
+                pending.reject(new globalThis.Error(errorFromCause(cause)))
+              })
+            }
+            return yield* Effect.failCause(cause)
+          }),
+        ),
+      )
+      if (!workflowID) return yield* run
+      return yield* withWorkflowToolCommandQueue(workflowID, run)
+    })
+
+    const dispatchCommand = Effect.fn("Workflow.dispatchCommand")(function* (input: WorkflowToolCommand) {
+      yield* InstanceState.get(initState)
+      const command = input.id ? input : { ...input, id: Bus.createID() }
+      const replay = yield* handleWorkflowToolCommand(command)
+      return workflowToolCommandResultPayload(replay.input, replay.result)
     })
 
     const updateWorkflowFileError = Effect.fn("Workflow.updateWorkflowFileError")(function* (
@@ -7726,6 +12349,50 @@ export const layer: Layer.Layer<
       }
     })
 
+    const handleWorkflowPlanFileUpdate = Effect.fn("Workflow.handleWorkflowPlanFileUpdate")(function* (
+      workflow: WorkflowInfo,
+      workflowRelativePath: string,
+      file: string,
+    ) {
+      const milestoneID = workflowPlanFileMilestoneID(workflowRelativePath)
+      if (!milestoneID) return false
+      const items = yield* milestones(workflow.id)
+      const milestone = items.find((item) => item.id === milestoneID)
+      if (!milestone || milestone.status !== "planning") return false
+      const text = yield* Effect.promise(() => readFile(file, "utf8")).pipe(Effect.catchCause(() => Effect.succeed("")))
+      if (!text.trim()) return false
+      const owner = milestone.session
+        .filter((ref) => ref.role === "department_pm" && ref.milestoneID === milestone.id)
+        .toSorted((a, b) => (b.attempt ?? 0) - (a.attempt ?? 0))
+        .at(0)
+      const hasDownstream = items.some((item) => item.dependsOn.some((dependency) => dependency === milestone.id))
+      const closeGate = hasDownstream && workflowPlanClaimsClosedGate(text)
+      const sourceSessionID = closeGate
+        ? workflow.pmSessionID ?? workflow.rootSessionID ?? owner?.sessionID
+        : owner?.sessionID ?? workflow.pmSessionID ?? workflow.rootSessionID
+      if (!sourceSessionID) return false
+      if (parseWorkflowControlCommand(text) || implicitWorkflowResume(text)) {
+        yield* applyWorkflowControl(workflow.id, text, `workflow plan file ${workflowRelativePath}`, {
+          sourceSessionID,
+          sourceAgent: "workflow-file-watcher",
+        }).pipe(Effect.ignore)
+        return true
+      }
+      if (!hasHandoffSummary(text)) return false
+      const replay = yield* handleWorkflowToolCommand({
+        id: Bus.createID(),
+        action: closeGate ? "force_complete" : "plan_complete",
+        workflowID: workflow.id,
+        sourceSessionID,
+        sourceAgent: "workflow-file-watcher",
+        milestoneID,
+        message: closeGate
+          ? `Workflow file watcher observed completed gate plan ${workflowRelativePath} and closed it to unblock downstream work.`
+          : `Workflow file watcher observed completed plan ${workflowRelativePath} and requested milestone continuation.`,
+      })
+      return replay.result.applied
+    })
+
     const handleWorkflowFileUpdate = Effect.fn("Workflow.handleWorkflowFileUpdate")(function* (input: {
       file: string
       event: "add" | "change" | "unlink"
@@ -7757,25 +12424,40 @@ export const layer: Layer.Layer<
       if (!workflow) return
       const workflowRelative = workflowRelativeFile(workflow, file)
       if (!workflowRelative) return
-      if (path.normalize(workflowRelative) !== "workflow.xml") {
+      const workflowRelativePath = path.normalize(workflowRelative)
+      if (workflowRelativePath !== "workflow.xml" && !workflowPipelineItemPaths(workflow.xml).some((item) => path.normalize(item) === workflowRelativePath)) {
+        if (
+          input.event !== "unlink" &&
+          (yield* handleWorkflowPlanFileUpdate(workflow, workflowRelativePath, file).pipe(Effect.catchCause(() => Effect.succeed(false))))
+        ) {
+          return
+        }
         yield* publishUpdated(workflow.id).pipe(Effect.ignore)
         return
       }
       if (input.event === "unlink") {
-        yield* updateWorkflowFileError(workflow.id, "workflow.xml was deleted; keeping the last valid workflow graph")
+        yield* updateWorkflowFileError(
+          workflow.id,
+          workflowRelativePath === "workflow.xml"
+            ? "workflow.xml was deleted; keeping the last valid workflow graph"
+            : `pipeline items file ${workflowRelative} was deleted; keeping the last valid workflow graph`,
+        )
         return
       }
-      const xml = yield* Effect.promise(() => readFile(file, "utf8")).pipe(
+      const xmlFile = workflowRelativePath === "workflow.xml" ? file : projectWorkflowPath(ctx.directory, workflow, "workflow.xml")
+      const xml = yield* Effect.promise(() => readFile(xmlFile, "utf8")).pipe(
         Effect.catch((error: unknown) =>
           updateWorkflowFileError(
             workflow.id,
-            `workflow.xml could not be read: ${error instanceof globalThis.Error ? error.message : String(error)}`,
+            `workflow.xml could not be read after ${workflowRelative} changed: ${
+              error instanceof globalThis.Error ? error.message : String(error)
+            }`,
           ).pipe(Effect.as(undefined as string | undefined)),
         ),
       )
       if (!xml) return
       const definition = yield* Effect.try({
-        try: () => parseXmlDefinition(xml),
+        try: () => parseXmlDefinition(xml, workflow),
         catch: (error) => new Error({ message: error instanceof globalThis.Error ? error.message : String(error) }),
       }).pipe(
         Effect.catch((error: Error) =>
@@ -7816,6 +12498,7 @@ export const layer: Layer.Layer<
     })
 
     const resumeActiveWorkflowsOnStartup = Effect.fn("Workflow.resumeActiveWorkflowsOnStartup")(function* () {
+      if (!workflowAutorunEnabled()) return
       const ctx = yield* InstanceState.context
       const activeStatuses: WorkflowInfo["status"][] = [
         "pending",
@@ -7840,7 +12523,11 @@ export const layer: Layer.Layer<
           .all()
           .map(toInfo),
       )
-      for (const workflow of workflows.filter((item) => !activeJobs.has(item.id))) {
+      const startupResumeStarted = Date.now()
+      // Recovery can overlap a fresh workflow.start before every artifact is visible on disk.
+      for (const workflow of workflows.filter(
+        (item) => !activeJobs.has(item.id) && startupResumeStarted - item.time.created > 5_000,
+      )) {
         yield* applyWorkflowControl(
           workflow.id,
           workflowToolResumeBlock("opencode startup resume"),
@@ -7849,13 +12536,74 @@ export const layer: Layer.Layer<
       }
     })
 
+    const handleMessageUpdated = Effect.fn("Workflow.handleMessageUpdated")(function* (properties: {
+      sessionID: SessionID
+      info: MessageV2.Info
+    }) {
+      const info = properties.info
+      if (info.role === "user") {
+        yield* Effect.all(
+          [
+            observeRequesterMessage({
+              sessionID: properties.sessionID,
+              messageID: info.id,
+            }),
+            observeWorkflowUserMessage({
+              sessionID: properties.sessionID,
+              messageID: info.id,
+            }),
+          ],
+          { discard: true },
+        )
+        return
+      }
+      if (!info.time.completed || info.error) return
+      yield* observeWorkflowMessage({
+        sessionID: properties.sessionID,
+        messageID: info.id,
+        agent: info.agent,
+        model: {
+          providerID: info.providerID,
+          modelID: info.modelID,
+          ...(info.variant ? { variant: info.variant } : {}),
+        },
+      })
+    })
+
     const initState = yield* InstanceState.make(
       Effect.fn("Workflow.initState")(function* () {
+        const instance = yield* InstanceState.context
+        const bridge = yield* EffectBridge.make()
+        const unregisterWorkflowToolCommandDispatcher = registerWorkflowToolCommandDispatcher(instance.directory, (input) =>
+          bridge.promise(dispatchCommand(input)),
+        )
+        const unregisterWorkflowMessageSendDispatcher = registerWorkflowMessageSendDispatcher(instance.directory, (input) =>
+          bridge.promise(dispatchMessageSend(input)),
+        )
+        const globalWorkflowCommandHandler = (event: { directory?: string; payload?: { type?: string; properties?: WorkflowToolCommand } }) => {
+          if (event.directory && event.directory !== instance.directory) return
+          if (event.payload?.type !== WorkflowToolCommandEvent.type) return
+          if (!event.payload.properties?.id) return
+          bridge.fork(handleWorkflowToolCommand(event.payload.properties))
+        }
+        const globalMessageUpdatedHandler = (event: { directory?: string; payload?: { type?: string; properties?: { sessionID: SessionID; info: MessageV2.Info } } }) => {
+          if (event.directory && event.directory !== instance.directory) return
+          if (event.payload?.type !== MessageV2.Event.Updated.type) return
+          bridge.fork(handleMessageUpdated(event.payload.properties))
+        }
+        GlobalBus.on("event", globalWorkflowCommandHandler)
+        GlobalBus.on("event", globalMessageUpdatedHandler)
+        yield* Effect.addFinalizer(() =>
+          Effect.sync(() => {
+            unregisterWorkflowToolCommandDispatcher()
+            unregisterWorkflowMessageSendDispatcher()
+            GlobalBus.off("event", globalWorkflowCommandHandler)
+            GlobalBus.off("event", globalMessageUpdatedHandler)
+          }),
+        )
         yield* syncWorkflowStatesFromDisk().pipe(Effect.ignore)
         yield* (yield* bus.subscribe(WorkflowToolCommandEvent)).pipe(
-          Stream.runForEach((payload) =>
-            applyWorkflowToolCommand(payload.properties).pipe(Effect.catchCause(() => Effect.void)),
-          ),
+          Stream.runForEach((payload) => handleWorkflowToolCommand(payload.properties).pipe(Effect.ignore)),
           Effect.forkScoped,
         )
         yield* (yield* bus.subscribe(FileWatcher.Event.Updated)).pipe(
@@ -7872,7 +12620,28 @@ export const layer: Layer.Layer<
                   .select()
                   .from(WorkflowTable)
                   .where(eq(WorkflowTable.pm_session_id, payload.properties.sessionID))
-                  .get(),
+                  .get() ??
+                (() => {
+                  const member = db
+                    .select()
+                    .from(WorkflowMemberTable)
+                    .where(
+                      and(
+                        eq(WorkflowMemberTable.session_id, payload.properties.sessionID),
+                        eq(WorkflowMemberTable.role, "main_pm"),
+                      ),
+                    )
+                    .orderBy(asc(WorkflowMemberTable.time_updated))
+                    .all()
+                    .at(-1)
+                  return member
+                    ? db
+                        .select()
+                        .from(WorkflowTable)
+                        .where(eq(WorkflowTable.id, member.workflow_id))
+                        .get()
+                    : undefined
+                })(),
               )
               if (workflow && ["planning", "dispatching", "blocked", "failed"].includes(workflow.status)) {
                 yield* archiveWorkflowSession({
@@ -7884,8 +12653,85 @@ export const layer: Layer.Layer<
                   (item) => item.info.role === "assistant" && item.info.time.completed && !item.info.error,
                 )
                 const text = latest ? messageText(latest) : ""
+                if (workflowDispatchClaimWithoutControl(text, "main_pm")) {
+                  const workflowInfo = toInfo(workflow)
+                  const inferredControl = workflowInferredDispatchControl({
+                    text,
+                    role: "main_pm",
+                    milestones: yield* milestones(workflow.id),
+                  })
+                  if (inferredControl) {
+                    const replay = yield* handleWorkflowToolCommand({
+                      ...inferredControl,
+                      id: Bus.createID(),
+                      workflowID: workflow.id,
+                      sourceSessionID: payload.properties.sessionID,
+                      sourceAgent: "workflow-main-pm",
+                    }).pipe(Effect.catchCause(() => Effect.succeed(undefined)))
+                    if (replay?.result?.applied) return
+                  }
+                  const correction = latestText(
+                    yield* runPrompt(
+                      payload.properties.sessionID,
+                      "workflow-main-pm",
+                      workflowInfo.model,
+                      workflowDispatchCorrectionPrompt({
+                        workflow: workflowInfo,
+                        role: "main_pm",
+                        previous: text,
+                      }),
+                      {
+                        workflowID: workflow.id,
+                        role: "main_pm",
+                      },
+                      { consult: false, expect: workflowDispatchCorrectionExpectation("main_pm") },
+                    ),
+                  )
+                  if (
+                    yield* applyWorkflowUpdateFromOutput({
+                      workflowID: workflow.id,
+                      role: "main_pm",
+                      output: correction,
+                    })
+                  ) {
+                    yield* queueContinuePlanning(yield* get(workflow.id), "main PM idle dispatch correction workflow update").pipe(
+                      Effect.ignore,
+                    )
+                    return
+                  }
+                  if (parseWorkflowControlCommand(correction) || implicitWorkflowResume(correction)) {
+                    yield* applyWorkflowControl(workflow.id, correction, "main PM idle dispatch correction", {
+                      sourceSessionID: payload.properties.sessionID,
+                      sourceAgent: "workflow-main-pm",
+                    }).pipe(Effect.ignore)
+                    return
+                  }
+                  const correctionConsults = parseConsultRequests(correction)
+                  if (correctionConsults.length > 0 && !workflowDispatchClaimWithoutControl(correction, "main_pm")) {
+                    yield* resolveConsultRequests(
+                      workflow.id,
+                      payload.properties.sessionID,
+                      "workflow-main-pm",
+                      workflowInfo.model,
+                      "main_pm",
+                      undefined,
+                      undefined,
+                      correction,
+                    ).pipe(Effect.ignore)
+                    yield* advanceWorkflowAfterSession(workflow.id, "main PM idle dispatch correction consultation completed")
+                    return
+                  }
+                  yield* blockPlanning(
+                    workflow.id,
+                    "Main PM session became idle after claiming dispatch without a confirmed workflow control result.",
+                  )
+                  return
+                }
                 if (text && implicitWorkflowResume(text)) {
-                  yield* applyWorkflowControl(workflow.id, text, "main PM session idle").pipe(Effect.ignore)
+                  yield* applyWorkflowControl(workflow.id, text, "main PM session idle", {
+                    sourceSessionID: payload.properties.sessionID,
+                    sourceAgent: "workflow-main-pm",
+                  }).pipe(Effect.ignore)
                   return
                 }
                 if (yield* queueContinuePlanning(toInfo(workflow), "main PM session idle")) return
@@ -7914,6 +12760,85 @@ export const layer: Layer.Layer<
                   (item) => item.info.role === "assistant" && item.info.time.completed && !item.info.error,
                 )
                 const text = latest ? messageText(latest) : ""
+                if (workflowDispatchClaimWithoutControl(text, context.role)) {
+                  const inferredControl = workflowInferredDispatchControl({
+                    text,
+                    role: context.role,
+                    milestoneID: context.milestoneID,
+                    milestoneStatus: active.status,
+                    milestones: contextItems,
+                  })
+                  if (inferredControl) {
+                    const replay = yield* handleWorkflowToolCommand({
+                      ...inferredControl,
+                      id: Bus.createID(),
+                      workflowID: context.workflow.id,
+                      sourceSessionID: payload.properties.sessionID,
+                      sourceAgent: workflowAgentForRole(context.role),
+                    }).pipe(Effect.catchCause(() => Effect.succeed(undefined)))
+                    if (replay?.result?.applied) return
+                  }
+                  const info = yield* session
+                    .get(payload.properties.sessionID)
+                    .pipe(Effect.mapError((error) => new Error({ message: error.message })))
+                  const correction = latestText(
+                    yield* runPrompt(
+                      payload.properties.sessionID,
+                      info.agent ?? workflowAgentForRole(context.role),
+                      context.workflow.model,
+                      workflowDispatchCorrectionPrompt({
+                        workflow: context.workflow,
+                        role: context.role,
+                        milestoneID: context.milestoneID,
+                        previous: text,
+                      }),
+                      {
+                        workflowID: context.workflow.id,
+                        role: context.role,
+                        milestoneID: context.milestoneID,
+                        attempt: context.attempt,
+                      },
+                      { consult: false, expect: workflowDispatchCorrectionExpectation(context.role) },
+                    ),
+                  )
+                  if (
+                    yield* applyWorkflowUpdateFromOutput({
+                      workflowID: context.workflow.id,
+                      role: context.role,
+                      output: correction,
+                    })
+                  ) {
+                    yield* advanceWorkflowAfterSession(context.workflow.id, "idle dispatch correction workflow update")
+                    return
+                  }
+                  if (parseWorkflowControlCommand(correction) || implicitWorkflowResume(correction)) {
+                    yield* applyWorkflowControl(context.workflow.id, correction, "idle dispatch correction", {
+                      sourceSessionID: payload.properties.sessionID,
+                      sourceAgent: info.agent ?? workflowAgentForRole(context.role),
+                    }).pipe(Effect.ignore)
+                    return
+                  }
+                  const correctionConsults = parseConsultRequests(correction)
+                  if (correctionConsults.length > 0 && !workflowDispatchClaimWithoutControl(correction, context.role)) {
+                    yield* resolveConsultRequests(
+                      context.workflow.id,
+                      payload.properties.sessionID,
+                      info.agent ?? workflowAgentForRole(context.role),
+                      context.workflow.model,
+                      context.role,
+                      context.milestoneID,
+                      context.attempt,
+                      correction,
+                    ).pipe(Effect.ignore)
+                    yield* advanceWorkflowAfterSession(context.workflow.id, "idle dispatch correction consultation completed")
+                    return
+                  }
+                  yield* blockPlanning(
+                    context.workflow.id,
+                    "Workflow session became idle after claiming dispatch without a confirmed workflow control result.",
+                  )
+                  return
+                }
                 if (
                   expectation &&
                   text.trim() &&
@@ -7939,43 +12864,14 @@ export const layer: Layer.Layer<
                   ).pipe(Effect.ignore)
                 }
               }
-              if (!(yield* recoverStaleActiveMilestones(context.workflow.id, contextItems))) return
-              yield* setStatus(context.workflow.id, "executing", { error: "" }).pipe(Effect.ignore)
+              if (!(yield* recoverStaleActiveMilestones(context.workflow, contextItems))) return
               yield* schedule(context.workflow.id).pipe(Effect.ignore)
             }),
           ),
           Effect.forkScoped,
         )
         yield* (yield* bus.subscribe(MessageV2.Event.Updated)).pipe(
-          Stream.runForEach((payload) => {
-            const info = payload.properties.info
-            if (info.role === "user") {
-              return Effect.all(
-                [
-                  observeRequesterMessage({
-                    sessionID: payload.properties.sessionID,
-                    messageID: info.id,
-                  }),
-                  observeWorkflowUserMessage({
-                    sessionID: payload.properties.sessionID,
-                    messageID: info.id,
-                  }),
-                ],
-                { discard: true },
-              ).pipe(Effect.catchCause(() => Effect.void))
-            }
-            if (!info.time.completed || info.error) return Effect.void
-            return observeWorkflowMessage({
-              sessionID: payload.properties.sessionID,
-              messageID: info.id,
-              agent: info.agent,
-              model: {
-                providerID: info.providerID,
-                modelID: info.modelID,
-                ...(info.variant ? { variant: info.variant } : {}),
-              },
-            }).pipe(Effect.catchCause(() => Effect.void))
-          }),
+          Stream.runForEach((payload) => handleMessageUpdated(payload.properties).pipe(Effect.catchCause(() => Effect.void))),
           Effect.forkScoped,
         )
         yield* resumeActiveWorkflowsOnStartup().pipe(Effect.delay("500 millis"), Effect.catchCause(() => Effect.void), Effect.forkScoped)
@@ -8017,11 +12913,14 @@ export const layer: Layer.Layer<
       }
       const title = input.title ?? titleFromRequest(request) ?? "Workflow request"
       const time = Date.now()
+      const initialXml = workflowXmlFromText(request)
+      const initialStatus = initialXml ? ("dispatching" as const) : ("planning" as const)
       const model = yield* Effect.try({
         try: () => modelFromInput(input.model, input.variant),
         catch: (error) => new Error({ message: error instanceof globalThis.Error ? error.message : String(error) }),
       })
       const staffing = normalizeStaffing(input.staffing)
+      const scheduling = normalizeScheduling(input.scheduling)
       const modelWhitelist = normalizeWorkflowModelWhitelist(input.modelWhitelist)
       const root = requester ?? (yield* session.create({
         title: workflowRequesterTitle(request),
@@ -8037,10 +12936,11 @@ export const layer: Layer.Layer<
         request,
         title,
         directory: ctx.directory,
-        path: workflowFolderPath(time, title),
-        xml: defaultXml,
-        status: "planning",
+        path: workflowFolderPath(id),
+        xml: initialXml ?? defaultXml,
+        status: initialStatus,
         staffing,
+        scheduling,
         model,
         modelWhitelist,
         agent: input.agent,
@@ -8049,6 +12949,67 @@ export const layer: Layer.Layer<
           updated: time,
         },
       }
+      Database.use((db) =>
+        db
+          .insert(ProjectTable)
+          .values({
+            id: ctx.project.id,
+            worktree: ctx.project.worktree,
+            vcs: ctx.project.vcs ?? null,
+            name: ctx.project.name,
+            icon_url: ctx.project.icon?.url,
+            icon_url_override: ctx.project.icon?.override,
+            icon_color: ctx.project.icon?.color,
+            time_created: ctx.project.time.created,
+            time_updated: ctx.project.time.updated,
+            time_initialized: ctx.project.time.initialized,
+            sandboxes: ctx.project.sandboxes,
+            commands: ctx.project.commands,
+          })
+          .onConflictDoNothing()
+          .run(),
+      )
+      Database.use((db) =>
+        db
+          .insert(SessionTable)
+          .values(
+            workflowStateSessionRow({
+              ctx,
+              workflow: info,
+              session: workflowStateSessionSnapshot({
+                workflow: info,
+                ref: { sessionID: root.id, role: "requester", title: workflowRequesterTitle(request) },
+                info: root,
+              }),
+            }),
+          )
+          .onConflictDoNothing()
+          .run(),
+      )
+      yield* Effect.promise(async () =>
+        Promise.all([
+          writeFileEnsured(projectWorkflowPath(ctx.directory, info, "workflow.xml"), info.xml),
+          writeWorkflowStateFile(
+            projectWorkflowPath(ctx.directory, info, workflowManifestFileName),
+            workflowManifest(info),
+          ),
+          writeFileEnsured(
+            projectWorkflowPath(ctx.directory, info, workflowMainPlanPath()),
+            initialXml
+              ? [
+                  `# ${info.title}`,
+                  "",
+                  "The requester supplied canonical workflow XML. It was imported directly into workflow.xml and will be dispatched without waiting for a main PM rewrite.",
+                  "",
+                  "## Request",
+                  "",
+                  info.request,
+                  "",
+                ].join("\n")
+              : `# ${info.title}\n\n${info.request}\n`,
+          ),
+        ]),
+      )
       Database.use((db) =>
         db.insert(WorkflowTable)
           .values({
@@ -8062,6 +13023,7 @@ export const layer: Layer.Layer<
             xml: info.xml,
             status: info.status,
             staffing: info.staffing,
+            scheduling: info.scheduling,
             model: info.model,
             model_whitelist: info.modelWhitelist,
             agent: info.agent,
@@ -8070,20 +13032,17 @@ export const layer: Layer.Layer<
           })
           .run(),
       )
-      yield* Effect.promise(async () =>
-        Promise.all([
-          writeFileEnsured(projectWorkflowPath(ctx.directory, info, "workflow.xml"), info.xml),
-          writeFileEnsured(projectWorkflowPath(ctx.directory, info, "main-plan.md"), `# ${info.title}\n\n${info.request}\n`),
-        ]),
-      )
-      yield* saveDefinition(id, info.xml, parseXmlDefinition(info.xml), "planning")
+      yield* saveDefinition(id, info.xml, parseXmlDefinition(info.xml, info), initialStatus)
       yield* writePrecreatedPlans(info, yield* milestones(id))
       yield* ensureCompany(info)
+      const mainPM = (yield* members(id)).find((item) => item.role === "main_pm")
+      if (mainPM) yield* setMainProductManagerSession(id, mainPM.sessionID)
       yield* archiveWorkflowSession({ workflowID: id, sessionID: root.id, role: "requester" }).pipe(Effect.ignore)
       yield* writeArchiveIndex(id).pipe(Effect.ignore)
       yield* writeOrganization(id).pipe(Effect.ignore)
       yield* writeProgress(id).pipe(Effect.ignore)
       yield* writeInterventionArtifacts(id).pipe(Effect.ignore)
+      yield* writeReferenceIndex(id).pipe(Effect.ignore)
       yield* ensureStandupIndex(id).pipe(Effect.ignore)
       const initialized = yield* get(id)
       yield* writeWorkflowState(id, initialized).pipe(Effect.ignore)
@@ -8094,14 +13053,16 @@ export const layer: Layer.Layer<
         type: "workflow",
         title: info.title,
         metadata: { workflowID: id },
-        run: runPlanning(id).pipe(
+        run: (initialXml ? schedule(id) : runPlanning(id)).pipe(
           Effect.delay("10 millis"),
           Effect.catchCause((cause) =>
             Cause.hasInterruptsOnly(cause)
               ? Effect.interrupt
-              : blockPlanning(id, `Workflow planning failed: ${errorFromCause(cause)}`).pipe(Effect.asVoid),
+              : blockPlanning(id, `Workflow ${initialXml ? "dispatch" : "planning"} failed: ${errorFromCause(cause)}`).pipe(
+                  Effect.asVoid,
+                ),
           ),
-          Effect.as("workflow planning completed"),
+          Effect.as(initialXml ? "workflow dispatched" : "workflow planning completed"),
         ),
       })
       return info
@@ -8109,12 +13070,12 @@ export const layer: Layer.Layer<
 
     const updateXml = Effect.fn("Workflow.updateXml")(function* (input: UpdateXmlInput) {
       yield* InstanceState.get(initState)
-      yield* get(input.workflowID)
+      const workflow = yield* get(input.workflowID)
       const definition = yield* Effect.try({
-        try: () => parseXmlDefinition(input.xml),
+        try: () => parseXmlDefinition(input.xml, workflow),
         catch: (error) => new Error({ message: error instanceof globalThis.Error ? error.message : String(error) }),
       })
-      yield* writeNote(workflowArtifactPath(yield* get(input.workflowID), "workflow.xml"), input.xml)
+      yield* writeNote(workflowArtifactPath(workflow, "workflow.xml"), input.xml)
       const result = yield* saveDefinition(input.workflowID, input.xml, definition)
       yield* writePrecreatedPlans(yield* get(input.workflowID), yield* milestones(input.workflowID))
       yield* publishUpdated(input.workflowID)
@@ -8139,7 +13100,8 @@ export const layer: Layer.Layer<
       yield* writeOrganization(input.workflowID).pipe(Effect.ignore)
       yield* writeArchiveIndex(input.workflowID).pipe(Effect.ignore)
       yield* writeProgress(input.workflowID).pipe(Effect.ignore)
-      return yield* publishUpdated(workflow.id)
+      yield* publishUpdated(workflow.id)
+      return yield* schedule(input.workflowID)
     })
 
     const updateIntervention = Effect.fn("Workflow.updateIntervention")(function* (
@@ -8159,11 +13121,24 @@ export const layer: Layer.Layer<
           .where(and(eq(WorkflowInterventionTable.workflow_id, workflowID), eq(WorkflowInterventionTable.id, interventionID)))
           .run(),
       )
+      const updated = (yield* interventions(workflowID)).find((item) => item.id === interventionID)
+      if (updated && (patch.status !== undefined || patch.response !== undefined)) {
+        yield* appendWorkflowMessageRuntimeJournal(workflowID, {
+          action: patch.status === "delivered" ? "deliver" : patch.status === "acked" ? "ack" : "update",
+          kind: "intervention",
+          messageID: interventionID,
+          sessionID: updated.targetSessionID,
+          targetSessionID: updated.targetSessionID,
+          targetRole: updated.targetRole,
+          status: updated.status,
+          response: updated.response,
+        }).pipe(Effect.ignore)
+      }
       yield* writeInterventionArtifacts(workflowID).pipe(Effect.ignore)
       yield* writeReferenceIndex(workflowID).pipe(Effect.ignore)
       yield* writeArchiveIndex(workflowID).pipe(Effect.ignore)
       yield* events.publish(Event.GraphUpdated, { workflowID })
-      return (yield* interventions(workflowID)).find((item) => item.id === interventionID)
+      return updated
     })
 
     const deliverIntervention = Effect.fn("Workflow.deliverIntervention")(function* (
@@ -8177,6 +13152,46 @@ export const layer: Layer.Layer<
       const target = yield* session
         .get(intervention.targetSessionID)
         .pipe(Effect.mapError((error) => new Error({ message: error.message })))
+      const workflowMessage = Database.use((db) =>
+        db
+          .select()
+          .from(WorkflowMessageTable)
+          .where(and(eq(WorkflowMessageTable.workflow_id, workflowID), eq(WorkflowMessageTable.id, interventionID)))
+          .get(),
+      )
+      if (workflowMessage?.kind === "standup") {
+        const result = yield* runPrompt(
+          intervention.targetSessionID,
+          target.agent ?? workflowAgentForRole(intervention.targetRole),
+          workflow.model,
+          [
+            "Workflow company standup request received.",
+            "",
+            workflowReferencePrompt(workflow),
+            "",
+            `Message id: ${interventionID}`,
+            `Timing: ${intervention.timing}`,
+            `Standup request document: ${intervention.path}`,
+            "",
+            "Standup request:",
+            intervention.message,
+            "",
+            "Do not edit workflow.xml, dispatch milestones, or output resume/block only because of a standup.",
+            "Report your current state with workflow action=status_update, including availability, currentFocus, blockers, and progressNote.",
+            "Then acknowledge this standup request with workflow_message action=ack and this message id.",
+          ].join("\n"),
+          {
+            workflowID,
+            role: intervention.targetRole,
+          },
+          { consult: false, control: false },
+        )
+        yield* updateIntervention(workflowID, interventionID, {
+          response: latestText(result),
+          status: "delivered",
+        }).pipe(Effect.ignore)
+        return
+      }
       const result = yield* runPrompt(
         intervention.targetSessionID,
         target.agent ?? workflowAgentForRole(intervention.targetRole),
@@ -8204,7 +13219,7 @@ export const layer: Layer.Layer<
           workflowID,
           role: intervention.targetRole,
         },
-        { consult: false, expect: workflowControlExpectation() },
+        { consult: false, control: false, expect: workflowControlExpectation() },
       )
       const output = latestText(result)
       if (parseConsultRequests(output).length > 0) {
@@ -8220,13 +13235,14 @@ export const layer: Layer.Layer<
           output,
         ).pipe(Effect.ignore)
       }
-      const control = parseWorkflowControlAction(output)
+      const control = parseWorkflowControlCommand(output)
       yield* updateIntervention(workflowID, interventionID, {
         response: output,
-        status: intervention.timing === "interrupt" && control !== "resume" ? "blocked" : "delivered",
+        status: intervention.timing === "interrupt" && (!control || control.action === "block") ? "blocked" : "delivered",
       }).pipe(Effect.ignore)
       yield* applyWorkflowControl(workflowID, output, `intervention ${interventionID}`, {
         exceptJobID: jobID,
+        sourceSessionID: intervention.targetSessionID,
       }).pipe(Effect.ignore)
       if (intervention.targetRole !== "main_pm") {
         yield* notifyMainPM(workflowID, `Requester intervention ${interventionID} was delivered to ${roleSessionTitle(intervention.targetRole)}.`).pipe(
@@ -8235,23 +13251,153 @@ export const layer: Layer.Layer<
       }
     })
 
+    const afterTaskInterventionShouldWait = Effect.fn("Workflow.afterTaskInterventionShouldWait")(function* (
+      workflowID: WorkflowID,
+      intervention: WorkflowInterventionInfo,
+    ) {
+      if (intervention.timing !== "after-task" || !intervention.targetSessionID) return false
+      const assignment = workflowSessionAssignment(yield* milestones(workflowID), intervention.targetSessionID)
+      if (!assignment) return false
+      return interruptedMilestone(assignment.milestone.status) || assignment.milestone.status === "testing"
+    })
+
+    const startInterventionDelivery = Effect.fn("Workflow.startInterventionDelivery")(function* (
+      workflow: WorkflowInfo,
+      interventionID: string,
+    ) {
+      if (!workflowAutorunEnabled()) return false
+      const intervention = (yield* interventions(workflow.id)).find((item) => item.id === interventionID)
+      if (!intervention || intervention.status !== "queued") return false
+      if (yield* afterTaskInterventionShouldWait(workflow.id, intervention)) return false
+      const jobID = `${workflow.id}:${intervention.id}`
+      if ((yield* background.list()).some((job) => job.id === jobID && job.status === "running")) return true
+      yield* background.start({
+        id: jobID,
+        type: "workflow.intervention",
+        title: `${workflow.title} requester intervention`,
+        metadata: { workflowID: workflow.id },
+        run: deliverIntervention(workflow.id, intervention.id, jobID).pipe(
+          Effect.catchCause((cause) =>
+            updateIntervention(workflow.id, intervention.id, {
+              response: errorFromCause(cause),
+              status: "failed",
+            }).pipe(Effect.asVoid),
+          ),
+          Effect.as("workflow intervention delivered"),
+        ),
+      })
+      return true
+    })
+
+    const deliverReadyInterventions = Effect.fn("Workflow.deliverReadyInterventions")(function* (
+      workflowID: WorkflowID,
+    ) {
+      const workflow = yield* get(workflowID)
+      if (workflow.status === "cancelled" || workflow.status === "completed") return 0
+      let started = 0
+      for (const intervention of (yield* interventions(workflowID)).filter((item) => item.status === "queued")) {
+        if (
+          workflow.rootSessionID &&
+          intervention.fromSessionID === workflow.rootSessionID &&
+          intervention.targetRole === "main_pm" &&
+          requesterDirectExecutionOverride(intervention.message)
+        ) {
+          const override = yield* applyRequesterDirectExecutionOverride({
+            workflow,
+            sourceSessionID: workflow.rootSessionID,
+            message: intervention.message,
+          }).pipe(
+            Effect.catchCause((cause) =>
+              Effect.succeed({
+                applied: false,
+                message: `Requester direct-execution override failed: ${errorFromCause(cause)}`,
+              }),
+            ),
+          )
+          yield* updateIntervention(workflowID, intervention.id, {
+            response: override.message,
+            status: override.applied ? "acked" : "failed",
+          }).pipe(Effect.ignore)
+          yield* notifyMainPM(
+            workflowID,
+            `Requester direct-execution override ${override.applied ? "applied" : "failed"}: ${override.message}`,
+          ).pipe(Effect.ignore)
+          started++
+          continue
+        }
+        if (yield* startInterventionDelivery(workflow, intervention.id)) started++
+      }
+      return started
+    })
+
+    const applyRequesterDirectExecutionOverride = Effect.fn("Workflow.applyRequesterDirectExecutionOverride")(function* (input: {
+      workflow: WorkflowInfo
+      sourceSessionID: SessionID
+      message: string
+    }) {
+      const planning = (yield* milestones(input.workflow.id)).filter((item) => item.status === "planning")
+      if (planning.length === 0) {
+        yield* applyWorkflowControl(
+          input.workflow.id,
+          workflowToolResumeBlock(input.message),
+          "requester direct execution override",
+          {
+            sourceSessionID: input.sourceSessionID,
+          },
+        ).pipe(Effect.ignore)
+        return {
+          applied: true,
+          message: "Requester direct-execution override requested scheduling; no active planning gate needed force completion.",
+        }
+      }
+      const results = yield* Effect.all(
+        planning.map((item) =>
+          Effect.gen(function* () {
+            const command: WorkflowToolCommand = {
+              id: Bus.createID(),
+              action: "force_complete",
+              workflowID: input.workflow.id,
+              sourceSessionID: input.sourceSessionID,
+              milestoneID: item.id,
+              message: `Requester direct-execution override closed planning gate ${item.id}: ${compactMarkdown(input.message, 240)}`,
+            }
+            return yield* applyAndPublishWorkflowToolCommand(command, input.workflow.id)
+          }),
+        ),
+        { concurrency: 1 },
+      )
+      const applied = results.filter((result) => result.result.applied)
+      if (applied.length > 0) {
+        return {
+          applied: true,
+          message: `Requester direct-execution override force-completed planning gate(s): ${applied.map((item) => item.input.milestoneID).filter(Boolean).join(", ")}.`,
+        }
+      }
+      return {
+        applied: false,
+        message: `Requester direct-execution override could not close planning gates: ${results.map((item) => item.result.message).join(" | ")}`,
+      }
+    })
+
     const intervene = Effect.fn("Workflow.intervene")(function* (input: InterveneInput) {
       yield* InstanceState.get(initState)
       const message = input.message.trim()
       if (!message) return yield* new Error({ message: "Workflow intervention message is required" })
       const workflow = yield* get(input.workflowID)
+      const sourceSessionID = input.sourceSessionID ?? workflow.rootSessionID
       const targetRole = input.targetRole ?? (input.targetSessionID ? workflowSessionRole(workflow, yield* milestones(workflow.id), input.targetSessionID) : "main_pm")
       const target =
         input.targetSessionID ??
         (targetRole === "requester"
           ? workflow.rootSessionID
           : (yield* ensureCompanyMember({
-              workflow,
-              role: targetRole,
-              specialty: roleSpecialty(targetRole),
-              prompt: input.message,
-            }))?.sessionID)
+            workflow,
+            role: targetRole,
+            specialty: input.targetSpecialty ?? roleSpecialty(targetRole),
+            prompt: input.message,
+          }))?.sessionID)
       if (!target) return yield* new Error({ message: `No ${roleSessionTitle(targetRole)} session is available` })
+      if (!sourceSessionID) return yield* new Error({ message: "Workflow requester session is not available" })
 
       const id = `intervention_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`
       const now = Date.now()
@@ -8261,7 +13407,7 @@ export const layer: Layer.Layer<
           .values({
             workflow_id: workflow.id,
             id,
-            from_session_id: workflow.rootSessionID,
+            from_session_id: sourceSessionID,
             target_session_id: target,
             target_role: targetRole,
             timing,
@@ -8273,10 +13419,54 @@ export const layer: Layer.Layer<
           })
           .run(),
       )
+      const sourceRole = yield* workflowToolCommandSourceRole(workflow, sourceSessionID).pipe(
+        Effect.catchCause(() => Effect.succeed(undefined)),
+      )
+      yield* upsertWorkflowMessage({
+        workflowID: workflow.id,
+        id,
+        kind: "intervention",
+        fromSessionID: sourceSessionID,
+        fromRole: sourceRole,
+        toSessionID: target,
+        toRole: targetRole,
+        timing,
+        body: message,
+        status: "queued",
+        timeCreated: now,
+        timeUpdated: now,
+      }).pipe(Effect.ignore)
       yield* writeInterventionArtifacts(workflow.id).pipe(Effect.ignore)
       yield* writeReferenceIndex(workflow.id).pipe(Effect.ignore)
       yield* writeArchiveIndex(workflow.id).pipe(Effect.ignore)
       yield* archiveWorkflowSession({ workflowID: workflow.id, sessionID: target, role: targetRole }).pipe(Effect.ignore)
+      if (
+        workflow.rootSessionID === sourceSessionID &&
+        targetRole === "main_pm" &&
+        requesterDirectExecutionOverride(message)
+      ) {
+        const override = yield* applyRequesterDirectExecutionOverride({
+          workflow,
+          sourceSessionID,
+          message,
+        }).pipe(
+          Effect.catchCause((cause) =>
+            Effect.succeed({
+              applied: false,
+              message: `Requester direct-execution override failed: ${errorFromCause(cause)}`,
+            }),
+          ),
+        )
+        yield* updateIntervention(workflow.id, id, {
+          response: override.message,
+          status: override.applied ? "acked" : "failed",
+        }).pipe(Effect.ignore)
+        yield* notifyMainPM(
+          workflow.id,
+          `Requester direct-execution override ${override.applied ? "applied" : "failed"}: ${override.message}`,
+        ).pipe(Effect.ignore)
+        return yield* publishUpdated(workflow.id)
+      }
       if (timing === "interrupt") {
         yield* cancelWorkflowRuns(workflow.id).pipe(Effect.ignore)
         for (const item of (yield* milestones(workflow.id)).filter((milestone) => interruptedMilestone(milestone.status))) {
@@ -8289,30 +13479,134 @@ export const layer: Layer.Layer<
       if (!workflowAutorunEnabled()) {
         return yield* publishUpdated(workflow.id)
       }
-      const jobID = `${workflow.id}:${id}`
-      yield* background.start({
-        id: jobID,
-        type: "workflow.intervention",
-        title: `${workflow.title} requester intervention`,
-        metadata: { workflowID: workflow.id },
-        run: deliverIntervention(workflow.id, id, jobID).pipe(
-          Effect.catchCause((cause) =>
-            updateIntervention(workflow.id, id, {
-              response: errorFromCause(cause),
-              status: "failed",
-            }).pipe(Effect.asVoid),
-          ),
-          Effect.as("workflow intervention delivered"),
-        ),
-      })
+      yield* startInterventionDelivery(workflow, id).pipe(Effect.ignore)
       return yield* publishUpdated(workflow.id)
+    })
+
+    const dispatchMessageSend = Effect.fn("Workflow.dispatchMessageSend")(function* (
+      input: WorkflowMessageSendCommand,
+    ): Effect.Effect<WorkflowMessageSendResult> {
+      yield* InstanceState.get(initState)
+      const workflow = yield* get(input.workflowID)
+      const sourceRole = yield* workflowToolCommandSourceRole(workflow, input.sourceSessionID)
+      if (!sourceRole) {
+        return {
+          workflowID: workflow.id,
+          applied: false,
+          kind: input.kind,
+          message: `Session ${input.sourceSessionID} is not a member of workflow ${workflow.id}.`,
+          rejection: {
+            code: "not_authorized",
+            reason: "Only workflow member sessions can send runtime workflow messages.",
+          },
+        }
+      }
+      if (input.kind !== "intervention" && input.kind !== "handoff") {
+        return {
+          workflowID: workflow.id,
+          applied: false,
+          kind: input.kind,
+          message: "Runtime delivery is currently available for intervention and handoff messages only.",
+          rejection: {
+            code: "precondition_failed",
+            reason: "Use workflow_message inbox/answer for consultation messages until the unified lifecycle lands.",
+          },
+        }
+      }
+      const attachments = (input.attachments ?? []).map((item) => item.trim()).filter(Boolean)
+      const invalidAttachment = attachments.find(workflowMessageAttachmentInvalid)
+      if (input.kind === "handoff" && (attachments.length === 0 || invalidAttachment)) {
+        return {
+          workflowID: workflow.id,
+          applied: false,
+          kind: input.kind,
+          message: attachments.length === 0
+            ? "Workflow handoff delivery requires attachments."
+            : `Workflow handoff attachment is invalid: ${invalidAttachment}.`,
+          rejection: {
+            code: "precondition_failed",
+            reason: attachments.length === 0
+              ? "handoff requires at least one workflow-relative artifact path."
+              : "handoff attachments must be relative workflow artifact paths and cannot use absolute paths or '..'.",
+          },
+        }
+      }
+      const message = workflowMessageWithAttachments(input.message.trim(), attachments)
+      const interventionResult = yield* intervene({
+        workflowID: workflow.id,
+        sourceSessionID: input.sourceSessionID,
+        targetRole: input.targetRole,
+        targetSpecialty: input.targetSpecialty,
+        targetSessionID: input.targetSessionID,
+        timing: input.timing,
+        message,
+      }).pipe(
+        Effect.map(() => ({ ok: true as const })),
+        Effect.catch((error) =>
+          Effect.succeed({
+            ok: false as const,
+            message: error instanceof globalThis.Error ? error.message : String(error),
+          }),
+        ),
+      )
+      if (!interventionResult.ok) {
+        return {
+          workflowID: workflow.id,
+          applied: false,
+          kind: input.kind,
+          message: `Workflow intervention delivery was not queued: ${interventionResult.message}`,
+          rejection: {
+            code: "precondition_failed",
+            reason: interventionResult.message,
+          },
+        }
+      }
+      const row = Database.use((db) =>
+        db
+          .select()
+          .from(WorkflowInterventionTable)
+          .where(
+            and(
+              eq(WorkflowInterventionTable.workflow_id, workflow.id),
+              eq(WorkflowInterventionTable.from_session_id, input.sourceSessionID),
+              eq(WorkflowInterventionTable.message, message),
+            ),
+          )
+          .orderBy(asc(WorkflowInterventionTable.time_created))
+          .all()
+          .at(-1),
+      )
+      if (!row) {
+        return {
+          workflowID: workflow.id,
+          applied: false,
+          kind: input.kind,
+          message: "Workflow intervention delivery did not create a tracked message.",
+          rejection: {
+            code: "precondition_failed",
+            reason: "The workflow runtime accepted the request but no intervention row was found.",
+          },
+        }
+      }
+      return {
+        workflowID: workflow.id,
+        applied: true,
+        kind: input.kind,
+        message: `${input.kind === "handoff" ? "Handoff" : "Intervention"} ${row.id} was queued for runtime delivery to ${roleSessionTitle(row.target_role)} ${row.target_session_id}.`,
+        messageID: row.id,
+        status: "queued",
+      }
     })
 
     const resume = Effect.fn("Workflow.resume")(function* (workflowID: WorkflowID) {
       yield* InstanceState.get(initState)
+      yield* syncWorkflowStateFromDisk(workflowID).pipe(Effect.ignore)
       const current = yield* get(workflowID)
       if (current.status === "cancelled" || current.status === "completed") return current
+      const doctorBlocked = yield* blockWorkflowResumeForDoctorIssues(workflowID, "workflow resume")
+      if (doctorBlocked) return doctorBlocked
       yield* background.cancel(workflowID).pipe(Effect.ignore)
+      yield* expireWorkflowMessages(workflowID).pipe(Effect.ignore)
       const items = yield* milestones(workflowID)
       yield* recoverInterruptedProgress(workflowID, items)
       const recoveredItems = yield* milestones(workflowID)
@@ -8329,7 +13623,13 @@ export const layer: Layer.Layer<
         type: "workflow",
         title: workflow.title,
         metadata: { workflowID },
-        run: (shouldRunPlanning ? runPlanning(workflowID) : shouldContinuePlanning ? continuePlanning(workflowID) : schedule(workflowID)).pipe(
+        run: (
+          shouldRunPlanning
+            ? runPlanning(workflowID)
+            : shouldContinuePlanning
+              ? continuePlanning(workflowID)
+              : schedule(workflowID, { bypassStagedGate: true })
+        ).pipe(
           Effect.delay("10 millis"),
           Effect.catchCause((cause) =>
             Cause.hasInterruptsOnly(cause)
@@ -8361,7 +13661,7 @@ export const layer: Layer.Layer<
       }).pipe(Effect.ignore)
       if (terminalMilestone(current.status) || current.status === "testing") {
         yield* setStatus(workflow.id, "executing", { error: "" }).pipe(Effect.ignore)
-        yield* schedule(workflow.id).pipe(Effect.ignore)
+        yield* schedule(workflow.id, { bypassStagedGate: true }).pipe(Effect.ignore)
         return true
       }
       const workflowJobs = (yield* background.list()).filter(
@@ -8407,6 +13707,9 @@ export const layer: Layer.Layer<
         workflowID,
         workflowToolResumeBlock(input.message ?? "/workflow-continue requested"),
         "/workflow-continue",
+        {
+          sourceSessionID: input.sessionID,
+        },
       ).pipe(Effect.ignore)
       return yield* get(workflowID)
     })
@@ -8425,7 +13728,20 @@ export const layer: Layer.Layer<
       return yield* setStatus(workflowID, "cancelled")
     })
 
-    return Service.of({ start, get, list, graph, updateXml, updateStaffing, intervene, continueFromSession, resume, cancel })
+    return Service.of({
+      start,
+      get,
+      list,
+      doctor,
+      graph,
+      updateXml,
+      updateStaffing,
+      dispatchCommand,
+      intervene,
+      continueFromSession,
+      resume,
+      cancel,
+    })
   }),
 )
 

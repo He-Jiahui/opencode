@@ -737,6 +737,11 @@ export type WorkflowStaffingConfig = {
   expert?: number
 }
 
+export type WorkflowSchedulingConfig = {
+  mode?: "eager" | "staged" | "economical"
+  maxActive?: number
+}
+
 export type WorkflowModelWhitelistItem = {
   providerID: string
   modelID: string
@@ -780,6 +785,7 @@ export type Workflow = {
     | "failed"
     | "cancelled"
   staffing?: WorkflowStaffingConfig
+  scheduling?: WorkflowSchedulingConfig
   model?: {
     providerID: string
     modelID: string
@@ -807,6 +813,8 @@ export type WorkflowMilestone = {
   id: string
   title?: string
   department?: string
+  review?: "required" | "skip"
+  waitingFor?: "pipeline_items" | "staffing" | "scheduling"
   prompt: string
   dependsOn: Array<string>
   status:
@@ -839,6 +847,10 @@ export type WorkflowMember = {
   sessionID: string
   capacity: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
   status: "active" | "paused"
+  availability?: "idle" | "working" | "blocked_waiting"
+  currentFocus?: string
+  blockers?: Array<string>
+  progressNote?: string
   model?: {
     providerID: string
     modelID: string
@@ -864,7 +876,7 @@ export type WorkflowConsultation = {
   timing?: "after-task" | "interrupt" | "temporary-interrupt"
   question: string
   answer: string
-  status: "pending" | "answered" | "failed"
+  status: "pending" | "answered" | "expired" | "failed"
   time: {
     created: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
     updated: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
@@ -881,7 +893,7 @@ export type WorkflowIntervention = {
   message: string
   response?: string
   path: string
-  status: "queued" | "delivered" | "blocked" | "failed"
+  status: "queued" | "delivered" | "acked" | "blocked" | "expired" | "failed"
   time: {
     created: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
     updated: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
@@ -2933,6 +2945,7 @@ export type WorkflowStartInput = {
   agent?: string
   title?: string
   staffing?: WorkflowStaffingConfig
+  scheduling?: WorkflowSchedulingConfig
   modelWhitelist?: WorkflowModelWhitelistConfig
 }
 
@@ -3205,6 +3218,7 @@ export type Workflow7 = {
     | "failed"
     | "cancelled"
   staffing?: WorkflowStaffingConfig
+  scheduling?: WorkflowSchedulingConfig
   model?: {
     providerID: string
     modelID: string
@@ -3232,6 +3246,8 @@ export type WorkflowMilestone1 = {
   id: string
   title?: string
   department?: string
+  review?: "required" | "skip"
+  waitingFor?: "pipeline_items" | "staffing" | "scheduling"
   prompt: string
   dependsOn: Array<string>
   status:
@@ -3264,6 +3280,10 @@ export type WorkflowMember1 = {
   sessionID: string
   capacity: number | "NaN" | "Infinity" | "-Infinity"
   status: "active" | "paused"
+  availability?: "idle" | "working" | "blocked_waiting"
+  currentFocus?: string
+  blockers?: Array<string>
+  progressNote?: string
   model?: {
     providerID: string
     modelID: string
@@ -3289,7 +3309,7 @@ export type WorkflowConsultation1 = {
   timing?: "after-task" | "interrupt" | "temporary-interrupt"
   question: string
   answer: string
-  status: "pending" | "answered" | "failed"
+  status: "pending" | "answered" | "expired" | "failed"
   time: {
     created: number | "NaN" | "Infinity" | "-Infinity"
     updated: number | "NaN" | "Infinity" | "-Infinity"
@@ -3306,7 +3326,7 @@ export type WorkflowIntervention1 = {
   message: string
   response?: string
   path: string
-  status: "queued" | "delivered" | "blocked" | "failed"
+  status: "queued" | "delivered" | "acked" | "blocked" | "expired" | "failed"
   time: {
     created: number | "NaN" | "Infinity" | "-Infinity"
     updated: number | "NaN" | "Infinity" | "-Infinity"
@@ -11661,8 +11681,10 @@ export type WorkflowUpdateStaffingResponse = WorkflowUpdateStaffingResponses[key
 export type WorkflowInterveneData = {
   body?: {
     message: string
+    sourceSessionID?: string
     timing?: "after-task" | "interrupt" | "temporary-interrupt"
     targetRole?: "requester" | "main_pm" | "department_pm" | "executor" | "reviewer" | "tester" | "expert"
+    targetSpecialty?: string
     targetSessionID?: string
   }
   path: {

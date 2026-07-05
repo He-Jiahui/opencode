@@ -4,6 +4,7 @@ import appPlugin from "@opencode-ai/app/vite"
 import * as fs from "node:fs/promises"
 
 const OPENCODE_SERVER_DIST = "../opencode/dist/node"
+const OPENCODE_SERVER_MIGRATION = "../opencode/migration"
 
 const channel = (() => {
   const raw = process.env.OPENCODE_CHANNEL
@@ -60,6 +61,8 @@ export default defineConfig({
       {
         name: "opencode:copy-server-assets",
         async writeBundle() {
+          await fs.rm("./out/migration", { recursive: true, force: true })
+          await fs.cp(OPENCODE_SERVER_MIGRATION, "./out/migration", { recursive: true })
           for (const l of await fs.readdir(OPENCODE_SERVER_DIST)) {
             if (!l.endsWith(".wasm")) continue
             await fs.writeFile(`./out/main/chunks/${l}`, await fs.readFile(`${OPENCODE_SERVER_DIST}/${l}`))

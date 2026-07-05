@@ -12,6 +12,38 @@ export function readyMilestones(workflow: WorkflowDefinition, states: WorkflowMi
   )
 }
 
+export function dependencyBlockedMilestones(workflow: WorkflowDefinition, states: WorkflowMilestoneState[]) {
+  const stateByID = new Map(states.map((state) => [state.id, state.status]))
+  const blocked = new Set<WorkflowMilestoneID>()
+  while (true) {
+    const newlyBlocked = workflow.milestones.filter(
+      (milestone) =>
+        (stateByID.get(milestone.id) ?? "pending") === "pending" &&
+        !blocked.has(milestone.id) &&
+        milestone.dependsOn.some((id) => {
+          const status = stateByID.get(id)
+          return status === "failed" || status === "cancelled" || blocked.has(id)
+        }),
+    )
+    if (newlyBlocked.length === 0) break
+    newlyBlocked.forEach((milestone) => blocked.add(milestone.id))
+  }
+  return workflow.milestones.filter((milestone) => blocked.has(milestone.id))
+}
+
+export function dependencyUnblockedMilestones(workflow: WorkflowDefinition, states: WorkflowMilestoneState[]) {
+  const stateByID = new Map(states.map((state) => [state.id, state.status]))
+  return workflow.milestones.filter(
+    (milestone) =>
+      stateByID.get(milestone.id) === "blocked" &&
+      milestone.dependsOn.length > 0 &&
+      milestone.dependsOn.every((id) => {
+        const status = stateByID.get(id)
+        return status === "approved" || status === "done" || status === "completed" || status === "skipped"
+      }),
+  )
+}
+
 export function nextWorkflowStatus(workflow: WorkflowDefinition, states: WorkflowMilestoneState[]): WorkflowStatus {
   const stateByID = new Map(states.map((state) => [state.id, state.status]))
   const statuses = workflow.milestones.map((milestone) => stateByID.get(milestone.id) ?? "pending")

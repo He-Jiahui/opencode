@@ -12,6 +12,7 @@ import type {
   WorkflowMemberInfo,
   WorkflowMilestoneInfo,
   WorkflowModelWhitelistConfig,
+  WorkflowSchedulingConfig,
   WorkflowSessionRef,
 } from "./schema"
 import { WorkflowID, WorkflowMilestoneID } from "./schema"
@@ -37,6 +38,7 @@ export const WorkflowTable = sqliteTable(
     xml: text().notNull(),
     status: text().$type<WorkflowInfo["status"]>().notNull(),
     staffing: text({ mode: "json" }).$type<WorkflowInfo["staffing"]>(),
+    scheduling: text({ mode: "json" }).$type<WorkflowSchedulingConfig>(),
     model: text({ mode: "json" }).$type<WorkflowInfo["model"]>(),
     model_whitelist: text({ mode: "json" }).$type<WorkflowModelWhitelistConfig>(),
     agent: text(),
@@ -69,6 +71,10 @@ export const WorkflowMemberTable = sqliteTable(
       .references(() => SessionTable.id, { onDelete: "cascade" }),
     capacity: integer().notNull().default(1),
     status: text().$type<WorkflowMemberInfo["status"]>().notNull(),
+    availability: text().$type<WorkflowMemberInfo["availability"]>(),
+    current_focus: text(),
+    blockers: text({ mode: "json" }).$type<ReadonlyArray<string>>(),
+    progress_note: text(),
     model: text({ mode: "json" }).$type<WorkflowInfo["model"]>(),
     model_weight: integer(),
     model_cache_until: integer(),
@@ -91,6 +97,8 @@ export const WorkflowMilestoneTable = sqliteTable(
     id: text().$type<WorkflowMilestoneID>().notNull(),
     title: text(),
     department: text(),
+    review: text().$type<WorkflowMilestoneInfo["review"]>(),
+    waiting_for: text().$type<WorkflowMilestoneInfo["waitingFor"]>(),
     prompt: text().notNull(),
     depends_on: text({ mode: "json" }).notNull().$type<ReadonlyArray<WorkflowMilestoneID>>(),
     status: text().$type<WorkflowMilestoneInfo["status"]>().notNull(),
@@ -183,5 +191,42 @@ export const WorkflowInterventionTable = sqliteTable(
     primaryKey({ columns: [table.workflow_id, table.id] }),
     index("workflow_intervention_workflow_idx").on(table.workflow_id),
     index("workflow_intervention_target_session_idx").on(table.target_session_id),
+  ],
+)
+
+export const WorkflowMessageTable = sqliteTable(
+  "workflow_message",
+  {
+    workflow_id: text()
+      .$type<WorkflowID>()
+      .notNull()
+      .references(() => WorkflowTable.id, { onDelete: "cascade" }),
+    id: text().notNull(),
+    kind: text().notNull(),
+    from_session_id: text()
+      .$type<SessionID>()
+      .references(() => SessionTable.id, { onDelete: "set null" }),
+    from_role: text().$type<WorkflowSessionRef["role"]>(),
+    to_session_id: text()
+      .$type<SessionID>()
+      .references(() => SessionTable.id, { onDelete: "set null" }),
+    to_role: text().$type<WorkflowSessionRef["role"]>(),
+    milestone_id: text().$type<WorkflowMilestoneID>(),
+    timing: text().$type<WorkflowConsultationInfo["timing"]>(),
+    body: text().notNull(),
+    response: text(),
+    attachments: text({ mode: "json" }).$type<ReadonlyArray<string>>(),
+    status: text().notNull(),
+    time_created: integer().notNull(),
+    time_delivered: integer(),
+    time_closed: integer(),
+    time_updated: integer().notNull(),
+  },
+  (table) => [
+    primaryKey({ columns: [table.workflow_id, table.id] }),
+    index("workflow_message_workflow_idx").on(table.workflow_id),
+    index("workflow_message_to_session_idx").on(table.to_session_id),
+    index("workflow_message_from_session_idx").on(table.from_session_id),
+    index("workflow_message_workflow_status_idx").on(table.workflow_id, table.status),
   ],
 )

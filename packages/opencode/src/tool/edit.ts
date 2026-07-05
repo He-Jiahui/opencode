@@ -16,6 +16,7 @@ import { Format } from "../format"
 import { InstanceState } from "@/effect/instance-state"
 import { Snapshot } from "@/snapshot"
 import { assertExternalDirectoryEffect } from "./external-directory"
+import { assertWorkflowArtifactWritableByAgent } from "./workflow-ownership"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import * as Bom from "@/util/bom"
 
@@ -81,6 +82,9 @@ export const EditTool = Tool.define(
             ? params.filePath
             : path.join(instance.directory, params.filePath)
           yield* assertExternalDirectoryEffect(ctx, filePath)
+          yield* Effect.promise(() =>
+            assertWorkflowArtifactWritableByAgent({ instanceDirectory: instance.directory, filePath }),
+          )
 
           let diff = ""
           let contentOld = ""

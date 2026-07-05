@@ -12,6 +12,7 @@ import { Database } from "@opencode-ai/core/database/database"
 import { makeRuntime } from "@opencode-ai/core/effect/runtime"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { EventV2 } from "@opencode-ai/core/event"
+import { SessionProjector } from "@opencode-ai/core/session/projector"
 import { SessionV2 } from "@opencode-ai/core/session"
 import { SessionExecution } from "@opencode-ai/core/session/execution"
 
@@ -27,7 +28,7 @@ import { inArray } from "drizzle-orm"
 import { lt } from "drizzle-orm"
 import { or } from "drizzle-orm"
 import type { SQL } from "drizzle-orm"
-import { PartTable, SessionTable } from "@opencode-ai/core/session/sql"
+import { MessageTable, PartTable, SessionTable } from "@opencode-ai/core/session/sql"
 import { ProjectTable } from "@opencode-ai/core/project/sql"
 import { MessageV2 } from "./message-v2"
 import type { InstanceContext } from "../project/instance-context"
@@ -144,6 +145,27 @@ export function toRow(info: Info) {
     time_updated: info.time.updated,
     time_compacting: info.time.compacting,
     time_archived: info.time.archived,
+  }
+}
+
+function messageRow(info: SessionV1.Info): typeof MessageTable.$inferInsert {
+  const { id: _, sessionID: __, ...data } = info
+  return {
+    id: info.id,
+    session_id: info.sessionID,
+    time_created: info.time.created,
+    data,
+  }
+}
+
+function partRow(part: SessionV1.Part, time: number): typeof PartTable.$inferInsert {
+  const { id: _, sessionID: __, messageID: ___, ...data } = part
+  return {
+    id: part.id,
+    session_id: part.sessionID,
+    message_id: part.messageID,
+    time_created: time,
+    data,
   }
 }
 
@@ -575,7 +597,10 @@ export const layer: Layer.Layer<
       }
       yield* Effect.logInfo("created", result)
 
-      yield* events.publish(SessionV1.Event.Created, { sessionID: result.id, info: result })
+      yield* events.publish(SessionV1.Event.Created, { sessionID: result.id, info: result }, {
+        commit: () =>
+          db.insert(SessionTable).values(toRow(result)).onConflictDoNothing().run().pipe(Effect.orDie),
+      })
 
       return result
     })
@@ -671,16 +696,49 @@ export const layer: Layer.Layer<
 
     const updateMessage = <T extends SessionV1.Info>(msg: T): Effect.Effect<T> =>
       Effect.gen(function* () {
-        yield* events.publish(SessionV1.Event.MessageUpdated, { sessionID: msg.sessionID, info: msg })
+        yield* events.publish(SessionV1.Event.MessageUpdated, { sessionID: msg.sessionID, info: msg }, {
+          commit: () =>
+            db
+              .insert(MessageTable)
+              .values(messageRow(msg))
+              .onConflictDoUpdate({
+                target: MessageTable.id,
+                set: {
+                  session_id: msg.sessionID,
+                  time_created: msg.time.created,
+                  data: messageRow(msg).data,
+                },
+              })
+              .run()
+              .pipe(Effect.orDie),
+        })
         return msg
       }).pipe(Effect.withSpan("Session.updateMessage"))
 
     const updatePart = <T extends SessionV1.Part>(part: T): Effect.Effect<T> =>
       Effect.gen(function* () {
+        const time = Date.now()
+        const next = structuredClone(part)
         yield* events.publish(SessionV1.Event.PartUpdated, {
-          sessionID: part.sessionID,
-          part: structuredClone(part),
-          time: Date.now(),
+          sessionID: next.sessionID,
+          part: next,
+          time,
+        }, {
+          commit: () =>
+            db
+              .insert(PartTable)
+              .values(partRow(next, time))
+              .onConflictDoUpdate({
+                target: PartTable.id,
+                set: {
+                  message_id: next.messageID,
+                  session_id: next.sessionID,
+                  time_created: time,
+                  data: partRow(next, time).data,
+                },
+              })
+              .run()
+              .pipe(Effect.orDie),
         })
         return part
       }).pipe(Effect.withSpan("Session.updatePart"))
@@ -969,10 +1027,11 @@ export const layer: Layer.Layer<
   }),
 )
 
-export const defaultLayer = layer.pipe(
+export const defaultLayer = Layer.mergeAll(layer, SessionProjector.layer).pipe(
   Layer.provide(BackgroundJob.defaultLayer),
   Layer.provide(Database.defaultLayer),
-  Layer.provide(EventV2Bridge.defaultLayer),
+  Layer.provide(EventV2Bridge.layer),
+  Layer.provide(EventV2.defaultLayer),
   Layer.provide(SessionExecution.noopLayer),
   Layer.provide(SessionV2.defaultLayer),
   Layer.provide(RuntimeFlags.defaultLayer),

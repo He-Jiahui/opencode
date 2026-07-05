@@ -80,11 +80,16 @@ const readText = (filepath: string) => Effect.promise(() => fs.readFile(filepath
 const writeText = (filepath: string, content: string) => Effect.promise(() => fs.writeFile(filepath, content, "utf-8"))
 const makeDir = (dir: string) => Effect.promise(() => fs.mkdir(dir, { recursive: true }))
 
-const expectFailure = <A, E, R>(effect: Effect.Effect<A, E, R>, message?: string) =>
+const expectFailure = <A, E, R>(effect: Effect.Effect<A, E, R>, message?: string | string[]) =>
   Effect.gen(function* () {
     const exit = yield* Effect.exit(effect)
     expect(Exit.isFailure(exit)).toBe(true)
-    if (Exit.isFailure(exit) && message) expect(Cause.pretty(exit.cause)).toContain(message)
+    if (Exit.isFailure(exit) && message) {
+      const text = Cause.pretty(exit.cause)
+      for (const item of Array.isArray(message) ? message : [message]) {
+        expect(text).toContain(item)
+      }
+    }
   })
 
 const expectReadFailure = (filepath: string) => expectFailure(readText(filepath))
@@ -157,6 +162,48 @@ describe("tool.apply_patch freeform", () => {
         yield* expectReadFailure(deletePath)
       }),
     { git: true },
+  )
+
+  it.instance("rejects patches to workflow engine-owned artifacts", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const { ctx } = makeCtx()
+      const root = path.join(test.directory, ".opencode", "workflows", "wfl_test")
+      yield* makeDir(root)
+      yield* writeText(
+        path.join(root, "manifest.json"),
+        JSON.stringify({
+          schema: 2,
+          workflowID: "wfl_test",
+          ownership: {
+            "progress.md": "engine",
+            "work/**": "agent",
+          },
+        }),
+      )
+      yield* writeText(path.join(root, "progress.md"), "engine view\n")
+
+      yield* expectFailure(
+        execute(
+          {
+            patchText:
+              "*** Begin Patch\n*** Update File: .opencode/workflows/wfl_test/progress.md\n@@\n-engine view\n+manual edit\n*** End Patch",
+          },
+          ctx,
+        ),
+        ["owned by engine", "Use the workflow tool"],
+      )
+      expect(yield* readText(path.join(root, "progress.md"))).toBe("engine view\n")
+
+      const result = yield* execute(
+        {
+          patchText: "*** Begin Patch\n*** Add File: .opencode/workflows/wfl_test/work/note.md\n+agent work\n*** End Patch",
+        },
+        ctx,
+      )
+      expect(result.output).toContain("Success")
+      expect(yield* readText(path.join(root, "work", "note.md"))).toBe("agent work\n")
+    }),
   )
 
   it.instance(

@@ -281,7 +281,7 @@ export function createRoutes(
       fenceLayer,
       cors(corsOptions),
       Bus.layer,
-      Workflow.layer,
+      Workflow.defaultLayer,
       MoveSession.defaultLayer,
       HttpServer.layerServices,
     ]),

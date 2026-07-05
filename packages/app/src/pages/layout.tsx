@@ -1004,7 +1004,10 @@ export default function Layout(props: ParentProps) {
     setStore("session", (items) => items.map((item) => (item.id === session.id ? { ...item, title } : item)))
   }
 
-  const sessionPinned = (session: Session) => store.pinnedSession[`${pathKey(session.directory)}:${session.id}`] === true
+  function sessionPinned(session: Session) {
+    return store.pinnedSession[`${pathKey(session.directory)}:${session.id}`] === true
+  }
+
   const togglePinSession = (session: Session) => {
     const key = `${pathKey(session.directory)}:${session.id}`
     setStore("pinnedSession", key, !store.pinnedSession[key])

@@ -95,6 +95,37 @@ const onceBus = Effect.fn("EditToolTest.onceBus")(function* (def: typeof Watcher
 
 describe("tool.edit", () => {
   describe("creating new files", () => {
+    it.instance("rejects edits to workflow engine-owned artifacts", () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        const root = path.join(test.directory, ".opencode", "workflows", "wfl_test")
+        yield* Effect.promise(() => fs.mkdir(root, { recursive: true }))
+        yield* Effect.promise(() =>
+          fs.writeFile(
+            path.join(root, "manifest.json"),
+            JSON.stringify({
+              schema: 2,
+              workflowID: "wfl_test",
+              ownership: {
+                "progress.md": "engine",
+                "work/**": "agent",
+              },
+            }),
+          ),
+        )
+        yield* Effect.promise(() => fs.writeFile(path.join(root, "progress.md"), "engine view"))
+
+        const rejection = (yield* fail({ filePath: path.join(root, "progress.md"), oldString: "engine", newString: "manual" })).message
+        expect(rejection).toContain("owned by engine")
+        expect(rejection).toContain("Use the workflow tool")
+        expect(yield* loadRaw(path.join(root, "progress.md"))).toBe("engine view")
+
+        const result = yield* run({ filePath: path.join(root, "work", "note.md"), oldString: "", newString: "agent work" })
+        expect(result.output).toContain("Edit applied successfully")
+        expect(yield* loadRaw(path.join(root, "work", "note.md"))).toBe("agent work")
+      }),
+    )
+
     it.instance("creates new file when oldString is empty", () =>
       Effect.gen(function* () {
         const test = yield* TestInstance

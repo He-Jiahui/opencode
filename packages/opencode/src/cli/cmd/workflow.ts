@@ -18,6 +18,7 @@ export const WorkflowCommand = cmd({
       .command(WorkflowListCommand)
       .command(WorkflowStatusCommand)
       .command(WorkflowGraphCommand)
+      .command(WorkflowDoctorCommand)
       .command(WorkflowResumeCommand)
       .command(WorkflowCancelCommand)
       .demandCommand(),
@@ -155,6 +156,56 @@ export const WorkflowGraphCommand = effectCmd({
     }
     for (const edge of graph.edges) {
       UI.println(`  ${edge.from} -> ${edge.to}`)
+    }
+  }),
+})
+
+export const WorkflowDoctorCommand = effectCmd({
+  command: "doctor [workflowID]",
+  describe: "diagnose workflow persistence and dispatch state",
+  builder: (yargs) =>
+    yargs
+      .positional("workflowID", {
+        describe: "workflow id",
+        type: "string",
+      })
+      .option("format", {
+        describe: "output format",
+        type: "string",
+        choices: ["text", "json"],
+        default: "text",
+      })
+      .option("fix", {
+        describe: "rename duplicate workflow directories out of the active workflow set",
+        type: "boolean",
+        default: false,
+      })
+      .option("migrate", {
+        describe: "move legacy workflow directories to the canonical workflow id path before checking",
+        type: "boolean",
+        default: false,
+      }),
+  handler: Effect.fn("Cli.workflow.doctor")(function* (args) {
+    const report = yield* Workflow.Service.use((workflow) =>
+      workflow.doctor({
+        workflowID: args.workflowID ? WorkflowID.make(args.workflowID) : undefined,
+        fix: args.fix,
+        migrate: args.migrate,
+      }),
+    ).pipe(Effect.mapError(workflowCliError))
+    if (args.format === "json") {
+      console.log(JSON.stringify(report, null, 2))
+      return
+    }
+    UI.println(
+      `${report.ok ? UI.Style.TEXT_SUCCESS_BOLD : UI.Style.TEXT_DANGER_BOLD}Workflow doctor checked ${report.checked} workflow${report.checked === 1 ? "" : "s"}: ${
+        report.ok ? "ok" : "issues found"
+      }${UI.Style.TEXT_NORMAL}`,
+    )
+    for (const issue of report.issues) {
+      UI.println(
+        `  [${issue.severity}] ${issue.code}${issue.workflowID ? ` ${issue.workflowID}` : ""}${issue.path ? ` ${issue.path}` : ""}: ${issue.message}`,
+      )
     }
   }),
 })

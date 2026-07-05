@@ -1,6 +1,8 @@
 import { describe, expect, test } from "bun:test"
 
 import {
+  dependencyBlockedMilestones,
+  dependencyUnblockedMilestones,
   nextWorkflowStatus,
   parseWorkflowXml,
   readyMilestones,
@@ -61,12 +63,82 @@ describe("readyMilestones", () => {
     ).toEqual(["finish"])
   })
 
+  test("allows pipeline item review before other item audits complete", () => {
+    const pipeline = parseWorkflowXml(
+      `
+        <workflow>
+          <ordered>
+            <milestone id="prepare">Prepare shared inputs</milestone>
+            <pipeline items="work/shared/audit-tracks.json">
+              <milestone id="audit">Audit {item.id}</milestone>
+              <milestone id="review" depends="audit">Review {item.id}</milestone>
+            </pipeline>
+            <milestone id="finish">Finish synthesis</milestone>
+          </ordered>
+        </workflow>
+      `,
+      {
+        readPipelineItems: () =>
+          Array.from({ length: 13 }, (_, index) => ({
+            id: `track-${String(index + 1).padStart(2, "0")}`,
+          })),
+      },
+    )
+
+    expect(pipeline.milestones.filter((milestone) => String(milestone.id).startsWith("audit@"))).toHaveLength(13)
+    expect(pipeline.milestones.filter((milestone) => String(milestone.id).startsWith("review@"))).toHaveLength(13)
+    expect(
+      readyMilestones(pipeline, [
+        { id: id("prepare"), status: "done" },
+        { id: id("audit@track-01"), status: "done" },
+      ]).map((milestone) => String(milestone.id)),
+    ).toEqual([
+      "review@track-01",
+      "audit@track-02",
+      "audit@track-03",
+      "audit@track-04",
+      "audit@track-05",
+      "audit@track-06",
+      "audit@track-07",
+      "audit@track-08",
+      "audit@track-09",
+      "audit@track-10",
+      "audit@track-11",
+      "audit@track-12",
+      "audit@track-13",
+    ])
+  })
+
   test("treats skipped dependencies as satisfied", () => {
     expect(
       readyMilestones(workflow, [
         { id: id("plan"), status: "completed" },
         { id: id("api"), status: "skipped" },
         { id: id("tests"), status: "completed" },
+      ]).map((milestone) => String(milestone.id)),
+    ).toEqual(["finish"])
+  })
+})
+
+describe("dependencyBlockedMilestones", () => {
+  test("returns pending transitive dependents of failed dependencies", () => {
+    expect(
+      dependencyBlockedMilestones(workflow, [
+        { id: id("plan"), status: "done" },
+        { id: id("api"), status: "failed" },
+        { id: id("tests"), status: "pending" },
+        { id: id("finish"), status: "pending" },
+      ]).map((milestone) => String(milestone.id)),
+    ).toEqual(["finish"])
+  })
+
+  test("returns dependency-blocked milestones that can run after a force skip", () => {
+    expect(
+      dependencyUnblockedMilestones(workflow, [
+        { id: id("plan"), status: "done" },
+        { id: id("api"), status: "skipped" },
+        { id: id("tests"), status: "done" },
+        { id: id("finish"), status: "blocked" },
       ]).map((milestone) => String(milestone.id)),
     ).toEqual(["finish"])
   })

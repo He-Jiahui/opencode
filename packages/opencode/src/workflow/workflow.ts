@@ -328,6 +328,25 @@ WHERE NOT EXISTS (SELECT 1 FROM __drizzle_migrations WHERE name = '2026052712000
 `
 let schemaEnsuredClient: unknown
 
+function workflowSchemaReady(client: ReturnType<typeof Database.Client>["$client"]) {
+  const hasTable = (table: string) =>
+    !!client.prepare("SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?").get(table)
+  const hasColumn = (table: string, column: string) =>
+    !!client.prepare(`SELECT 1 FROM pragma_table_info(?) WHERE name = ?`).get(table, column)
+  return (
+    ["workflow", "workflow_member", "workflow_milestone", "workflow_edge", "workflow_consultation", "workflow_intervention", "workflow_message"].every(
+      hasTable,
+    ) &&
+    [
+      ["workflow", "scheduling"],
+      ["workflow", "model_whitelist"],
+      ["workflow_member", "availability"],
+      ["workflow_milestone", "session"],
+      ["workflow_intervention", "status"],
+    ].every((item) => hasColumn(item[0], item[1]))
+  )
+}
+
 function ensureColumn(table: string, column: string, sql: string) {
   const client = Database.Client().$client
   const existing = client.prepare(`SELECT 1 FROM pragma_table_info(?) WHERE name = ?`).get(table, column)
@@ -781,6 +800,15 @@ function recordWorkflowGraphDiagnostic(graph: WorkflowGraph) {
   }
 }
 
+function recordWorkflowStartDiagnostic(record: Record<string, unknown>) {
+  const dir = process.env.OPENCODE_SIDECAR_DIAGNOSTIC_DIR
+  if (!dir) return
+  try {
+    mkdirSync(dir, { recursive: true })
+    appendFileSync(path.join(dir, "workflow-start.jsonl"), JSON.stringify({ at: new Date().toISOString(), ...record }) + "\n")
+  } catch {}
+}
+
 function countGraphValues(values: string[]) {
   return values.reduce<Record<string, number>>((acc, value) => {
     acc[value] = (acc[value] ?? 0) + 1
@@ -1201,7 +1229,7 @@ function workflowOwnershipPatternScore(pattern: string) {
 
 function ensureSchema() {
   const client = Database.Client().$client
-  if (schemaEnsuredClient === client) return
+  if (schemaEnsuredClient === client && workflowSchemaReady(client)) return
   client.exec(ensureSchemaSql)
   const rootSession = client
     .prepare("SELECT [notnull] FROM pragma_table_info('workflow') WHERE name = 'root_session_id'")
@@ -3037,6 +3065,10 @@ function errorFromCause(cause: Cause.Cause<unknown>) {
   return error instanceof globalThis.Error ? error.message : String(error)
 }
 
+function logWorkflowFailure(scope: string, workflowID: WorkflowID, cause: Cause.Cause<unknown>) {
+  console.warn(`[workflow:${scope}]`, JSON.stringify({ workflowID, error: errorFromCause(cause), cause: Cause.pretty(cause) }))
+}
+
 function workflowCommandDurabilityFailure(cause: Cause.Cause<unknown>) {
   const message = errorFromCause(cause)
   return (
@@ -3828,6 +3860,31 @@ function graphFrom(
     interventions: interventions.map(compactGraphIntervention),
     nodes,
     edges: graphEdges,
+  }
+}
+
+function fallbackGraph(info: WorkflowInfo, reason: string): WorkflowGraph {
+  return {
+    workflow: {
+      ...info,
+      error: info.error ?? `Workflow graph degraded: ${reason}`,
+    },
+    milestones: [],
+    members: [],
+    consultations: [],
+    interventions: [],
+    nodes: [
+      {
+        id: info.id,
+        type: "workflow" as const,
+        title: info.title,
+        role: "requester" as const,
+        status: info.status,
+        ...(info.rootSessionID ? { sessionID: info.rootSessionID } : {}),
+        summary: `Workflow graph degraded: ${reason}`,
+      },
+    ],
+    edges: [],
   }
 }
 
@@ -6656,6 +6713,19 @@ export const layer: Layer.Layer<
       return results.some(Boolean)
     })
 
+    let workflowStateSyncRunning = false
+    const queueWorkflowStateSync = Effect.fn("Workflow.queueWorkflowStateSync")(function* () {
+      if (workflowStateSyncRunning) return
+      workflowStateSyncRunning = true
+      yield* syncWorkflowStatesFromDisk().pipe(
+        Effect.ensuring(Effect.sync(() => {
+          workflowStateSyncRunning = false
+        })),
+        Effect.ignore,
+        Effect.forkDetach({ startImmediately: true }),
+      )
+    })
+
     const publishUpdated = Effect.fn("Workflow.publishUpdated")(function* (workflowID: WorkflowID) {
       const info = yield* get(workflowID)
       yield* writeWorkflowState(workflowID, info).pipe(Effect.ignore)
@@ -6664,7 +6734,7 @@ export const layer: Layer.Layer<
       return info
     })
 
-    const ensureAuditablePath = Effect.fn("Workflow.ensureAuditablePath")(function* (workflow: WorkflowInfo) {
+    const repairAuditablePath = Effect.fn("Workflow.repairAuditablePath")(function* (workflow: WorkflowInfo) {
       if (!isLegacyWorkflowPath(workflow)) return workflow
       const ctx = yield* InstanceState.context
       const oldPath = workflow.path
@@ -6709,19 +6779,40 @@ export const layer: Layer.Layer<
       return { ...workflow, path: nextPath, testPath: rewrite(workflow.testPath), time: { ...workflow.time, updated: now } }
     })
 
+    const queueAuditablePathRepair = Effect.fn("Workflow.queueAuditablePathRepair")(function* (workflow: WorkflowInfo) {
+      if (!isLegacyWorkflowPath(workflow)) return
+      yield* background.start({
+        id: `${workflow.id}:auditable-path`,
+        type: "workflow.artifacts",
+        title: `${workflow.title} path migration`,
+        metadata: { workflowID: workflow.id, reason: "auditable-path" },
+        run: repairAuditablePath(workflow).pipe(Effect.as("workflow path migrated")),
+      }).pipe(Effect.ignore)
+    })
+
+    const ensureAuditablePath = Effect.fn("Workflow.ensureAuditablePath")(function* (
+      workflow: WorkflowInfo,
+      options?: { background?: boolean },
+    ) {
+      if (!options?.background) return yield* repairAuditablePath(workflow)
+      yield* queueAuditablePathRepair(workflow)
+      return workflow
+    })
+
     const get = Effect.fn("Workflow.get")(function* (workflowID: WorkflowID) {
       const row = Database.use((db) => db.select().from(WorkflowTable).where(eq(WorkflowTable.id, workflowID)).get())
-      if (row) return yield* ensureAuditablePath(toInfo(row))
+      if (row) return yield* ensureAuditablePath(toInfo(row), { background: true })
       yield* syncWorkflowStatesFromDisk().pipe(Effect.ignore)
       const restored = Database.use((db) => db.select().from(WorkflowTable).where(eq(WorkflowTable.id, workflowID)).get())
       if (!restored) return yield* new Error({ message: `Workflow not found: ${workflowID}` })
-      return yield* ensureAuditablePath(toInfo(restored))
+      return yield* ensureAuditablePath(toInfo(restored), { background: true })
     })
 
     const ensureRequesterSession = Effect.fn("Workflow.ensureRequesterSession")(function* (workflow: WorkflowInfo) {
       if (workflow.rootSessionID) {
         yield* session.setTitle({ sessionID: workflow.rootSessionID, title: workflowRequesterTitle(workflow.request) }).pipe(
           Effect.ignore,
+          Effect.forkDetach({ startImmediately: true }),
         )
         return workflow
       }
@@ -6765,7 +6856,7 @@ export const layer: Layer.Layer<
             }),
           ]).pipe(Effect.ignore),
         ),
-      )
+      ).pipe(Effect.ignore, Effect.forkDetach({ startImmediately: true }))
     })
 
     const writeArchiveIndex = Effect.fn("Workflow.writeArchiveIndex")(function* (workflowID: WorkflowID) {
@@ -6891,7 +6982,7 @@ export const layer: Layer.Layer<
 
     const list = Effect.fn("Workflow.list")(function* (input?: ListInput) {
       const ctx = yield* InstanceState.context
-      yield* syncWorkflowStatesFromDisk().pipe(Effect.ignore)
+      yield* queueWorkflowStateSync()
       const rows = Database.use((db) =>
         db
           .select()
@@ -6928,24 +7019,22 @@ export const layer: Layer.Layer<
                 db
                   .select({
                     workflow_id: WorkflowMemberTable.workflow_id,
+                    session_id: WorkflowMemberTable.session_id,
                   })
                   .from(WorkflowMemberTable)
-                  .where(
-                    and(
-                      inArray(WorkflowMemberTable.workflow_id, rows.map((row) => row.id)),
-                      eq(WorkflowMemberTable.session_id, sessionID),
-                    ),
-                  )
+                  .where(inArray(WorkflowMemberTable.workflow_id, rows.map((row) => row.id)))
                   .all(),
-              ).map((row) => row.workflow_id),
+              )
+                .filter((row) => row.session_id === sessionID)
+                .map((row) => row.workflow_id),
             )
       return workflows.filter(
         (workflow) =>
           workflow.rootSessionID === sessionID ||
           workflow.pmSessionID === sessionID ||
           workflow.testerSessionID === sessionID ||
-          memberWorkflowIDs.has(workflow.id) ||
-          milestoneWorkflowIDs.has(workflow.id),
+          milestoneWorkflowIDs.has(workflow.id) ||
+          memberWorkflowIDs.has(workflow.id),
       )
     })
 
@@ -8137,35 +8226,46 @@ export const layer: Layer.Layer<
     })
 
     const graph = Effect.fn("Workflow.graph")(function* (workflowID: WorkflowID) {
-      const ctx = yield* InstanceState.context
       const info = yield* get(workflowID)
-      yield* normalizeWorkflowSessions(info)
-      yield* expireWorkflowMessages(workflowID).pipe(Effect.ignore)
-      const next = yield* get(workflowID)
-      const items = yield* milestones(workflowID)
-      const staff = yield* members(workflowID)
-      const standupIndex = yield* Effect.promise(() =>
-        readFile(projectWorkflowPath(ctx.directory, next, workflowStandupIndexPath()), "utf8"),
-      ).pipe(Effect.catchCause(() => Effect.succeed("")))
-      const edges = Database.use((db) =>
-        db
-          .select()
-          .from(WorkflowEdgeTable)
-          .where(eq(WorkflowEdgeTable.workflow_id, workflowID))
-          .all()
-          .map((row) => row.data ?? { id: `${row.from_id}->${row.to_id}`, from: String(row.from_id), to: String(row.to_id) }),
+      return yield* Effect.gen(function* () {
+        const ctx = yield* InstanceState.context
+        yield* normalizeWorkflowSessions(info).pipe(Effect.ignore)
+        yield* expireWorkflowMessages(workflowID).pipe(Effect.ignore)
+        const next = yield* get(workflowID)
+        const items = yield* milestones(workflowID)
+        const staff = yield* members(workflowID)
+        const standupIndex = yield* Effect.promise(() =>
+          readFile(projectWorkflowPath(ctx.directory, next, workflowStandupIndexPath()), "utf8"),
+        ).pipe(Effect.catchCause(() => Effect.succeed("")))
+        const edges = Database.use((db) =>
+          db
+            .select()
+            .from(WorkflowEdgeTable)
+            .where(eq(WorkflowEdgeTable.workflow_id, workflowID))
+            .all()
+            .map((row) => row.data ?? { id: `${row.from_id}->${row.to_id}`, from: String(row.from_id), to: String(row.to_id) }),
+        )
+        const result = graphFrom(
+          next,
+          items,
+          edges,
+          yield* consultations(workflowID),
+          staff,
+          yield* interventions(workflowID),
+          standupDocsFromIndex(next, standupIndex),
+        )
+        recordWorkflowGraphDiagnostic(result)
+        return result
+      }).pipe(
+        Effect.catchCause((cause) =>
+          Effect.sync(() => {
+            logWorkflowFailure("graph", workflowID, cause)
+            const result = fallbackGraph(info, errorFromCause(cause))
+            recordWorkflowGraphDiagnostic(result)
+            return result
+          }),
+        ),
       )
-      const result = graphFrom(
-        next,
-        items,
-        edges,
-        yield* consultations(workflowID),
-        staff,
-        yield* interventions(workflowID),
-        standupDocsFromIndex(next, standupIndex),
-      )
-      recordWorkflowGraphDiagnostic(result)
-      return result
     })
 
     const setStatus = Effect.fn("Workflow.setStatus")(function* (
@@ -8280,8 +8380,8 @@ export const layer: Layer.Layer<
       xml: string,
       definition: WorkflowDefinition,
       status: WorkflowInfo["status"] = "dispatching",
+      options?: { recordRevision?: boolean; refreshArtifacts?: boolean },
     ) {
-      const ctx = yield* InstanceState.context
       const workflow = yield* get(workflowID)
       const edges = edgesFrom(definition)
       const now = Date.now()
@@ -8352,20 +8452,25 @@ export const layer: Layer.Layer<
           .run()
         }
       })
-      const revisionPath = yield* Effect.promise(() => writeWorkflowGraphRevision(ctx.directory, workflow, xml))
-      if (revisionPath) {
-        yield* appendWorkflowEventRuntimeJournal(workflowID, {
-          action: "graph.revised",
-          path: revisionPath,
-          milestones: rows.length,
-          edges: edges.length,
-        }).pipe(Effect.ignore)
+      if (options?.recordRevision !== false) {
+        const ctx = yield* InstanceState.context
+        const revisionPath = yield* Effect.promise(() => writeWorkflowGraphRevision(ctx.directory, workflow, xml))
+        if (revisionPath) {
+          yield* appendWorkflowEventRuntimeJournal(workflowID, {
+            action: "graph.revised",
+            path: revisionPath,
+            milestones: rows.length,
+            edges: edges.length,
+          }).pipe(Effect.ignore)
+        }
       }
       yield* events.publish(Event.GraphUpdated, { workflowID })
-      yield* writeArchiveIndex(workflowID).pipe(Effect.ignore)
-      yield* writeOrganization(workflowID).pipe(Effect.ignore)
-      yield* writeProgress(workflowID).pipe(Effect.ignore)
-      return yield* graph(workflowID)
+      if (options?.refreshArtifacts !== false) {
+        yield* writeArchiveIndex(workflowID).pipe(Effect.ignore)
+        yield* writeOrganization(workflowID).pipe(Effect.ignore)
+        yield* writeProgress(workflowID).pipe(Effect.ignore)
+      }
+      return yield* get(workflowID)
     })
 
     const refreshWorkflowXml = Effect.fn("Workflow.refreshWorkflowXml")(function* (
@@ -12602,7 +12707,7 @@ export const layer: Layer.Layer<
             GlobalBus.off("event", globalMessageUpdatedHandler)
           }),
         )
-        yield* syncWorkflowStatesFromDisk().pipe(Effect.ignore)
+        yield* queueWorkflowStateSync()
         yield* (yield* bus.subscribe(WorkflowToolCommandEvent)).pipe(
           Stream.runForEach((payload) => handleWorkflowToolCommand(payload.properties).pipe(Effect.ignore)),
           Effect.forkScoped,
@@ -12880,6 +12985,12 @@ export const layer: Layer.Layer<
     )
 
     const start = Effect.fn("Workflow.start")(function* (input: StartInput) {
+      const startTime = Date.now()
+      recordWorkflowStartDiagnostic({
+        phase: "begin",
+        hasSession: !!input.sessionID,
+        promptBytes: byteLength(input.prompt ?? ""),
+      })
       yield* InstanceState.get(initState)
       const ctx = yield* InstanceState.context
       const existing = input.sessionID
@@ -12900,9 +13011,21 @@ export const layer: Layer.Layer<
           )
         : undefined
       if (existing) {
+        recordWorkflowStartDiagnostic({
+          phase: "existing",
+          workflowID: existing.id,
+          legacyPath: isLegacyWorkflowPath(toInfo(existing)),
+          durationMS: Date.now() - startTime,
+        })
         const workflow = yield* ensureRequesterSession(toInfo(existing))
         yield* normalizeWorkflowSessions(workflow).pipe(Effect.ignore)
-        return yield* get(workflow.id)
+        const result = yield* get(workflow.id)
+        recordWorkflowStartDiagnostic({
+          phase: "return-existing",
+          workflowID: result.id,
+          durationMS: Date.now() - startTime,
+        })
+        return result
       }
       const requester =
         input.sessionID !== undefined
@@ -13011,6 +13134,7 @@ export const layer: Layer.Layer<
           ),
         ]),
       )
+      recordWorkflowStartDiagnostic({ phase: "files-written", workflowID: id, durationMS: Date.now() - startTime })
       Database.use((db) =>
         db.insert(WorkflowTable)
           .values({
@@ -13033,28 +13157,41 @@ export const layer: Layer.Layer<
           })
           .run(),
       )
-      yield* saveDefinition(id, info.xml, parseXmlDefinition(info.xml, info), initialStatus)
-      yield* writePrecreatedPlans(info, yield* milestones(id))
-      yield* ensureCompany(info)
-      const mainPM = (yield* members(id)).find((item) => item.role === "main_pm")
-      if (mainPM) yield* setMainProductManagerSession(id, mainPM.sessionID)
-      yield* archiveWorkflowSession({ workflowID: id, sessionID: root.id, role: "requester" }).pipe(Effect.ignore)
-      yield* writeArchiveIndex(id).pipe(Effect.ignore)
-      yield* writeOrganization(id).pipe(Effect.ignore)
-      yield* writeProgress(id).pipe(Effect.ignore)
-      yield* writeInterventionArtifacts(id).pipe(Effect.ignore)
-      yield* writeReferenceIndex(id).pipe(Effect.ignore)
-      yield* ensureStandupIndex(id).pipe(Effect.ignore)
-      const initialized = yield* get(id)
-      yield* writeWorkflowState(id, initialized).pipe(Effect.ignore)
-      yield* events.publish(Event.Created, { workflowID: id, info })
-      if (!workflowAutorunEnabled()) return info
+      recordWorkflowStartDiagnostic({ phase: "row-inserted", workflowID: id, durationMS: Date.now() - startTime })
+      yield* saveDefinition(id, info.xml, parseXmlDefinition(info.xml, info), initialStatus, {
+        recordRevision: false,
+        refreshArtifacts: false,
+      })
+      recordWorkflowStartDiagnostic({ phase: "definition-saved", workflowID: id, durationMS: Date.now() - startTime })
+      yield* events.publish(Event.Created, { workflowID: id, info }).pipe(
+        Effect.ignore,
+        Effect.forkDetach({ startImmediately: true }),
+      )
       yield* background.start({
         id,
         type: "workflow",
         title: info.title,
         metadata: { workflowID: id },
-        run: (initialXml ? schedule(id) : runPlanning(id)).pipe(
+        run: Effect.gen(function* () {
+          const workflow = yield* get(id)
+          yield* writePrecreatedPlans(workflow, yield* milestones(id))
+          yield* ensureCompany(workflow)
+          const mainPM = (yield* members(id)).find((item) => item.role === "main_pm")
+          if (mainPM) yield* setMainProductManagerSession(id, mainPM.sessionID)
+          yield* archiveWorkflowSession({ workflowID: id, sessionID: root.id, role: "requester" }).pipe(Effect.ignore)
+          yield* writeArchiveIndex(id).pipe(Effect.ignore)
+          yield* writeOrganization(id).pipe(Effect.ignore)
+          yield* writeProgress(id).pipe(Effect.ignore)
+          yield* writeInterventionArtifacts(id).pipe(Effect.ignore)
+          yield* writeReferenceIndex(id).pipe(Effect.ignore)
+          yield* ensureStandupIndex(id).pipe(Effect.ignore)
+          const initialized = yield* get(id)
+          yield* writeWorkflowState(id, initialized).pipe(Effect.ignore)
+          yield* publishUpdated(id).pipe(Effect.ignore)
+          if (!workflowAutorunEnabled()) return "workflow initialized"
+          if (initialXml) return yield* schedule(id).pipe(Effect.as("workflow dispatched"))
+          return yield* runPlanning(id).pipe(Effect.as("workflow planning completed"))
+        }).pipe(
           Effect.delay("10 millis"),
           Effect.catchCause((cause) =>
             Cause.hasInterruptsOnly(cause)
@@ -13063,9 +13200,9 @@ export const layer: Layer.Layer<
                   Effect.asVoid,
                 ),
           ),
-          Effect.as(initialXml ? "workflow dispatched" : "workflow planning completed"),
         ),
       })
+      recordWorkflowStartDiagnostic({ phase: "return-new", workflowID: id, durationMS: Date.now() - startTime })
       return info
     })
 
@@ -13077,10 +13214,10 @@ export const layer: Layer.Layer<
         catch: (error) => new Error({ message: error instanceof globalThis.Error ? error.message : String(error) }),
       })
       yield* writeNote(workflowArtifactPath(workflow, "workflow.xml"), input.xml)
-      const result = yield* saveDefinition(input.workflowID, input.xml, definition)
+      yield* saveDefinition(input.workflowID, input.xml, definition)
       yield* writePrecreatedPlans(yield* get(input.workflowID), yield* milestones(input.workflowID))
       yield* publishUpdated(input.workflowID)
-      return result
+      return yield* graph(input.workflowID)
     })
 
     const updateStaffing = Effect.fn("Workflow.updateStaffing")(function* (input: UpdateStaffingInput) {

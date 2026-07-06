@@ -5,13 +5,14 @@ import { Button } from "@opencode-ai/ui/button"
 import { ContextMenu } from "@opencode-ai/ui/context-menu"
 import { HoverCard } from "@opencode-ai/ui/hover-card"
 import { Icon } from "@opencode-ai/ui/icon"
-import { createSortable } from "@thisbeyond/solid-dnd"
+import type { Session } from "@opencode-ai/sdk/v2/client"
 import { useLayout, type LocalProject } from "@/context/layout"
 import { useServerSync } from "@/context/server-sync"
 import { useLanguage } from "@/context/language"
 import { useNotification } from "@/context/notification"
-import { ProjectIcon, SessionItem, type SessionItemProps } from "./sidebar-items"
+import { ProjectIcon, type SessionItemProps } from "./sidebar-items"
 import { displayName, sortedRootSessions } from "./helpers"
+import { sessionTitle } from "@/utils/session-title"
 
 export type ProjectSidebarContext = {
   currentDir: Accessor<string>
@@ -24,6 +25,7 @@ export type ProjectSidebarContext = {
   onProjectFocus: (worktree: string) => void
   onHoverOpenChanged: (worktree: string, hovered: boolean) => void
   navigateToProject: (directory: string) => void
+  navigateToSession: (directory: string, sessionID: string) => void
   openSidebar: () => void
   closeProject: (directory: string) => void
   showEditProjectDialog: (project: LocalProject) => void
@@ -185,6 +187,35 @@ const ProjectTile = (props: {
   )
 }
 
+const ProjectPreviewSessionRow = (props: {
+  project: LocalProject
+  session: Session
+  ctx: ProjectSidebarContext
+}): JSX.Element => {
+  const open = (event: MouseEvent) => {
+    event.preventDefault()
+    event.stopPropagation()
+    props.ctx.onHoverOpenChanged(props.project.worktree, false)
+    props.ctx.navigateToSession(props.session.directory, props.session.id)
+  }
+
+  return (
+    <button
+      type="button"
+      class="flex w-full min-w-0 items-center gap-2 rounded-md px-2 py-1 text-left text-text-strong transition-colors hover:bg-surface-raised-base-hover focus-visible:bg-surface-raised-base-hover focus-visible:outline-none"
+      onMouseDown={(event) => {
+        event.preventDefault()
+        event.stopPropagation()
+      }}
+      onClick={open}
+    >
+      <div class="min-w-0 flex-1">
+        <span class="block min-w-0 truncate text-14-regular">{sessionTitle(props.session.title)}</span>
+      </div>
+    </button>
+  )
+}
+
 const ProjectPreviewPanel = (props: {
   project: LocalProject
   mobile?: boolean
@@ -208,14 +239,10 @@ const ProjectPreviewPanel = (props: {
         fallback={
           <For each={props.projectSessions().slice(0, 2)}>
             {(session) => (
-              <SessionItem
-                {...props.ctx.sessionProps}
+              <ProjectPreviewSessionRow
+                project={props.project}
                 session={session}
-                list={props.projectSessions()}
-                slug={base64Encode(props.project.worktree)}
-                dense
-                showTooltip
-                mobile={props.mobile}
+                ctx={props.ctx}
               />
             )}
           </For>
@@ -234,14 +261,10 @@ const ProjectPreviewPanel = (props: {
                 </div>
                 <For each={sessions().slice(0, 2)}>
                   {(session) => (
-                    <SessionItem
-                      {...props.ctx.sessionProps}
+                    <ProjectPreviewSessionRow
+                      project={props.project}
                       session={session}
-                      list={sessions()}
-                      slug={base64Encode(directory)}
-                      dense
-                      showTooltip
-                      mobile={props.mobile}
+                      ctx={props.ctx}
                     />
                   )}
                 </For>
@@ -276,7 +299,6 @@ export const SortableProject = (props: {
 }): JSX.Element => {
   const serverSync = useServerSync()
   const language = useLanguage()
-  const sortable = createSortable(props.project.worktree)
   const selected = createMemo(() => props.ctx.currentProject()?.worktree === props.project.worktree)
   const workspaces = createMemo(() => props.ctx.workspaceIds(props.project).slice(0, 2))
   const workspaceEnabled = createMemo(() => props.ctx.workspacesEnabled(props.project))
@@ -342,8 +364,7 @@ export const SortableProject = (props: {
   )
 
   return (
-    // @ts-ignore
-    <div use:sortable classList={{ "opacity-30": sortable.isActiveDraggable }}>
+    <div>
       <Show when={preview() && !selected()} fallback={tile()}>
         <HoverCard
           open={!state.suppressHover && hoverOpen() && !state.menu}

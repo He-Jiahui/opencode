@@ -1,13 +1,4 @@
 import { createEffect, createMemo, For, Show, type Accessor, type JSX } from "solid-js"
-import {
-  DragDropProvider,
-  DragDropSensors,
-  DragOverlay,
-  SortableProvider,
-  closestCenter,
-  type DragEvent,
-} from "@thisbeyond/solid-dnd"
-import { ConstrainDragXAxis } from "@/utils/solid-dnd"
 import { IconButton } from "@opencode-ai/ui/icon-button"
 import { Tooltip, TooltipKeybind } from "@opencode-ai/ui/tooltip"
 import { type LocalProject } from "@/context/layout"
@@ -18,13 +9,9 @@ export const SidebarContent = (props: {
   aimMove: (event: MouseEvent) => void
   projects: Accessor<LocalProject[]>
   renderProject: (project: LocalProject) => JSX.Element
-  handleDragStart: (event: unknown) => void
-  handleDragEnd: () => void
-  handleDragOver: (event: DragEvent) => void
   openProjectLabel: JSX.Element
   openProjectKeybind: Accessor<string | undefined>
   onOpenProject: () => void
-  renderProjectOverlay: () => JSX.Element
   settingsLabel: Accessor<string>
   settingsKeybind: Accessor<string | undefined>
   onOpenSettings: () => void
@@ -54,40 +41,28 @@ export const SidebarContent = (props: {
         onMouseMove={props.aimMove}
       >
         <div class="flex-1 min-h-0 w-full">
-          <DragDropProvider
-            onDragStart={props.handleDragStart}
-            onDragEnd={props.handleDragEnd}
-            onDragOver={props.handleDragOver}
-            collisionDetector={closestCenter}
-          >
-            <DragDropSensors />
-            <ConstrainDragXAxis />
-            <div class="h-full w-full flex flex-col items-center gap-3 px-3 py-3 overflow-y-auto no-scrollbar">
-              <SortableProvider ids={props.projects().map((p) => p.worktree)}>
-                <For each={props.projects()}>{(project) => props.renderProject(project)}</For>
-              </SortableProvider>
-              <Tooltip
-                placement={placement()}
-                value={
-                  <div class="flex items-center gap-2">
-                    <span>{props.openProjectLabel}</span>
-                    <Show when={!props.mobile && !!props.openProjectKeybind()}>
-                      <span class="text-icon-base text-12-medium">{props.openProjectKeybind()}</span>
-                    </Show>
-                  </div>
-                }
-              >
-                <IconButton
-                  icon="plus"
-                  variant="ghost"
-                  size="large"
-                  onClick={props.onOpenProject}
-                  aria-label={typeof props.openProjectLabel === "string" ? props.openProjectLabel : undefined}
-                />
-              </Tooltip>
-            </div>
-            <DragOverlay>{props.renderProjectOverlay()}</DragOverlay>
-          </DragDropProvider>
+          <div class="h-full w-full flex flex-col items-center gap-3 px-3 py-3 overflow-y-auto no-scrollbar">
+            <For each={props.projects()}>{(project) => props.renderProject(project)}</For>
+            <Tooltip
+              placement={placement()}
+              value={
+                <div class="flex items-center gap-2">
+                  <span>{props.openProjectLabel}</span>
+                  <Show when={!props.mobile && !!props.openProjectKeybind()}>
+                    <span class="text-icon-base text-12-medium">{props.openProjectKeybind()}</span>
+                  </Show>
+                </div>
+              }
+            >
+              <IconButton
+                icon="plus"
+                variant="ghost"
+                size="large"
+                onClick={props.onOpenProject}
+                aria-label={typeof props.openProjectLabel === "string" ? props.openProjectLabel : undefined}
+              />
+            </Tooltip>
+          </div>
         </div>
         <div class="shrink-0 w-full pt-3 pb-6 flex flex-col items-center gap-2">
           <TooltipKeybind placement={placement()} title={props.settingsLabel()} keybind={props.settingsKeybind() ?? ""}>

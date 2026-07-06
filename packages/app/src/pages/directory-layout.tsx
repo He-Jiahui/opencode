@@ -53,8 +53,15 @@ export function DirectoryDataProvider(
   createEffect(() => {
     const sessionID = params.id
     if (!sessionID) return
-    serverSync().session.pin(sessionID)
-    onCleanup(() => serverSync().session.unpin(sessionID))
+    // Snapshot the ServerSync instance now: calling the serverSync() memo
+    // inside onCleanup reads a possibly-STALE memo mid-disposal, which makes
+    // readSignal re-enter updateComputation/cleanNode while the outer cleanup
+    // cascade is iterating owned nodes (crashes with "Cannot read properties
+    // of null"). It could also resolve to the NEW server's sync after a
+    // server switch, unpinning on the wrong instance.
+    const sync = serverSync()
+    sync.session.pin(sessionID)
+    onCleanup(() => sync.session.unpin(sessionID))
   })
 
   return (

@@ -1,10 +1,17 @@
 // @refresh reload
 
+// V8's default Error.stackTraceLimit truncates at 10 frames, which is exactly
+// the depth of the recursive cleanNode crash — the real trigger (our code
+// calling dispose, or a store update racing disposal) is beyond that. Raise
+// it so stacks contain the origin frame.
+Error.stackTraceLimit = 200
+
 import {
   ACCEPTED_FILE_EXTENSIONS,
   AppBaseProviders,
   AppInterface,
   handleNotificationClick,
+  installSolidOwnerWarningStack,
   loadLocaleDict,
   normalizeLocale,
   type Locale,
@@ -28,6 +35,11 @@ import { availableStartupServer, readyWslConnections } from "./wsl/connections"
 import "./styles.css"
 import { Splash } from "@opencode-ai/ui/logo"
 import { useTheme } from "@opencode-ai/ui/theme/context"
+
+// The app package's entry.tsx installs this too, but the desktop renderer
+// boots from this file instead — install here so DEV "created outside a
+// createRoot" warnings come with a stack trace.
+installSolidOwnerWarningStack()
 
 const root = document.getElementById("root")
 if (import.meta.env.DEV && !(root instanceof HTMLElement)) {
@@ -58,6 +70,84 @@ if (import.meta.env.VITE_SENTRY_DSN) {
 }
 
 void initI18n()
+
+const rendererOS = () => {
+  const ua = navigator.userAgent
+  if (ua.includes("Mac")) return "macos"
+  if (ua.includes("Windows")) return "windows"
+  if (ua.includes("Linux")) return "linux"
+  return undefined
+}
+
+const rendererErrorText = (value: unknown) => {
+  if (value instanceof Error) return value.message
+  if (typeof value === "string") return value
+  if (typeof value === "number" || typeof value === "boolean" || value === null || value === undefined)
+    return String(value)
+  return Object.prototype.toString.call(value)
+}
+
+const rendererErrorStack = (value: unknown) => {
+  if (value instanceof Error) return value.stack
+  if (typeof value !== "object" || value === null) return
+  const stack = "stack" in value ? value.stack : undefined
+  return typeof stack === "string" ? stack : undefined
+}
+
+const rendererErrorKey = (kind: "error" | "unhandledrejection", message: string, stack?: string) =>
+  `${kind}\n${message}\n${stack ?? ""}`
+
+// Benign browser throttling notice: the observer callback caused another
+// layout change, so delivery was deferred to the next frame. Not an error —
+// standard practice (e.g. Sentry's default ignore list) is to drop it.
+const IGNORED_RENDERER_ERRORS = [
+  "ResizeObserver loop completed with undelivered notifications",
+  "ResizeObserver loop limit exceeded",
+]
+
+const installRendererDiagnostics = () => {
+  const lastReported = new Map<string, number>()
+  const report = (
+    kind: "error" | "unhandledrejection",
+    value: unknown,
+    detail?: { source?: string; line?: number; column?: number },
+  ) => {
+    const error = rendererErrorText(value)
+    if (IGNORED_RENDERER_ERRORS.some((ignored) => error.includes(ignored))) return
+    const stack = rendererErrorStack(value)
+    const key = rendererErrorKey(kind, error, stack)
+    const now = Date.now()
+    const previous = lastReported.get(key) ?? 0
+    if (now - previous < 1_000) return
+    lastReported.set(key, now)
+    void window.api.recordFatalRendererError({
+      kind,
+      error,
+      stack,
+      source: detail?.source,
+      line: detail?.line,
+      column: detail?.column,
+      url: location.href,
+      version: pkg.version,
+      platform: "desktop",
+      os: rendererOS(),
+      userAgent: navigator.userAgent,
+    })
+  }
+
+  window.addEventListener("error", (event) => {
+    report("error", event.error ?? event.message, {
+      source: event.filename,
+      line: event.lineno,
+      column: event.colno,
+    })
+  })
+  window.addEventListener("unhandledrejection", (event) => {
+    report("unhandledrejection", event.reason)
+  })
+}
+
+installRendererDiagnostics()
 
 const [updaterState, setUpdaterState] = createSignal<UpdaterState>({ status: "disabled" })
 void window.api.updater.subscribe(setUpdaterState)

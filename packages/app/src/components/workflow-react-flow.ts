@@ -1,6 +1,6 @@
 import type { WorkflowGraph } from "@opencode-ai/sdk/v2"
 import dagre from "@dagrejs/dagre"
-import * as React from "react"
+import React from "react"
 import { createRoot, type Root } from "react-dom/client"
 import {
   Background,
@@ -30,7 +30,7 @@ export type WorkflowReactFlowContextTarget = WorkflowReactFlowTarget & {
   y: number
 }
 
-export type WorkflowReactFlowSessionState = "running" | "completed"
+export type WorkflowReactFlowSessionState = "running" | "completed" | "idle" | "blocked" | "paused" | "pending"
 
 export type WorkflowReactFlowProps = {
   graph: WorkflowGraph
@@ -83,6 +83,8 @@ type WorkflowDisplayEdge = {
 }
 type WorkflowMilestone = WorkflowGraph["milestones"][number]
 type WorkflowMilestoneSession = WorkflowMilestone["session"][number]
+type WorkflowGraphMember = WorkflowGraph["members"][number]
+type WorkflowSessionLookup = { milestone: WorkflowMilestone; session: WorkflowMilestoneSession }
 
 const roleTitles = {
   requester: "Requester",
@@ -107,14 +109,14 @@ const workflowDocumentColumnSpan = 1.18
 
 const panelFitViewOptions = {
   padding: 0.12,
-  minZoom: 0.3,
-  maxZoom: 1.15,
+  minZoom: 0.34,
+  maxZoom: 1.4,
 }
 
 const fullscreenFitViewOptions = {
   padding: 0.09,
-  minZoom: 0.18,
-  maxZoom: 1.15,
+  minZoom: 0.24,
+  maxZoom: 1.45,
 }
 
 const workflowPreviewLimit = 1200
@@ -147,8 +149,8 @@ function WorkflowReactFlow(props: WorkflowReactFlowProps) {
     edgeTypes,
     fitView: true,
     fitViewOptions: fullscreen ? fullscreenFitViewOptions : panelFitViewOptions,
-    minZoom: fullscreen ? 0.12 : 0.25,
-    maxZoom: 1.6,
+    minZoom: fullscreen ? 0.2 : 0.3,
+    maxZoom: 1.8,
     nodesDraggable: true,
     nodesConnectable: false,
     edgesFocusable: false,
@@ -202,15 +204,19 @@ function workflowModel(
       ]),
     ),
   )
+  const membersBySessionRole = new Map(graph.members.map((member) => [workflowMemberRefKey(member.role, member.sessionID), member] as const))
+  const membersBySession = new Map(graph.members.map((member) => [member.sessionID, member] as const))
   const displayEdges = workflowDisplayEdges(graph)
   const currentNodeIDs = workflowCurrentNodeIDs(graph, currentSessionID)
   const rawNodes = graph.nodes.map((node, index) => {
     const milestone = (node.milestoneID ? milestones.get(node.milestoneID) : undefined) ?? workflowMilestoneFromPath(node.path, milestones)
     const session = sessions.get(node.id)
+    const member = workflowMemberForNode(node, session, membersBySessionRole, membersBySession)
     const data = workflowNodeData(
       node,
       milestone,
       session,
+      member,
       graph.workflow.status,
       graph.workflow.request,
       milestoneLabel,
@@ -361,14 +367,16 @@ function workflowMilestoneFromPath(filePath: string | undefined, milestones: Map
 function workflowNodeData(
   node: WorkflowGraph["nodes"][number],
   milestone: WorkflowGraph["milestones"][number] | undefined,
-  session: { milestone: WorkflowGraph["milestones"][number]; session: WorkflowGraph["milestones"][number]["session"][number] } | undefined,
+  session: WorkflowSessionLookup | undefined,
+  member: WorkflowGraphMember | undefined,
   workflowStatus: WorkflowGraph["workflow"]["status"],
   workflowRequest: string,
   milestoneLabel: string,
   sessionState: Record<string, WorkflowReactFlowSessionState | undefined>,
   currentSession: boolean,
 ): WorkflowFlowNodeData {
-  const state = nodeSessionState(node, milestone, session, workflowStatus, sessionState)
+  const state = nodeSessionState(node, milestone, session, member, workflowStatus, sessionState)
+  const memberPrompt = workflowMemberPrompt(member)
   if (node.type === "milestone") {
     const emphasized = currentSession || state === "running" || milestone?.status === "planning" || milestone?.status === "executing"
     return {
@@ -378,8 +386,8 @@ function workflowNodeData(
       title: milestone?.title ?? node.title,
       label: milestone?.department ?? milestoneLabel,
       status: milestone?.status ?? node.status,
-      summary: milestone?.attempt ? `#${milestone.attempt}` : undefined,
-      prompt: previewText(milestone?.prompt),
+      summary: workflowSummary([milestone?.attempt ? `#${milestone.attempt}` : undefined, member?.availability]),
+      prompt: previewText(workflowSummaryBlock([milestone?.prompt, memberPrompt])),
       sessionID: node.sessionID,
       sessionState: state,
       currentSession,
@@ -395,8 +403,13 @@ function workflowNodeData(
       role: node.role,
       title: node.title,
       label: roleLabel(node.role ?? "requester"),
-      status: node.status ?? workflowStatus,
-      prompt: node.role === "requester" || node.role === "main_pm" ? previewText(workflowRequest) : undefined,
+      status:
+        node.role === "requester"
+          ? (node.status ?? workflowStatus)
+          : workflowSessionDisplayStatus(node, milestone, session, member, workflowStatus, state) ?? node.status ?? workflowStatus,
+      summary: workflowSummary([member?.specialty, member?.availability]),
+      prompt:
+        node.role === "requester" || node.role === "main_pm" ? previewText(workflowSummaryBlock([workflowRequest, memberPrompt])) : memberPrompt,
       sessionID: node.sessionID,
       sessionState: state,
       currentSession,
@@ -414,7 +427,7 @@ function workflowNodeData(
       department: milestone?.department ?? session?.milestone.department,
       label: workflowDocumentLabel(documentKind),
       summary: node.role ? roleLabel(node.role) : undefined,
-      prompt: previewText([node.summary, node.path].filter(Boolean).join("\n\n")),
+      prompt: previewText(workflowSummaryBlock([node.summary, node.path])),
       sessionID: node.sessionID,
       sessionState: state,
       currentSession,
@@ -431,8 +444,14 @@ function workflowNodeData(
     department: session?.milestone.department ?? milestone?.department,
     title: session?.milestone.title ?? node.title,
     label: roleLabel(role ?? "main_pm"),
-    summary: node.summary ?? (session?.session.attempt ? `#${session.session.attempt}` : undefined),
-    prompt: previewText(node.summary ?? session?.milestone.prompt),
+    status: workflowSessionDisplayStatus(node, milestone, session, member, workflowStatus, state) ?? node.status,
+    summary: workflowSummary([
+      node.summary,
+      member?.availability,
+      session?.session.attempt ? `#${session.session.attempt}` : undefined,
+      member?.status === "paused" ? "paused" : undefined,
+    ]),
+    prompt: previewText(workflowSummaryBlock([node.summary ?? session?.milestone.prompt, memberPrompt])),
     sessionID: node.sessionID,
     sessionState: state,
     currentSession,
@@ -746,18 +765,32 @@ function WorkflowFlowNodeView(props: NodeProps<WorkflowFlowNode>) {
 function nodeSessionState(
   node: WorkflowGraph["nodes"][number],
   milestone: WorkflowGraph["milestones"][number] | undefined,
-  session: { milestone: WorkflowGraph["milestones"][number]; session: WorkflowGraph["milestones"][number]["session"][number] } | undefined,
+  session: WorkflowSessionLookup | undefined,
+  member: WorkflowGraphMember | undefined,
   workflowStatus: WorkflowGraph["workflow"]["status"],
   sessionState: Record<string, WorkflowReactFlowSessionState | undefined>,
 ) {
   if (!node.sessionID) return undefined
-  if (node.type === "milestone" && milestoneFailed(milestone?.status ?? node.status)) return undefined
-  if (node.type === "workflow" && workflowFailed(workflowStatus)) return undefined
+  const status = session?.milestone.status ?? milestone?.status ?? node.status
+  if (node.type === "session" || session || node.type === "milestone") {
+    if (milestoneComplete(status)) return "completed"
+    if (milestoneFailed(status)) return "blocked"
+  }
+  if (node.type === "workflow" && workflowStatus === "completed") return "completed"
+  if (node.type === "workflow" && workflowFailed(workflowStatus)) return "blocked"
   const explicit = sessionState[node.sessionID]
   if (explicit) return explicit
-  if (node.type === "session" || session) return "completed"
-  if (node.type === "milestone" && milestoneComplete(milestone?.status ?? node.status)) return "completed"
-  if (node.type === "workflow" && workflowStatus === "completed") return "completed"
+  if (member?.status === "paused") return "paused"
+  if (member?.availability === "working") return "running"
+  if (member?.availability === "blocked_waiting") return "blocked"
+  if (member?.availability === "idle") return "idle"
+  if (node.type === "session" || session) {
+    if (status === "pending" || status === "skipped") return "pending"
+    if (status === "planning" || status === "executing" || status === "reviewing" || status === "testing" || status === "running")
+      return "running"
+    return "idle"
+  }
+  if (node.status === "pending") return "pending"
   return undefined
 }
 
@@ -771,6 +804,66 @@ function milestoneFailed(status: string | undefined) {
 
 function workflowFailed(status: string | undefined) {
   return status === "blocked" || status === "failed" || status === "cancelled"
+}
+
+function workflowMemberRefKey(role: string, sessionID: string) {
+  return `${role}:${sessionID}`
+}
+
+function workflowMemberForNode(
+  node: WorkflowGraph["nodes"][number],
+  session: WorkflowSessionLookup | undefined,
+  membersBySessionRole: Map<string, WorkflowGraphMember>,
+  membersBySession: Map<string, WorkflowGraphMember>,
+) {
+  if (!node.sessionID) return undefined
+  const role = node.role ?? session?.session.role
+  if (role) {
+    const member = membersBySessionRole.get(workflowMemberRefKey(role, node.sessionID))
+    if (member) return member
+  }
+  return membersBySession.get(node.sessionID)
+}
+
+function workflowSessionDisplayStatus(
+  node: WorkflowGraph["nodes"][number],
+  milestone: WorkflowGraph["milestones"][number] | undefined,
+  session: WorkflowSessionLookup | undefined,
+  member: WorkflowGraphMember | undefined,
+  workflowStatus: WorkflowGraph["workflow"]["status"],
+  state: WorkflowReactFlowSessionState | undefined,
+) {
+  if (state === "running") return member?.availability === "working" ? "working" : "running"
+  if (state === "completed") return "completed"
+  if (state === "blocked") return member?.availability === "blocked_waiting" ? "blocked_waiting" : "blocked"
+  if (state === "paused") return "paused"
+  if (state === "idle") return "idle"
+  if (state === "pending") return "pending"
+  if (member?.status === "paused") return "paused"
+  if (member?.availability) return member.availability
+  return session?.milestone.status ?? milestone?.status ?? node.status ?? workflowStatus
+}
+
+function workflowMemberPrompt(member: WorkflowGraphMember | undefined) {
+  if (!member) return undefined
+  return workflowSummaryBlock([
+    `Session: ${member.title}`,
+    `Role: ${roleLabel(member.role)}`,
+    `Specialty: ${member.specialty}`,
+    `Status: ${member.status}`,
+    member.availability ? `Availability: ${member.availability}` : undefined,
+    member.currentFocus ? `Focus: ${member.currentFocus}` : undefined,
+    member.progressNote ? `Progress: ${member.progressNote}` : undefined,
+    member.blockers && member.blockers.length > 0 ? `Blockers: ${member.blockers.join("; ")}` : undefined,
+  ])
+}
+
+function workflowSummary(values: Array<string | undefined>) {
+  return values.filter((value): value is string => Boolean(value)).join(" · ") || undefined
+}
+
+function workflowSummaryBlock(values: Array<string | undefined>) {
+  return values.filter((value): value is string => Boolean(value)).join("\n\n") || undefined
 }
 
 function roleLabel(role: string) {
@@ -819,7 +912,8 @@ function previewText(value: string | undefined) {
 function statusTone(status: string | undefined) {
   if (!status) return "neutral"
   if (status === "approved" || status === "completed" || status === "done") return "success"
-  if (status === "rejected" || status === "blocked" || status === "failed" || status === "cancelled") return "danger"
-  if (status === "pending") return "pending"
+  if (status === "rejected" || status === "blocked" || status === "blocked_waiting" || status === "failed" || status === "cancelled")
+    return "danger"
+  if (status === "pending" || status === "idle" || status === "paused" || status === "skipped") return "pending"
   return "active"
 }

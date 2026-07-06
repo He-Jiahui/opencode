@@ -1,5 +1,13 @@
 import { describe, expect, test } from "bun:test"
-import { canOpenTabRename, canStartTabDrag, forwardTabRef, isTabCloseTarget } from "./titlebar-tab-gesture"
+import {
+  canOpenTabRename,
+  canStartTabDrag,
+  forwardTabRef,
+  isTabCloseTarget,
+  isTabInteractiveTarget,
+  preventTabControlDefault,
+  stopTabControlPointer,
+} from "./titlebar-tab-gesture"
 
 describe("titlebar tab gestures", () => {
   test("excludes close controls from tab gestures", () => {
@@ -29,5 +37,32 @@ describe("titlebar tab gestures", () => {
     expect(canStartTabDrag("mouse")).toBe(true)
     expect(canStartTabDrag("pen")).toBe(true)
     expect(canStartTabDrag("touch")).toBe(false)
+  })
+
+  test("excludes routed tab links from drag activation", () => {
+    const link = document.createElement("a")
+    const child = document.createElement("span")
+    link.dataset.titlebarTabInteractive = ""
+    link.append(child)
+    expect(isTabInteractiveTarget(link)).toBe(true)
+    expect(isTabInteractiveTarget(child)).toBe(true)
+    expect(isTabInteractiveTarget(document.createElement("span"))).toBe(false)
+  })
+
+  test("stops tab pointer events before drag sensors see them", () => {
+    let stopped = false
+    stopTabControlPointer({ stopPropagation: () => (stopped = true) })
+    expect(stopped).toBe(true)
+  })
+
+  test("prevents tab default navigation when routed handlers are used", () => {
+    let prevented = false
+    let stopped = false
+    preventTabControlDefault({
+      preventDefault: () => (prevented = true),
+      stopPropagation: () => (stopped = true),
+    })
+    expect(prevented).toBe(true)
+    expect(stopped).toBe(true)
   })
 })

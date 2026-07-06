@@ -396,7 +396,10 @@ function wireWindowRecovery(win: BrowserWindow, name: string) {
   win.webContents.on("console-message", (_event, level, message, line, sourceId) => {
     if (message.toLowerCase().includes("terminal") || sourceId.toLowerCase().includes("terminal")) {
       writeLog("pty", "console", { window: name, level, message, line, sourceId })
+      return
     }
+    if (level < 2) return
+    writeLog("renderer", "console", { window: name, level, message, line, sourceId }, level >= 3 ? "error" : "warn")
   })
   win.webContents.on("preload-error", (_event, preloadPath, error) => {
     writeLog("preload", "preload error", { window: name, preloadPath, error }, "error")

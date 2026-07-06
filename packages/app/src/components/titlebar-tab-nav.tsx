@@ -10,7 +10,7 @@ import { displayName, projectForSession } from "@/pages/layout/helpers"
 import { SessionTabAvatar } from "@/pages/layout/session-tab-avatar"
 import { showToast } from "@/utils/toast"
 import type { Session } from "@opencode-ai/sdk/v2"
-import { canOpenTabRename, forwardTabRef } from "./titlebar-tab-gesture"
+import { canOpenTabRename, forwardTabRef, preventTabControlDefault, stopTabControlPointer } from "./titlebar-tab-gesture"
 import { TabPreviewPopover } from "./titlebar-tab-popover"
 import "./titlebar-tab-nav.css"
 
@@ -223,21 +223,24 @@ export function TabNavItem(props: {
         <a
           data-slot="tab-link"
           data-titlebar-tab-link
+          data-titlebar-tab-interactive
           href={props.href}
           draggable={false}
           onDragStart={(event) => {
             event.preventDefault()
             event.stopPropagation()
           }}
+          onPointerDown={stopTabControlPointer}
           onMouseDown={(event) => {
             // Navigate on mousedown to shave the press-release delay off tab switches.
             if (event.button !== 0) return
             if (editing()) return
             if (props.suppressNavigation?.()) return
+            preventTabControlDefault(event)
             props.onNavigate()
           }}
           onClick={(event) => {
-            event.preventDefault()
+            preventTabControlDefault(event)
             // Mouse navigation already happened on mousedown; detail 0 means keyboard activation.
             if (event.detail > 0) return
             if (editing()) return
@@ -299,13 +302,12 @@ export function TabNavItem(props: {
 
       <div data-slot="tab-close" class="group-hover:bg-[var(--tab-bg)] group-data-[active=true]:bg-[var(--tab-bg)]">
         <IconButtonV2
+          data-titlebar-tab-interactive
           size="small"
           variant="ghost-muted"
           class="hover-reveal relative z-10 group-hover:opacity-100 group-data-[active=true]:opacity-100 group-data-[editing=true]:opacity-100"
-          onPointerDown={(event) => {
-            event.preventDefault()
-            event.stopPropagation()
-          }}
+          onPointerDown={preventTabControlDefault}
+          onMouseDown={preventTabControlDefault}
           onClick={closeTab}
           icon={<IconV2 name="xmark-small" />}
         />
@@ -371,20 +373,23 @@ export function DraftTabItem(props: {
       <a
         data-slot="tab-link"
         data-titlebar-tab-link
+        data-titlebar-tab-interactive
         href={props.href}
         draggable={false}
         onDragStart={(event) => {
           event.preventDefault()
           event.stopPropagation()
         }}
+        onPointerDown={stopTabControlPointer}
         onMouseDown={(event) => {
           // Navigate on mousedown to shave the press-release delay off tab switches.
           if (event.button !== 0) return
           if (props.suppressNavigation?.()) return
+          preventTabControlDefault(event)
           props.onNavigate()
         }}
         onClick={(event) => {
-          event.preventDefault()
+          preventTabControlDefault(event)
           // Mouse navigation already happened on mousedown; detail 0 means keyboard activation.
           if (event.detail > 0) return
           if (props.suppressNavigation?.()) return
@@ -404,16 +409,11 @@ export function DraftTabItem(props: {
       </a>
       <div data-slot="tab-close" class="group-hover:bg-[var(--tab-bg)] group-data-[active=true]:bg-[var(--tab-bg)]">
         <IconButtonV2
+          data-titlebar-tab-interactive
           size="small"
           variant="ghost-muted"
-          onPointerDown={(event) => {
-            event.preventDefault()
-            event.stopPropagation()
-          }}
-          onMouseDown={(event) => {
-            event.preventDefault()
-            event.stopPropagation()
-          }}
+          onPointerDown={preventTabControlDefault}
+          onMouseDown={preventTabControlDefault}
           class="hover-reveal relative z-10 group-hover:opacity-100 group-data-[active=true]:opacity-100 group-data-[editing=true]:opacity-100"
           onClick={closeTab}
           icon={<IconV2 name="xmark-small" />}

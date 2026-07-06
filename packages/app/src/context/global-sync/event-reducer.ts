@@ -194,6 +194,9 @@ export function applyDirectoryEvent(input: {
     case "workflow.updated": {
       const info = (event.properties as { info: Workflow }).info
       upsertWorkflowSessionIndex(input.setStore, info)
+      if (input.store.workflow_graph[info.id]) {
+        input.setStore("workflow_graph", info.id, "workflow", reconcile(info))
+      }
       const result = Binary.search(input.store.workflow, info.id, (item) => item.id)
       if (result.found) {
         input.setStore("workflow", result.index, reconcile(info))
@@ -236,7 +239,9 @@ export function applyDirectoryEvent(input: {
       break
     }
     case "workflow.graph.updated": {
-      const graph = (event.properties as { graph?: WorkflowGraph }).graph
+      const props = event.properties as { workflowID: string; graph?: WorkflowGraph }
+      input.setStore("workflow_graph_version", props.workflowID, Date.now())
+      const graph = props.graph
       if (!graph) break
       upsertWorkflowSessionIndex(input.setStore, graph.workflow, graph)
       input.setStore("workflow_graph", graph.workflow.id, reconcile(graph))

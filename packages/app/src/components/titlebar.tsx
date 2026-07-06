@@ -19,6 +19,7 @@ import { useSettings } from "@/context/settings"
 import { WindowsAppMenu } from "./windows-app-menu"
 import { applyPath, backPath, forwardPath } from "./titlebar-history"
 import { TitlebarTabStrip } from "@/components/titlebar-tab-strip"
+import { preventTabControlDefault, stopTabControlPointer } from "@/components/titlebar-tab-gesture"
 import { makeEventListener } from "@solid-primitives/event-listener"
 import { createMediaQuery } from "@solid-primitives/media"
 import { readSessionTabsRemovedDetail, SESSION_TABS_REMOVED_EVENT } from "@/components/titlebar-session-events"
@@ -151,7 +152,7 @@ export function Titlebar(props: { update?: TitlebarUpdate }) {
     navigate(next.to)
   }
 
-  command.register(() => [
+  command.register("titlebar-navigation", () => [
     {
       id: "common.goBack",
       title: language.t("common.goBack"),
@@ -222,7 +223,7 @@ export function Titlebar(props: { update?: TitlebarUpdate }) {
     <header
       data-slot={useV2Titlebar() ? "titlebar-v2" : undefined}
       classList={{
-        "shrink-0 relative flex flex-row": true,
+        "shrink-0 relative z-[60] flex flex-row": true,
         "h-9 bg-v2-background-bg-deep overflow-visible": useV2Titlebar(),
         "h-10 bg-background-base overflow-hidden": !useV2Titlebar(),
         "order-last": bottom(),
@@ -454,7 +455,12 @@ export function Titlebar(props: { update?: TitlebarUpdate }) {
                     class="!w-9 shrink-0"
                     icon={<IconV2 name="grid-plus" />}
                     state={layout.route().type === "home" ? "pressed" : undefined}
-                    onClick={toggleHome}
+                    onPointerDown={stopTabControlPointer}
+                    onMouseDown={preventTabControlDefault}
+                    onClick={(event) => {
+                      preventTabControlDefault(event)
+                      toggleHome()
+                    }}
                     aria-label={language.t("home.title")}
                     aria-pressed={layout.route().type === "home"}
                   />
@@ -491,7 +497,12 @@ export function Titlebar(props: { update?: TitlebarUpdate }) {
                       size="large"
                       class="shrink-0"
                       icon={<IconV2 name="plus" />}
-                      onClick={openNewTab}
+                      onPointerDown={stopTabControlPointer}
+                      onMouseDown={preventTabControlDefault}
+                      onClick={(event) => {
+                        preventTabControlDefault(event)
+                        openNewTab()
+                      }}
                       aria-label={language.t("command.session.new")}
                     />
                   </TooltipV2>

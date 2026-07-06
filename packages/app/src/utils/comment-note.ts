@@ -66,14 +66,18 @@ export function formatCommentNote(input: { path: string; selection?: FileSelecti
 }
 
 export function parseCommentNote(text: string) {
-  const match = text.match(
-    /^The user made the following comment regarding (this file|line (\d+)|lines (\d+) through (\d+)) of (.+?): ([\s\S]+)$/,
-  )
+  const match =
+    /^The user made the following comment regarding (?<target>this file|line (?<line>\d+)|lines (?<start>\d+) through (?<end>\d+)) of (?<path>.+?): (?<comment>[\s\S]+)$/.exec(
+      text,
+    )
   if (!match) return
-  const start = match[2] ? Number(match[2]) : match[3] ? Number(match[3]) : undefined
-  const end = match[2] ? Number(match[2]) : match[4] ? Number(match[4]) : undefined
+  const line = match.groups?.line
+  const startLine = match.groups?.start
+  const endLine = match.groups?.end
+  const start = line ? Number(line) : startLine ? Number(startLine) : undefined
+  const end = line ? Number(line) : endLine ? Number(endLine) : undefined
   return {
-    path: match[5],
+    path: match.groups?.path ?? "",
     selection:
       start !== undefined && end !== undefined
         ? {
@@ -83,6 +87,6 @@ export function parseCommentNote(text: string) {
             endChar: 0,
           }
         : undefined,
-    comment: match[6],
+    comment: match.groups?.comment ?? "",
   } satisfies PromptComment
 }

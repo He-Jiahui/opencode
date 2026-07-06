@@ -22,6 +22,9 @@ beforeAll(async () => {
       },
     }),
   }))
+  mock.module("@/components/file-path-context-menu", () => ({
+    FilePathContextMenu: (props: { children?: unknown }) => props.children,
+  }))
   mock.module("@opencode-ai/ui/collapsible", () => ({
     Collapsible: {
       Trigger: (props: { children?: unknown }) => props.children,

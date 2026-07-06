@@ -8,8 +8,11 @@ import { dict as en } from "@/i18n/en"
 import { dict as zh } from "@/i18n/zh"
 import { handleNotificationClick } from "@/utils/notification-click"
 import { authFromToken } from "@/utils/server"
+import { installSolidOwnerWarningStack } from "@/utils/solid-owner-warning-stack"
 import pkg from "../package.json"
 import { ServerConnection } from "./context/server"
+
+installSolidOwnerWarningStack()
 
 const DEFAULT_SERVER_URL_KEY = "opencode.settings.dat:defaultServerUrl"
 

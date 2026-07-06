@@ -470,6 +470,17 @@ interface ThemeColors {
   diffDelete?: HexColor
 }
 
+const FALLBACK_THEME_COLORS = {
+  neutral: "#f7f7f7",
+  ink: "#171311",
+  primary: "#dcde8d",
+  success: "#12c905",
+  warning: "#ffdc17",
+  error: "#fc533a",
+  info: "#a753ae",
+  interactive: "#034cff",
+} satisfies Omit<ThemeColors, "compact" | "accent" | "diffAdd" | "diffDelete">
+
 function getColors(variant: ThemeVariant): ThemeColors {
   const input = variant as { palette?: unknown; seeds?: unknown }
   if (input.palette && input.seeds) {
@@ -477,40 +488,52 @@ function getColors(variant: ThemeVariant): ThemeColors {
   }
 
   if (variant.palette) {
+    const primary = safeHex(variant.palette.primary, FALLBACK_THEME_COLORS.primary)
+    const info = safeHex(variant.palette.info, FALLBACK_THEME_COLORS.info)
     return {
       compact: true,
-      neutral: variant.palette.neutral,
-      ink: variant.palette.ink,
-      primary: variant.palette.primary,
-      accent: variant.palette.accent ?? variant.palette.info,
-      success: variant.palette.success,
-      warning: variant.palette.warning,
-      error: variant.palette.error,
-      info: variant.palette.info,
-      interactive: variant.palette.interactive ?? variant.palette.primary,
-      diffAdd: variant.palette.diffAdd,
-      diffDelete: variant.palette.diffDelete,
+      neutral: safeHex(variant.palette.neutral, FALLBACK_THEME_COLORS.neutral),
+      ink: safeHex(variant.palette.ink, FALLBACK_THEME_COLORS.ink),
+      primary,
+      accent: safeHex(variant.palette.accent, info),
+      success: safeHex(variant.palette.success, FALLBACK_THEME_COLORS.success),
+      warning: safeHex(variant.palette.warning, FALLBACK_THEME_COLORS.warning),
+      error: safeHex(variant.palette.error, FALLBACK_THEME_COLORS.error),
+      info,
+      interactive: safeHex(variant.palette.interactive, primary),
+      diffAdd: safeOptionalHex(variant.palette.diffAdd),
+      diffDelete: safeOptionalHex(variant.palette.diffDelete),
     }
   }
 
   if (variant.seeds) {
     return {
       compact: false,
-      neutral: variant.seeds.neutral,
+      neutral: safeHex(variant.seeds.neutral, FALLBACK_THEME_COLORS.neutral),
       ink: undefined,
-      primary: variant.seeds.primary,
-      accent: variant.seeds.info,
-      success: variant.seeds.success,
-      warning: variant.seeds.warning,
-      error: variant.seeds.error,
-      info: variant.seeds.info,
-      interactive: variant.seeds.interactive,
-      diffAdd: variant.seeds.diffAdd,
-      diffDelete: variant.seeds.diffDelete,
+      primary: safeHex(variant.seeds.primary, FALLBACK_THEME_COLORS.primary),
+      accent: safeHex(variant.seeds.info, FALLBACK_THEME_COLORS.info),
+      success: safeHex(variant.seeds.success, FALLBACK_THEME_COLORS.success),
+      warning: safeHex(variant.seeds.warning, FALLBACK_THEME_COLORS.warning),
+      error: safeHex(variant.seeds.error, FALLBACK_THEME_COLORS.error),
+      info: safeHex(variant.seeds.info, FALLBACK_THEME_COLORS.info),
+      interactive: safeHex(variant.seeds.interactive, FALLBACK_THEME_COLORS.interactive),
+      diffAdd: safeOptionalHex(variant.seeds.diffAdd),
+      diffDelete: safeOptionalHex(variant.seeds.diffDelete),
     }
   }
 
   throw new Error("Theme variant requires `palette` or `seeds`")
+}
+
+function safeOptionalHex(value: unknown): HexColor | undefined {
+  if (typeof value !== "string") return
+  if (!value.startsWith("#")) return
+  return value as HexColor
+}
+
+function safeHex(value: unknown, fallback: HexColor): HexColor {
+  return safeOptionalHex(value) ?? fallback
 }
 
 function generateNeutralAlphaScale(neutralScale: HexColor[], isDark: boolean): HexColor[] {

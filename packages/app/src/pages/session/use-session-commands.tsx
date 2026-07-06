@@ -402,36 +402,49 @@ export const useSessionCommands = (actions: SessionCommandContext) => {
           initialRequest={workflowPrompt()}
           variants={workflowVariants()}
           initialVariant={local.model.variant.current() ?? "default"}
-          onStart={(input) => {
+          onStart={(input, control) => {
             const model = local.model.current()
-            void sdk()
+            return sdk()
               .client.workflow
-              .start({
-                workflowStartInput: {
-                  sessionID,
-                  prompt: input.request,
-                  model: model ? `${model.provider.id}/${model.id}` : undefined,
-                  variant: input.variant,
-                  agent: local.agent.current()?.name,
-                  staffing: input.staffing,
-                  modelWhitelist: input.modelWhitelist,
+              .start(
+                {
+                  workflowStartInput: {
+                    sessionID,
+                    prompt: input.request,
+                    model: model ? `${model.provider.id}/${model.id}` : undefined,
+                    variant: input.variant,
+                    agent: local.agent.current()?.name,
+                    staffing: input.staffing,
+                    modelWhitelist: input.modelWhitelist,
+                  },
                 },
-              })
-              .then(() => {
+                { signal: control.signal },
+              )
+              .then((result) => {
                 dialog.close()
+                if (result.data) {
+                  sync().set("workflow", (items) => [...items.filter((item) => item.id !== result.data!.id), result.data!])
+                  void sdk()
+                    .client.workflow.graph({ workflowID: result.data.id })
+                    .then((graphResult) => {
+                      if (graphResult.data) sync().set("workflow_graph", result.data!.id, graphResult.data)
+                    })
+                  void sync().session.fetch(0)
+                }
                 showToast({
                   variant: "success",
                   icon: "circle-check",
                   title: language.t("session.workflow.started.title"),
                 })
               })
-              .catch((error: unknown) =>
+              .catch((error: unknown) => {
                 showToast({
                   variant: "error",
                   title: language.t("common.requestFailed"),
                   description: error instanceof Error ? error.message : String(error),
-                }),
-              )
+                })
+                throw error
+              })
           }}
         />
       ))

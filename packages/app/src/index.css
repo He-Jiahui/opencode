@@ -289,4 +289,376 @@
       animation-range: 0 0.1px;
     }
   }
+
+  .workflow-react-flow {
+    width: 100%;
+    height: 100%;
+    background:
+      radial-gradient(circle at 1px 1px, rgba(139, 158, 188, 0.16) 1px, transparent 0) 0 0 / 22px 22px,
+      linear-gradient(180deg, rgba(8, 12, 16, 0.98), rgba(7, 10, 13, 0.96));
+  }
+
+  .workflow-react-flow .react-flow__pane {
+    cursor: grab;
+  }
+
+  .workflow-react-flow .react-flow__pane:active {
+    cursor: grabbing;
+  }
+
+  .workflow-react-flow .react-flow__controls {
+    border: 1px solid rgba(132, 151, 177, 0.24);
+    background: rgba(13, 18, 24, 0.9);
+    box-shadow: 0 14px 40px rgba(0, 0, 0, 0.36);
+  }
+
+  .workflow-react-flow .react-flow__controls-button {
+    border-bottom-color: rgba(132, 151, 177, 0.18);
+    background: transparent;
+    color: rgba(232, 238, 247, 0.86);
+  }
+
+  .workflow-rf-node {
+    position: relative;
+    display: flex;
+    min-width: 100%;
+    min-height: 100%;
+    border: 1px solid rgba(132, 151, 177, 0.28);
+    border-radius: 8px;
+    background: rgba(12, 15, 19, 0.96);
+    color: rgba(245, 248, 252, 0.94);
+    box-shadow: 0 18px 40px rgba(0, 0, 0, 0.36);
+    font-family: Inter, system-ui, sans-serif;
+    overflow: visible;
+  }
+
+  .workflow-rf-node--linked {
+    background: linear-gradient(180deg, rgba(16, 28, 36, 0.98), rgba(10, 16, 22, 0.98));
+  }
+
+  .workflow-rf-node--unlinked {
+    border-color: rgba(80, 88, 100, 0.26);
+    background: rgba(1, 3, 5, 0.96);
+    color: rgba(236, 240, 245, 0.72);
+  }
+
+  .workflow-rf-node--workflow.workflow-rf-node--role-requester {
+    border-color: rgba(56, 189, 171, 0.62);
+    background: linear-gradient(180deg, rgba(13, 88, 89, 0.92), rgba(9, 51, 60, 0.95));
+  }
+
+  .workflow-rf-node--workflow.workflow-rf-node--role-main-pm {
+    border-color: rgba(96, 165, 250, 0.68);
+    background: linear-gradient(180deg, rgba(26, 68, 113, 0.94), rgba(14, 35, 60, 0.96));
+  }
+
+  .workflow-rf-node--role-department-pm,
+  .workflow-rf-node--milestone.workflow-rf-node--success {
+    border-color: rgba(52, 211, 153, 0.58);
+    background: linear-gradient(180deg, rgba(9, 83, 67, 0.92), rgba(7, 43, 39, 0.96));
+  }
+
+  .workflow-rf-node--role-executor {
+    border-color: rgba(99, 179, 237, 0.56);
+    background: linear-gradient(180deg, rgba(24, 72, 95, 0.9), rgba(10, 31, 44, 0.96));
+  }
+
+  .workflow-rf-node--role-reviewer {
+    border-color: rgba(167, 139, 250, 0.54);
+    background: linear-gradient(180deg, rgba(61, 49, 112, 0.9), rgba(27, 23, 51, 0.96));
+  }
+
+  .workflow-rf-node--role-tester {
+    border-color: rgba(251, 191, 36, 0.56);
+    background: linear-gradient(180deg, rgba(92, 66, 18, 0.9), rgba(41, 31, 13, 0.96));
+  }
+
+  .workflow-rf-node--role-expert {
+    border-color: rgba(45, 212, 191, 0.52);
+    background: linear-gradient(180deg, rgba(20, 77, 77, 0.88), rgba(10, 38, 43, 0.96));
+  }
+
+  .workflow-rf-node--document {
+    border-style: dashed;
+    background: rgba(18, 17, 13, 0.95);
+  }
+
+  .workflow-rf-node--doc-reference {
+    border-color: rgba(245, 158, 11, 0.56);
+  }
+
+  .workflow-rf-node--doc-summary {
+    border-color: rgba(45, 212, 191, 0.52);
+  }
+
+  .workflow-rf-node--doc-standup {
+    border-color: rgba(125, 211, 252, 0.5);
+  }
+
+  .workflow-rf-node--doc-intervention {
+    border-color: rgba(251, 113, 133, 0.56);
+  }
+
+  .workflow-rf-node--success,
+  .workflow-rf-node--session-completed {
+    border-color: rgba(34, 197, 94, 0.9);
+    box-shadow:
+      0 0 0 2px rgba(34, 197, 94, 0.34),
+      0 0 30px rgba(34, 197, 94, 0.16),
+      0 18px 40px rgba(0, 0, 0, 0.36);
+  }
+
+  .workflow-rf-node--active,
+  .workflow-rf-node--session-running {
+    border-color: rgba(59, 130, 246, 0.95);
+    box-shadow:
+      0 0 0 2px rgba(59, 130, 246, 0.42),
+      0 0 34px rgba(59, 130, 246, 0.22),
+      0 18px 40px rgba(0, 0, 0, 0.38);
+  }
+
+  .workflow-rf-node--danger,
+  .workflow-rf-node--session-blocked {
+    border-color: rgba(244, 63, 94, 0.95);
+    box-shadow:
+      0 0 0 2px rgba(244, 63, 94, 0.34),
+      0 0 34px rgba(244, 63, 94, 0.16),
+      0 18px 40px rgba(0, 0, 0, 0.38);
+  }
+
+  .workflow-rf-node--pending,
+  .workflow-rf-node--session-idle,
+  .workflow-rf-node--session-pending,
+  .workflow-rf-node--session-paused {
+    box-shadow:
+      0 0 0 1px rgba(148, 163, 184, 0.2),
+      0 18px 40px rgba(0, 0, 0, 0.34);
+  }
+
+  .workflow-rf-node--current-session {
+    border-color: rgba(245, 158, 11, 1);
+    box-shadow:
+      0 0 0 3px rgba(245, 158, 11, 0.58),
+      0 0 38px rgba(245, 158, 11, 0.24),
+      0 18px 40px rgba(0, 0, 0, 0.4);
+  }
+
+  .workflow-rf-node__body {
+    display: flex;
+    min-width: 0;
+    flex: 1;
+    flex-direction: column;
+    justify-content: center;
+    gap: 7px;
+    padding: 14px 16px;
+  }
+
+  .workflow-rf-node__meta {
+    display: flex;
+    min-width: 0;
+    align-items: center;
+    gap: 7px;
+    color: rgba(202, 213, 226, 0.78);
+    font-size: 12px;
+    line-height: 1.15;
+  }
+
+  .workflow-rf-node__role-icon {
+    position: relative;
+    display: inline-flex;
+    width: 16px;
+    height: 16px;
+    flex: 0 0 auto;
+    border-radius: 9999px;
+    background: rgba(226, 232, 240, 0.13);
+  }
+
+  .workflow-rf-node__role-icon::before {
+    content: "";
+    position: absolute;
+    top: 3px;
+    left: 5px;
+    width: 6px;
+    height: 6px;
+    border-radius: 9999px;
+    background: currentColor;
+  }
+
+  .workflow-rf-node__role-icon::after {
+    content: "";
+    position: absolute;
+    bottom: 3px;
+    left: 3px;
+    width: 10px;
+    height: 5px;
+    border-radius: 8px 8px 3px 3px;
+    background: currentColor;
+    opacity: 0.9;
+  }
+
+  .workflow-rf-node__label,
+  .workflow-rf-node__summary {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .workflow-rf-node__summary {
+    margin-left: auto;
+    max-width: 42%;
+    color: rgba(202, 213, 226, 0.62);
+    font-size: 11px;
+  }
+
+  .workflow-rf-node__title {
+    display: -webkit-box;
+    overflow: hidden;
+    color: rgba(248, 250, 252, 0.98);
+    font-size: 15px;
+    font-weight: 650;
+    line-height: 1.22;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 2;
+  }
+
+  .workflow-rf-node__status {
+    align-self: flex-start;
+    border-radius: 5px;
+    background: rgba(15, 23, 42, 0.68);
+    color: rgba(226, 232, 240, 0.9);
+    padding: 3px 7px;
+    font-size: 11px;
+    font-weight: 600;
+    line-height: 1;
+  }
+
+  .workflow-rf-node--success .workflow-rf-node__status,
+  .workflow-rf-node--session-completed .workflow-rf-node__status {
+    background: rgba(22, 101, 52, 0.72);
+    color: rgba(220, 252, 231, 0.96);
+  }
+
+  .workflow-rf-node--active .workflow-rf-node__status,
+  .workflow-rf-node--session-running .workflow-rf-node__status {
+    background: rgba(30, 64, 175, 0.72);
+    color: rgba(219, 234, 254, 0.96);
+  }
+
+  .workflow-rf-node--danger .workflow-rf-node__status,
+  .workflow-rf-node--session-blocked .workflow-rf-node__status {
+    background: rgba(159, 18, 57, 0.72);
+    color: rgba(255, 228, 230, 0.98);
+  }
+
+  .workflow-rf-node--pending .workflow-rf-node__status,
+  .workflow-rf-node--session-idle .workflow-rf-node__status,
+  .workflow-rf-node--session-paused .workflow-rf-node__status {
+    background: rgba(51, 65, 85, 0.7);
+    color: rgba(226, 232, 240, 0.78);
+  }
+
+  .workflow-rf-node__locator {
+    position: absolute;
+    top: -10px;
+    right: -10px;
+    width: 20px;
+    height: 20px;
+    border: 2px solid rgba(245, 158, 11, 1);
+    border-radius: 9999px;
+    background: rgba(15, 23, 42, 0.96);
+  }
+
+  .workflow-rf-node__locator::before,
+  .workflow-rf-node__locator::after {
+    content: "";
+    position: absolute;
+    background: rgba(245, 158, 11, 1);
+  }
+
+  .workflow-rf-node__locator::before {
+    top: 3px;
+    bottom: 3px;
+    left: 8px;
+    width: 2px;
+  }
+
+  .workflow-rf-node__locator::after {
+    top: 8px;
+    left: 3px;
+    right: 3px;
+    height: 2px;
+  }
+
+  .workflow-rf-node__prompt {
+    position: absolute;
+    z-index: 40;
+    left: 16px;
+    bottom: calc(100% + 10px);
+    display: none;
+    width: min(460px, 72vw);
+    max-height: 220px;
+    overflow: auto;
+    border: 1px solid rgba(148, 163, 184, 0.36);
+    border-radius: 8px;
+    background: rgba(18, 22, 28, 0.98);
+    box-shadow: 0 18px 50px rgba(0, 0, 0, 0.52);
+    color: rgba(241, 245, 249, 0.94);
+    padding: 12px 14px;
+    font-size: 13px;
+    line-height: 1.45;
+    white-space: pre-wrap;
+  }
+
+  .workflow-rf-node:hover .workflow-rf-node__prompt {
+    display: block;
+  }
+
+  .workflow-rf-handle {
+    width: 9px;
+    height: 9px;
+    border: 1px solid rgba(226, 232, 240, 0.68);
+    background: rgba(15, 23, 42, 0.98);
+  }
+
+  .workflow-rf-edge .react-flow__edge-path {
+    stroke: rgba(135, 158, 184, 0.7);
+  }
+
+  .workflow-rf-edge--entry .react-flow__edge-path,
+  .workflow-rf-edge--dependency .react-flow__edge-path {
+    stroke-dasharray: 7 7;
+  }
+
+  .workflow-rf-edge--session .react-flow__edge-path {
+    stroke: rgba(125, 211, 252, 0.72);
+  }
+
+  .workflow-rf-edge--tester .react-flow__edge-path {
+    stroke: rgba(251, 191, 36, 0.72);
+  }
+
+  .workflow-rf-edge--consultation .react-flow__edge-path,
+  .workflow-rf-edge-label--consultation {
+    stroke: rgba(245, 158, 11, 0.86);
+    color: rgba(253, 230, 138, 0.96);
+  }
+
+  .workflow-rf-edge--document .react-flow__edge-path,
+  .workflow-rf-edge-label--document {
+    stroke: rgba(168, 85, 247, 0.62);
+    color: rgba(233, 213, 255, 0.94);
+  }
+
+  .workflow-rf-edge-label {
+    position: absolute;
+    pointer-events: all;
+    border: 1px solid rgba(148, 163, 184, 0.22);
+    border-radius: 4px;
+    background: rgba(15, 23, 42, 0.94);
+    padding: 2px 5px;
+    font-size: 10px;
+    font-weight: 600;
+    line-height: 1;
+    white-space: nowrap;
+  }
 }

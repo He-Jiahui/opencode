@@ -9,7 +9,7 @@ import { TextField } from "@opencode-ai/ui/text-field"
 import { useMutation } from "@tanstack/solid-query"
 import { showToast } from "@/utils/toast"
 import { useNavigate } from "@solidjs/router"
-import { createEffect, createMemo, createResource, Show } from "solid-js"
+import { batch, createEffect, createMemo, createResource, Show } from "solid-js"
 import { createStore } from "solid-js/store"
 import { ServerHealthIndicator, ServerRow } from "@/components/server/server-row"
 import { useGlobal } from "@/context/global"
@@ -371,8 +371,13 @@ export function useServerManagementController(options: { onSelect?: () => void; 
       navigate("/")
       return
     }
-    navigate("/")
-    queueMicrotask(() => server.setActive(ServerConnection.key(conn)))
+    // Run navigate + setActive in the same tick so Solid disposes the old
+    // subtree once instead of cascading the route change disposal into the
+    // ServerKey remount.
+    batch(() => {
+      navigate("/")
+      server.setActive(ServerConnection.key(conn))
+    })
   }
 
   const handleAddChange = (value: string) => {

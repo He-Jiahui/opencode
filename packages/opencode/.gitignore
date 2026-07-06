@@ -6,3 +6,4 @@ app.log
 script/build-*.ts
 temporary-*.md
 .artifacts
+script/.models-dev-snapshot.json

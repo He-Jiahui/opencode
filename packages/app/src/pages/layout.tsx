@@ -30,8 +30,6 @@ import { Session } from "@opencode-ai/sdk/v2/client"
 import { usePlatform } from "@/context/platform"
 import { useSettings } from "@/context/settings"
 import { createStore, produce, reconcile } from "solid-js/store"
-import { DragDropProvider, DragDropSensors, DragOverlay, SortableProvider, closestCenter } from "@thisbeyond/solid-dnd"
-import type { DragEvent } from "@thisbeyond/solid-dnd"
 import { useProviders } from "@/hooks/use-providers"
 import { toaster } from "@opencode-ai/ui/toast"
 import { setV2Toast, showToast, ToastRegion } from "@/utils/toast"
@@ -52,7 +50,6 @@ import { SessionRouteKey, SessionStateKey } from "@/utils/server-scope"
 import { useDialog } from "@opencode-ai/ui/context/dialog"
 import { useTheme, type ColorScheme } from "@opencode-ai/ui/theme/context"
 import { useCommand, type CommandOption } from "@/context/command"
-import { ConstrainDragXAxis, getDraggableId } from "@/utils/solid-dnd"
 import { DebugBar } from "@/components/debug-bar"
 import { HelpButton } from "@/components/help-button"
 import { Titlebar, type TitlebarUpdate } from "@/components/titlebar"
@@ -77,10 +74,9 @@ import { createInlineEditorController } from "./layout/inline-editor"
 import {
   LocalWorkspace,
   SortableWorkspace,
-  WorkspaceDragOverlay,
   type WorkspaceSidebarContext,
 } from "./layout/sidebar-workspace"
-import { ProjectDragOverlay, SortableProject, type ProjectSidebarContext } from "./layout/sidebar-project"
+import { SortableProject, type ProjectSidebarContext } from "./layout/sidebar-project"
 import { SidebarContent } from "./layout/sidebar-shell"
 
 export default function LegacyLayout(props: ParentProps) {
@@ -89,8 +85,6 @@ export default function LegacyLayout(props: ParentProps) {
     Persist.serverGlobal(serverSDK().scope, "layout.page", ["layout.page.v1"]),
     createStore({
       lastProjectSession: {} as { [directory: string]: { directory: string; id: string; at: number } },
-      activeProject: undefined as string | undefined,
-      activeWorkspace: undefined as string | undefined,
       workspaceOrder: {} as Record<string, string[]>,
       workspaceName: {} as Record<string, string>,
       workspaceBranchName: {} as Record<string, Record<string, string>>,
@@ -471,7 +465,7 @@ export default function LegacyLayout(props: ParentProps) {
           actions: [
             {
               label: language.t("notification.action.goToSession"),
-              onClick: () => navigate(href),
+              onClick: () => navigateWithSidebarReset(href),
             },
             {
               label: language.t("common.dismiss"),
@@ -888,9 +882,9 @@ export default function LegacyLayout(props: ParentProps) {
     )
     if (session.id === params.id) {
       if (nextSession) {
-        navigate(`/${params.dir}/session/${nextSession.id}`)
+        navigateWithSidebarReset(`/${params.dir}/session/${nextSession.id}`)
       } else {
-        navigate(`/${params.dir}/session`)
+        navigateWithSidebarReset(`/${params.dir}/session`)
       }
     }
   }
@@ -1308,9 +1302,18 @@ export default function LegacyLayout(props: ParentProps) {
     navigateWithSidebarReset(`/${base64Encode(root)}/session`)
   }
 
-  function navigateToSession(session: Session | undefined) {
-    if (!session) return
-    navigateWithSidebarReset(`/${base64Encode(session.directory)}/session/${session.id}`)
+  function navigateToSession(session: Session | undefined): void
+  function navigateToSession(directory: string, id: string): void
+  function navigateToSession(input: Session | string | undefined, id?: string) {
+    if (!input) return
+    const directory = typeof input === "string" ? input : input.directory
+    const sessionID = typeof input === "string" ? id : input.id
+    if (!sessionID) return
+    const root = syncSessionRoute(directory, sessionID, projectRoot(directory))
+    server.projects.touch(root)
+    layout.projects.open(root)
+    layout.sidebar.open()
+    navigateWithSidebarReset(`/${base64Encode(directory)}/session/${sessionID}`)
   }
 
   function openProject(directory: string, navigate = true) {
@@ -1383,7 +1386,7 @@ export default function LegacyLayout(props: ParentProps) {
 
     if (list.length === 1) {
       layout.projects.close(directory)
-      navigate("/")
+      navigateWithSidebarReset("/")
       return
     }
 
@@ -1565,8 +1568,7 @@ export default function LegacyLayout(props: ParentProps) {
           label: language.t("command.session.new"),
           onClick: () => {
             const href = `/${base64Encode(directory)}/session`
-            navigate(href)
-            layout.mobileSidebar.hide()
+            navigateWithSidebarReset(href)
           },
         },
         {
@@ -1799,29 +1801,6 @@ export default function LegacyLayout(props: ParentProps) {
     ),
   )
 
-  function handleDragStart(event: unknown) {
-    const id = getDraggableId(event)
-    if (!id) return
-    setHoverProject(undefined)
-    setStore("activeProject", id)
-  }
-
-  function handleDragOver(event: DragEvent) {
-    const { draggable, droppable } = event
-    if (draggable && droppable) {
-      const projects = layout.projects.list()
-      const fromIndex = projects.findIndex((p) => p.worktree === draggable.id.toString())
-      const toIndex = projects.findIndex((p) => p.worktree === droppable.id.toString())
-      if (fromIndex !== toIndex && toIndex !== -1) {
-        layout.projects.move(draggable.id.toString(), toIndex)
-      }
-    }
-  }
-
-  function handleDragEnd() {
-    setStore("activeProject", undefined)
-  }
-
   function workspaceIds(project: LocalProject | undefined) {
     if (!project) return []
     const local = project.worktree
@@ -1847,40 +1826,6 @@ export default function LegacyLayout(props: ParentProps) {
     if (hovered) return hovered
     return currentProject()
   })
-
-  function handleWorkspaceDragStart(event: unknown) {
-    const id = getDraggableId(event)
-    if (!id) return
-    setStore("activeWorkspace", id)
-  }
-
-  function handleWorkspaceDragOver(event: DragEvent) {
-    const { draggable, droppable } = event
-    if (!draggable || !droppable) return
-
-    const project = sidebarProject()
-    if (!project) return
-
-    const ids = workspaceIds(project)
-    const fromIndex = ids.findIndex((dir) => dir === draggable.id.toString())
-    const toIndex = ids.findIndex((dir) => dir === droppable.id.toString())
-    if (fromIndex === -1 || toIndex === -1) return
-    if (fromIndex === toIndex) return
-
-    const result = ids.slice()
-    const [item] = result.splice(fromIndex, 1)
-    if (!item) return
-    result.splice(toIndex, 0, item)
-    setStore(
-      "workspaceOrder",
-      project.worktree,
-      result.filter((directory) => pathKey(directory) !== pathKey(project.worktree)),
-    )
-  }
-
-  function handleWorkspaceDragEnd() {
-    setStore("activeWorkspace", undefined)
-  }
 
   const createWorkspace = async (project: LocalProject) => {
     clearSidebarHoverState()
@@ -1967,6 +1912,7 @@ export default function LegacyLayout(props: ParentProps) {
       setState("hoverProject", hoverOpen ? worktree : undefined)
     },
     navigateToProject,
+    navigateToSession,
     openSidebar: () => layout.sidebar.open(),
     closeProject,
     showEditProjectDialog: (proj) => showEditProjectDialog(server.current!, proj),
@@ -2211,42 +2157,24 @@ export default function LegacyLayout(props: ParentProps) {
                       </Button>
                     </div>
                     <div class="relative flex-1 min-h-0">
-                      <DragDropProvider
-                        onDragStart={handleWorkspaceDragStart}
-                        onDragEnd={handleWorkspaceDragEnd}
-                        onDragOver={handleWorkspaceDragOver}
-                        collisionDetector={closestCenter}
+                      <div
+                        ref={(el) => {
+                          if (!panelProps.mobile) scrollContainerRef = el
+                        }}
+                        class="size-full flex flex-col py-2 gap-4 overflow-y-auto no-scrollbar [overflow-anchor:none]"
                       >
-                        <DragDropSensors />
-                        <ConstrainDragXAxis />
-                        <div
-                          ref={(el) => {
-                            if (!panelProps.mobile) scrollContainerRef = el
-                          }}
-                          class="size-full flex flex-col py-2 gap-4 overflow-y-auto no-scrollbar [overflow-anchor:none]"
-                        >
-                          <SortableProvider ids={workspaces()}>
-                            <For each={workspaces()}>
-                              {(directory) => (
-                                <SortableWorkspace
-                                  ctx={workspaceSidebarCtx}
-                                  directory={directory}
-                                  project={project}
-                                  sortNow={sortNow}
-                                  mobile={panelProps.mobile}
-                                />
-                              )}
-                            </For>
-                          </SortableProvider>
-                        </div>
-                        <DragOverlay>
-                          <WorkspaceDragOverlay
-                            sidebarProject={sidebarProject}
-                            activeWorkspace={() => store.activeWorkspace}
-                            workspaceLabel={workspaceLabel}
-                          />
-                        </DragOverlay>
-                      </DragDropProvider>
+                        <For each={workspaces()}>
+                          {(directory) => (
+                            <SortableWorkspace
+                              ctx={workspaceSidebarCtx}
+                              directory={directory}
+                              project={project}
+                              sortNow={sortNow}
+                              mobile={panelProps.mobile}
+                            />
+                          )}
+                        </For>
+                      </div>
                     </div>
                   </>
                 </Show>
@@ -2288,7 +2216,6 @@ export default function LegacyLayout(props: ParentProps) {
   }
 
   const projects = () => layout.projects.list()
-  const projectOverlay = () => <ProjectDragOverlay projects={projects} activeProject={() => store.activeProject} />
   const sidebarContent = (mobile?: boolean) => (
     <SidebarContent
       mobile={mobile}
@@ -2298,13 +2225,9 @@ export default function LegacyLayout(props: ParentProps) {
       renderProject={(project) => (
         <SortableProject ctx={projectSidebarCtx} project={project} sortNow={sortNow} mobile={mobile} />
       )}
-      handleDragStart={handleDragStart}
-      handleDragEnd={handleDragEnd}
-      handleDragOver={handleDragOver}
       openProjectLabel={language.t("command.project.open")}
       openProjectKeybind={() => command.keybind("project.open")}
       onOpenProject={chooseProject}
-      renderProjectOverlay={projectOverlay}
       settingsLabel={() => language.t("sidebar.settings")}
       settingsKeybind={() => command.keybind("settings.open")}
       onOpenSettings={openSettings}

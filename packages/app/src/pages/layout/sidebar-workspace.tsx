@@ -1,7 +1,6 @@
 import { useNavigate, useParams } from "@solidjs/router"
 import { createEffect, createMemo, For, Show, type Accessor, type JSX } from "solid-js"
 import { createStore } from "solid-js/store"
-import { createSortable } from "@thisbeyond/solid-dnd"
 import { createMediaQuery } from "@solid-primitives/media"
 import { base64Encode } from "@opencode-ai/core/util/encode"
 import { getFilename } from "@opencode-ai/core/util/path"
@@ -313,7 +312,6 @@ export const SortableWorkspace = (props: {
   const serverSync = useServerSync()
   const queryOptions = useQueryOptions()
   const language = useLanguage()
-  const sortable = createSortable(props.directory)
   const [workspaceStore, setWorkspaceStore] = serverSync().child(props.directory, { bootstrap: false })
   const [menu, setMenu] = createStore({
     open: false,
@@ -373,10 +371,7 @@ export const SortableWorkspace = (props: {
 
   return (
     <div
-      // @ts-ignore
-      use:sortable
       classList={{
-        "opacity-30": sortable.isActiveDraggable,
         "opacity-50 pointer-events-none": busy(),
       }}
     >

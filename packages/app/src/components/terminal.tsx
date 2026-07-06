@@ -637,17 +637,29 @@ export const Terminal = (props: TerminalProps) => {
     drop?.()
     if (ws && ws.readyState !== WebSocket.CLOSED && ws.readyState !== WebSocket.CLOSING) ws.close(1000)
 
+    // Defer finalize (persistTerminal + local cleanup()) to a microtask so
+    // that its synchronous store write inside `persistTerminal` — which
+    // flows through `props.onCleanup` -> `ops.update` -> `update()` in
+    // `context/terminal.tsx` and calls `setStore("all", i, ...)` — does
+    // NOT run inside the outer solid cleanNode cascade. Running it
+    // synchronously mid-cascade races with solid's recursive owned
+    // iteration (readSignal on a stale memo re-enters updateComputation,
+    // which nulls an ancestor's owned while the outer loop is still
+    // iterating it) and crashes with "Cannot read properties of null"
+    // at node.owned[i] inside cleanNode. queueMicrotask runs after the
+    // current sync reactive flush, so the store write lands in a fresh tick.
     const finalize = () => {
       persistTerminal({ term, addon: serializeAddon, cursor, id, onCleanup: props.onCleanup })
       cleanup()
     }
+    const schedule = () => queueMicrotask(finalize)
 
     if (!output) {
-      finalize()
+      schedule()
       return
     }
 
-    output.flush(finalize)
+    output.flush(schedule)
   })
 
   return (

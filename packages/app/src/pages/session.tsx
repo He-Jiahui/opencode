@@ -106,6 +106,25 @@ type FollowupItem = FollowupDraft & { id: string }
 type FollowupEdit = Pick<FollowupItem, "id" | "prompt" | "context">
 const emptyFollowups: FollowupItem[] = []
 const emptyWorkflowList: WorkflowGraph["workflow"][] = []
+const workflowStartTimeoutMS = 45_000
+
+function workflowStartRequest<T>(request: (signal: AbortSignal) => Promise<T>, externalSignal?: AbortSignal) {
+  const controller = externalSignal ? undefined : new AbortController()
+  const signal = externalSignal ?? controller!.signal
+  let timeoutID: number | undefined
+  const timeout = new Promise<never>((_, reject) => {
+    timeoutID = window.setTimeout(
+      () => {
+        controller?.abort()
+        reject(new Error("Workflow start request timed out. Please retry after the service recovers."))
+      },
+      workflowStartTimeoutMS,
+    )
+  })
+  return Promise.race([request(signal), timeout]).finally(() => {
+    if (timeoutID !== undefined) window.clearTimeout(timeoutID)
+  })
+}
 
 type ChangeMode = "git" | "branch" | "turn"
 type VcsMode = "git" | "branch"
@@ -146,15 +165,39 @@ const workflowStatusTone = (status: string) => {
   return "bg-accent/10 text-accent"
 }
 const workflowSessionLogStatusTone = (status: string) => {
-  if (status === "approved" || status === "completed" || status === "done" || status === "active" || status === "running")
+  if (
+    status === "approved" ||
+    status === "completed" ||
+    status === "done" ||
+    status === "active" ||
+    status === "running" ||
+    status === "working"
+  )
     return "bg-success/10 text-success"
-  if (status === "rejected" || status === "blocked" || status === "failed" || status === "cancelled" || status === "paused")
+  if (
+    status === "rejected" ||
+    status === "blocked" ||
+    status === "blocked_waiting" ||
+    status === "failed" ||
+    status === "cancelled"
+  )
     return "bg-danger/10 text-danger"
-  if (status === "pending" || status === "untriggered") return "bg-surface-element text-text-weak"
+  if (status === "pending" || status === "untriggered" || status === "idle" || status === "paused")
+    return "bg-surface-element text-text-weak"
   return "bg-accent/10 text-accent"
 }
 const workflowSessionLogAttempt = (attempt: WorkflowGraph["milestones"][number]["attempt"] | undefined) =>
   typeof attempt === "number" ? attempt : undefined
+const workflowMemberLogStatus = (
+  member: WorkflowGraph["members"][number] | undefined,
+  fallback: string,
+  running: boolean,
+) => {
+  if (running) return "running"
+  if (member?.status === "paused") return "paused"
+  if (member?.availability) return member.availability
+  return fallback
+}
 
 const workflowSessionLogGroups = (
   graph: WorkflowGraph,
@@ -164,13 +207,22 @@ const workflowSessionLogGroups = (
   const memberBySessionRole = new Map(
     graph.members.map((member) => [workflowSessionRefKey(member.role, member.sessionID), member] as const),
   )
+  const requesterMember = graph.workflow.rootSessionID
+    ? memberBySessionRole.get(workflowSessionRefKey("requester", graph.workflow.rootSessionID))
+    : undefined
+  const mainPMMember = graph.workflow.pmSessionID
+    ? memberBySessionRole.get(workflowSessionRefKey("main_pm", graph.workflow.pmSessionID))
+    : undefined
+  const testerMember = graph.workflow.testerSessionID
+    ? memberBySessionRole.get(workflowSessionRefKey("tester", graph.workflow.testerSessionID))
+    : undefined
   const baseEntryCandidates: (WorkflowSessionLogEntry | undefined)[] = [
     graph.workflow.rootSessionID
       ? {
           role: "requester",
           source: "workflow",
           title: graph.workflow.title,
-          status: sessionRunning(graph.workflow.rootSessionID) ? "running" : graph.workflow.status,
+          status: workflowMemberLogStatus(requesterMember, graph.workflow.status, sessionRunning(graph.workflow.rootSessionID)),
           sessionID: graph.workflow.rootSessionID,
           current: graph.workflow.rootSessionID === currentSessionID,
         }
@@ -180,7 +232,7 @@ const workflowSessionLogGroups = (
           role: "main_pm",
           source: "workflow",
           title: "Main product manager",
-          status: sessionRunning(graph.workflow.pmSessionID) ? "running" : graph.workflow.status,
+          status: workflowMemberLogStatus(mainPMMember, graph.workflow.status, sessionRunning(graph.workflow.pmSessionID)),
           sessionID: graph.workflow.pmSessionID,
           current: graph.workflow.pmSessionID === currentSessionID,
         }
@@ -190,7 +242,7 @@ const workflowSessionLogGroups = (
           role: "tester",
           source: "workflow",
           title: "Tester",
-          status: sessionRunning(graph.workflow.testerSessionID) ? "running" : graph.workflow.status,
+          status: workflowMemberLogStatus(testerMember, graph.workflow.status, sessionRunning(graph.workflow.testerSessionID)),
           sessionID: graph.workflow.testerSessionID,
           current: graph.workflow.testerSessionID === currentSessionID,
         }
@@ -204,7 +256,7 @@ const workflowSessionLogGroups = (
         role: ref.role,
         source: "trigger",
         title: member?.title ?? `${ref.role} ${milestone.title ?? milestone.id}`,
-        status: sessionRunning(ref.sessionID) ? "running" : milestone.status,
+        status: workflowMemberLogStatus(member, milestone.status, sessionRunning(ref.sessionID)),
         sessionID: ref.sessionID,
         specialty: member?.specialty ?? milestone.department,
         milestoneID: String(ref.milestoneID ?? milestone.id),
@@ -226,7 +278,7 @@ const workflowSessionLogGroups = (
         role: member.role,
         source: "staff",
         title: member.title,
-        status: sessionRunning(member.sessionID) ? "running" : "untriggered",
+        status: workflowMemberLogStatus(member, "untriggered", sessionRunning(member.sessionID)),
         sessionID: member.sessionID,
         specialty: member.specialty,
         current: member.sessionID === currentSessionID,
@@ -852,17 +904,18 @@ export default function Page() {
     return workflowSessionLogGroups(graph, params.id, (sessionID) => sync().data.session_working(sessionID))
   })
   const [workflowMenu, setWorkflowMenu] = createSignal<WorkflowReactFlowContextTarget>()
+  let workflowGraphRefreshKey = ""
 
-  createEffect(
-    on(
-      () => activeWorkflow()?.id,
-      (workflowID) => {
-        if (!workflowID) return
-        if (sync().data.workflow_graph[workflowID]) return
-        void refreshWorkflowGraph(workflowID)
-      },
-    ),
-  )
+  createEffect(() => {
+    const workflow = activeWorkflow()
+    if (!workflow) return
+    const key = `${workflow.id}:${workflow.time.updated}:${sync().data.workflow_graph_version[workflow.id] ?? 0}`
+    if (key === workflowGraphRefreshKey && sync().data.workflow_graph[workflow.id]) return
+    workflowGraphRefreshKey = key
+    void refreshWorkflowGraph(workflow.id).catch(() => {
+      if (workflowGraphRefreshKey === key) workflowGraphRefreshKey = ""
+    })
+  })
 
   const workflowPrompt = () => {
     const message = lastUserMessage()
@@ -904,25 +957,32 @@ export default function Page() {
           variants={workflowVariants()}
           initialVariant={local.model.variant.current() ?? "default"}
           pending={store.workflowPending}
-          onStart={(input) => {
+          onStart={(input, control) => {
             setStore("workflowPending", true)
-            void sdk()
-              .client.workflow.start({
-                workflowStartInput: {
-                  ...(params.id ? { sessionID: params.id } : {}),
-                  prompt: input.request,
-                  model: workflowModel(),
-                  variant: input.variant,
-                  agent: local.agent.current()?.name,
-                  staffing: input.staffing,
-                  modelWhitelist: input.modelWhitelist,
-                },
-              })
+            return workflowStartRequest(
+              (signal) =>
+                sdk().client.workflow.start(
+                  {
+                    workflowStartInput: {
+                      ...(params.id ? { sessionID: params.id } : {}),
+                      prompt: input.request,
+                      model: workflowModel(),
+                      variant: input.variant,
+                      agent: local.agent.current()?.name,
+                      staffing: input.staffing,
+                      modelWhitelist: input.modelWhitelist,
+                    },
+                  },
+                  { signal },
+                ),
+              control.signal,
+            )
               .then((result) => {
                 dialog.close()
                 if (result.data) {
                   sync().set("workflow", (items) => [...items.filter((item) => item.id !== result.data!.id), result.data!])
                   void refreshWorkflowGraph(result.data.id)
+                  void sync().session.fetch(0)
                 }
                 showToast({
                   variant: "success",
@@ -930,13 +990,14 @@ export default function Page() {
                   title: language.t("session.workflow.started.title"),
                 })
               })
-              .catch((error: unknown) =>
+              .catch((error: unknown) => {
                 showToast({
                   variant: "error",
                   title: language.t("common.requestFailed"),
                   description: formatServerError(error, language.t),
-                }),
-              )
+                })
+                throw error
+              })
               .finally(() => setStore("workflowPending", false))
           }}
         />
@@ -952,21 +1013,32 @@ export default function Page() {
           variants={workflowVariants()}
           initialVariant={local.model.variant.current() ?? "default"}
           pending={store.workflowPending}
-          onStart={(input) => {
+          onStart={(input, control) => {
             setStore("workflowPending", true)
-            void sdk()
-              .client.workflow.start({
-                workflowStartInput: {
-                  prompt: input.request,
-                  model: workflowModel(),
-                  variant: input.variant,
-                  agent: local.agent.current()?.name,
-                  staffing: input.staffing,
-                  modelWhitelist: input.modelWhitelist,
-                },
-              })
+            return workflowStartRequest(
+              (signal) =>
+                sdk().client.workflow.start(
+                  {
+                    workflowStartInput: {
+                      prompt: input.request,
+                      model: workflowModel(),
+                      variant: input.variant,
+                      agent: local.agent.current()?.name,
+                      staffing: input.staffing,
+                      modelWhitelist: input.modelWhitelist,
+                    },
+                  },
+                  { signal },
+                ),
+              control.signal,
+            )
               .then((result) => {
                 dialog.close()
+                if (result.data) {
+                  sync().set("workflow", (items) => [...items.filter((item) => item.id !== result.data!.id), result.data!])
+                  void refreshWorkflowGraph(result.data.id)
+                  void sync().session.fetch(0)
+                }
                 showToast({
                   variant: "success",
                   icon: "circle-check",
@@ -975,13 +1047,14 @@ export default function Page() {
                 const rootSessionID = result.data?.rootSessionID
                 if (rootSessionID) navigate(sessionHref(server.key, rootSessionID))
               })
-              .catch((error: unknown) =>
+              .catch((error: unknown) => {
                 showToast({
                   variant: "error",
                   title: language.t("common.requestFailed"),
                   description: formatServerError(error, language.t),
-                }),
-              )
+                })
+                throw error
+              })
               .finally(() => setStore("workflowPending", false))
           }}
         />
@@ -1065,17 +1138,23 @@ export default function Page() {
     openWorkflowSession(target.sessionID)
   }
 
-  const workflowSessionState = (graph: WorkflowGraph) =>
-    Object.fromEntries(
+  const workflowSessionState = (graph: WorkflowGraph) => {
+    const members = new Map(graph.members.map((member) => [member.sessionID, member] as const))
+    return Object.fromEntries(
       graph.nodes
         .map((node): [string, WorkflowReactFlowSessionState] | undefined => {
           if (!node.sessionID) return
           if (sync().data.session_working(node.sessionID)) return [node.sessionID, "running"]
-          if (node.type === "session") return [node.sessionID, "completed"]
+          const member = members.get(node.sessionID)
+          if (member?.status === "paused") return [node.sessionID, "paused"]
+          if (member?.availability === "working") return [node.sessionID, "running"]
+          if (member?.availability === "blocked_waiting") return [node.sessionID, "blocked"]
+          if (member?.availability === "idle") return [node.sessionID, "idle"]
           return
         })
         .filter((entry): entry is [string, WorkflowReactFlowSessionState] => !!entry),
     )
+  }
 
   const workflowNodeContextMenu = (target: WorkflowReactFlowContextTarget) => {
     setWorkflowMenu(target)
@@ -1098,7 +1177,7 @@ export default function Page() {
   }
 
   const workflowSessionLogStatusLabel = (status: string) =>
-    status === "untriggered" ? language.t("session.workflow.sessionLog.untriggered") : status
+    status === "untriggered" ? language.t("session.workflow.sessionLog.untriggered") : status.replace(/_/g, " ")
 
   const WorkflowGraphView = (props: { graph: WorkflowGraph; fullscreen?: boolean }) => {
     const [host, setHost] = createSignal<HTMLDivElement>()

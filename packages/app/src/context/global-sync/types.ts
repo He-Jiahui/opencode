@@ -55,6 +55,9 @@ export type State = {
   workflow_graph: {
     [workflowID: string]: WorkflowGraph
   }
+  workflow_graph_version: {
+    [workflowID: string]: number
+  }
   session_status: {
     [sessionID: string]: SessionStatus
   }

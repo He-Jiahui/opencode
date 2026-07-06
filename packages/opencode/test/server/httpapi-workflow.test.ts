@@ -3,7 +3,9 @@ import { afterEach, describe, expect } from "bun:test"
 import { Effect, Layer } from "effect"
 import { HttpRouter } from "effect/unstable/http"
 import path from "path"
+import { mkdir } from "fs/promises"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
+import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { createOpencodeClient } from "@opencode-ai/sdk/v2"
 import { InstanceBootstrap } from "../../src/project/bootstrap-service"
 import { InstanceStore } from "../../src/project/instance-store"
@@ -14,14 +16,13 @@ import { Database } from "../../src/storage/db"
 import { WorkflowID } from "../../src/workflow/schema"
 import { resetDatabase } from "../fixture/db"
 import { disposeAllInstances, TestInstance } from "../fixture/fixture"
-import { testEffect } from "../lib/effect"
+import { pollWithTimeout, testEffect } from "../lib/effect"
 
+const noopBootstrapLayer = Layer.succeed(InstanceBootstrap.Service, InstanceBootstrap.Service.of({ run: Effect.void }))
 const it = testEffect(
-  Layer.mergeAll(
-    CrossSpawnSpawner.defaultLayer,
-    InstanceStore.defaultLayer.pipe(
-      Layer.provide(Layer.succeed(InstanceBootstrap.Service, InstanceBootstrap.Service.of({ run: Effect.void }))),
-    ),
+  LayerNode.compile(
+    LayerNode.group([CrossSpawnSpawner.node, InstanceStore.node]),
+    [[InstanceStore.bootstrapNode, noopBootstrapLayer]],
   ),
 )
 
@@ -55,6 +56,15 @@ function client(directory: string) {
   })
 }
 
+function requestWithTimeout<T>(request: () => Promise<T>, message: string) {
+  return Effect.promise(request).pipe(
+    Effect.timeoutOrElse({
+      duration: "5 seconds",
+      orElse: () => Effect.fail(new Error(message)),
+    }),
+  )
+}
+
 describe("workflow HttpApi", () => {
   afterEach(async () => {
     await disposeAllInstances()
@@ -75,22 +85,34 @@ describe("workflow HttpApi", () => {
       const sdk = client(test.directory)
       const session = yield* Effect.promise(() => sdk.session.create({ title: "Workflow source" }))
       if (!session.data) throw new Error("session create returned no data")
-      const workflow = yield* Effect.promise(() =>
+      const workflow = yield* requestWithTimeout(() =>
         sdk.workflow.start({
           workflowStartInput: {
             sessionID: session.data.id,
             prompt: "Build a targeted workflow",
           },
         }),
+        "workflow start timed out",
       )
       if (!workflow.data) throw new Error("workflow start returned no data")
 
       expect(workflow.data.request).toBe("Build a targeted workflow")
       expect(workflow.data.rootSessionID).toBe(session.data.id)
       expect(workflow.data.path.startsWith(`${path.join(".opencode", "workflows")}${path.sep}`)).toBe(true)
-      expect(path.basename(workflow.data.path)).toEndWith("Build a targeted workflow")
+      expect(path.basename(workflow.data.path)).toBe(workflow.data.id)
 
-      const graph = yield* Effect.promise(() => sdk.workflow.graph({ workflowID: workflow.data.id }))
+      const graph = yield* pollWithTimeout(
+        Effect.gen(function* () {
+          const result = yield* requestWithTimeout(() => sdk.workflow.graph({ workflowID: workflow.data!.id }), "workflow graph timed out")
+          if (!result.data) return
+          const planPath = result.data.milestones[0]?.planPath
+          if (!planPath) return
+          if (!(yield* Effect.promise(() => Bun.file(path.join(test.directory, planPath)).exists()))) return
+          return result
+        }),
+        "workflow initialization did not write milestone plan files",
+        "10 seconds",
+      )
       if (!graph.data) throw new Error("workflow graph returned no data")
       expect(graph.data.nodes.map((node) => node.id)).toContain("requirements")
       expect(graph.data.milestones.map((milestone) => milestone.id)).toEqual([
@@ -102,23 +124,24 @@ describe("workflow HttpApi", () => {
         true,
       )
 
-      const projectWorkflow = yield* Effect.promise(() =>
+      const projectWorkflow = yield* requestWithTimeout(() =>
         sdk.workflow.start({
           workflowStartInput: {
             prompt: "Run a workflow independent from the current chat",
           },
         }),
+        "project workflow start timed out",
       )
       if (!projectWorkflow.data) throw new Error("project workflow start returned no data")
 
       expect(projectWorkflow.data.rootSessionID).toBeDefined()
       expect(projectWorkflow.data.request).toBe("Run a workflow independent from the current chat")
-      expect(path.basename(projectWorkflow.data.path)).toEndWith("Run a workflow independent from the current chat")
+      expect(path.basename(projectWorkflow.data.path)).toBe(projectWorkflow.data.id)
 
       const list = yield* Effect.promise(() => sdk.workflow.list())
       expect(list.data?.map((item) => item.id)).toContain(projectWorkflow.data.id)
 
-      const staffedWorkflow = yield* Effect.promise(() =>
+      const staffedWorkflow = yield* requestWithTimeout(() =>
         sdk.workflow.start({
           workflowStartInput: {
             prompt: "Coordinate staffing and requester intervention",
@@ -136,6 +159,7 @@ describe("workflow HttpApi", () => {
             },
           },
         }),
+        "staffed workflow start timed out",
       )
       if (!staffedWorkflow.data) throw new Error("staffed workflow start returned no data")
 
@@ -188,7 +212,10 @@ describe("workflow HttpApi", () => {
         cacheMinutes: 120,
       })
 
-      const staffed = yield* Effect.promise(() => sdk.workflow.graph({ workflowID: staffedWorkflow.data!.id }))
+      const staffed = yield* requestWithTimeout(
+        () => sdk.workflow.graph({ workflowID: staffedWorkflow.data!.id }),
+        "staffed workflow graph timed out",
+      )
       if (!staffed.data) throw new Error("workflow graph returned no data")
       expect(staffed.data.members.filter((member) => member.role === "department_pm" && member.status === "active")).toHaveLength(2)
       expect(staffed.data.members.filter((member) => member.role === "executor" && member.status === "active")).toHaveLength(2)
@@ -204,7 +231,10 @@ describe("workflow HttpApi", () => {
       if (!intervened.data) throw new Error("workflow intervention returned no data")
       expect(intervened.data.status).toBe("blocked")
 
-      const intervenedGraph = yield* Effect.promise(() => sdk.workflow.graph({ workflowID: staffedWorkflow.data!.id }))
+      const intervenedGraph = yield* requestWithTimeout(
+        () => sdk.workflow.graph({ workflowID: staffedWorkflow.data!.id }),
+        "intervened workflow graph timed out",
+      )
       if (!intervenedGraph.data) throw new Error("workflow graph returned no data")
       const intervention = intervenedGraph.data.interventions.find((item) =>
         item.message.includes("validate the riskiest path first"),
@@ -241,7 +271,7 @@ describe("workflow HttpApi", () => {
       const request =
         "完善ECS到渲染工作流，你可以参照dev/下面graphics的unity的SRP工作流以及unrealEngine虚幻源码渲染能力、bevy fyrox等对wgpu架构的设计[image:ZirconEngine ECS 到渲染链路完善里程碑计划.md]"
 
-      const workflow = yield* Effect.promise(() =>
+      const workflow = yield* requestWithTimeout(() =>
         sdk.workflow.start({
           workflowStartInput: {
             sessionID: session.data!.id,
@@ -259,6 +289,7 @@ describe("workflow HttpApi", () => {
             },
           },
         }),
+        "attachment workflow start timed out",
       )
       if (!workflow.data) throw new Error("workflow start returned no data")
 
@@ -271,6 +302,69 @@ describe("workflow HttpApi", () => {
       })
       expect(path.basename(workflow.data.path)).not.toContain("/")
       expect(path.basename(workflow.data.path)).not.toContain(":")
+
+      yield* Effect.promise(() => sdk.workflow.cancel({ workflowID: WorkflowID.make(workflow.data!.id) }))
+    }),
+    30_000,
+  )
+
+  it.instance("returns an existing session workflow without waiting for path migration", () =>
+    Effect.gen(function* () {
+      const workflowAutorun = process.env.OPENCODE_WORKFLOW_AUTORUN
+      process.env.OPENCODE_WORKFLOW_AUTORUN = "0"
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => {
+          if (workflowAutorun === undefined) return delete process.env.OPENCODE_WORKFLOW_AUTORUN
+          process.env.OPENCODE_WORKFLOW_AUTORUN = workflowAutorun
+        }),
+      )
+      const test = yield* TestInstance
+      const sdk = client(test.directory)
+      const session = yield* Effect.promise(() => sdk.session.create({ title: "Existing workflow source" }))
+      if (!session.data) throw new Error("session create returned no data")
+      const workflow = yield* requestWithTimeout(() =>
+        sdk.workflow.start({
+          workflowStartInput: {
+            sessionID: session.data!.id,
+            prompt: "Build an existing workflow",
+          },
+        }),
+        "workflow start timed out",
+      )
+      if (!workflow.data) throw new Error("workflow start returned no data")
+
+      const legacyPath = path.join(".opencode", "workflows", "20260704_064850_329_legacy-long-prompt-path")
+      yield* Effect.promise(async () => {
+        await mkdir(path.join(test.directory, legacyPath), { recursive: true })
+        await Bun.write(path.join(test.directory, legacyPath, "marker.txt"), "legacy")
+      })
+      Database.Client().$client.prepare("UPDATE workflow SET path = ? WHERE id = ?").run(legacyPath, workflow.data.id)
+
+      const existing = yield* requestWithTimeout(() =>
+        sdk.workflow.start({
+          workflowStartInput: {
+            sessionID: session.data!.id,
+            prompt: "Build an existing workflow",
+          },
+        }),
+        "existing workflow start timed out",
+      )
+      if (!existing.data) throw new Error("existing workflow start returned no data")
+
+      expect(existing.data.id).toBe(workflow.data.id)
+      expect(existing.data.path).toBe(legacyPath)
+
+      const migratedPath = yield* pollWithTimeout(
+        Effect.sync(() => {
+          const row = Database.Client().$client.prepare("SELECT path FROM workflow WHERE id = ?").get(workflow.data!.id) as
+            | { path: string }
+            | undefined
+          return row?.path === workflow.data!.path ? row.path : undefined
+        }),
+        "legacy workflow path migration did not complete",
+        "5 seconds",
+      )
+      expect(migratedPath).toBe(workflow.data.path)
 
       yield* Effect.promise(() => sdk.workflow.cancel({ workflowID: WorkflowID.make(workflow.data!.id) }))
     }),
@@ -313,7 +407,7 @@ describe("workflow HttpApi", () => {
       const session = yield* Effect.promise(() => sdk.session.create({ title: "Legacy workflow source" }))
       if (!session.data) throw new Error("session create returned no data")
 
-      const workflow = yield* Effect.promise(() =>
+      const workflow = yield* requestWithTimeout(() =>
         sdk.workflow.start({
           workflowStartInput: {
             sessionID: session.data!.id,
@@ -322,6 +416,7 @@ describe("workflow HttpApi", () => {
             agent: "build",
           },
         }),
+        "legacy workflow start timed out",
       )
       if (!workflow.data) throw new Error("workflow start returned no data")
 

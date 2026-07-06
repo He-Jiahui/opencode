@@ -1,7 +1,6 @@
 import type { JSX } from "solid-js"
 import { Show, createEffect, onCleanup } from "solid-js"
 import { createStore } from "solid-js/store"
-import { createSortable } from "@thisbeyond/solid-dnd"
 import { IconButton } from "@opencode-ai/ui/icon-button"
 import { Tabs } from "@opencode-ai/ui/tabs"
 import { DropdownMenu } from "@opencode-ai/ui/dropdown-menu"
@@ -14,7 +13,6 @@ import { focusTerminalById } from "@/pages/session/helpers"
 export function SortableTerminalTab(props: { terminal: LocalPTY; onClose?: () => void }): JSX.Element {
   const terminal = useTerminal()
   const language = useLanguage()
-  const sortable = createSortable(props.terminal.id)
   const [store, setStore] = createStore({
     editing: false,
     title: props.terminal.title,
@@ -114,11 +112,9 @@ export function SortableTerminalTab(props: { terminal: LocalPTY; onClose?: () =>
 
   return (
     <div
-      use:sortable
       class="outline-none focus:outline-none focus-visible:outline-none"
       classList={{
         "h-full": true,
-        "opacity-0": sortable.isActiveDraggable,
       }}
     >
       <div class="relative h-full">

@@ -70,7 +70,6 @@
     "@solidjs/router": "catalog:",
     "@tanstack/solid-query": "5.91.4",
     "@tanstack/solid-virtual": "catalog:",
-    "@thisbeyond/solid-dnd": "0.7.5",
     "@xyflow/react": "12.10.2",
     "diff": "catalog:",
     "effect": "catalog:",

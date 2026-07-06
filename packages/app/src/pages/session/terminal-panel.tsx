@@ -5,9 +5,6 @@ import { Tabs } from "@opencode-ai/ui/tabs"
 import { ResizeHandle } from "@opencode-ai/ui/resize-handle"
 import { IconButton } from "@opencode-ai/ui/icon-button"
 import { TooltipKeybind } from "@opencode-ai/ui/tooltip"
-import { DragDropProvider, DragDropSensors, DragOverlay, SortableProvider, closestCenter } from "@thisbeyond/solid-dnd"
-import type { DragEvent } from "@thisbeyond/solid-dnd"
-import { ConstrainDragYAxis, getDraggableId } from "@/utils/solid-dnd"
 
 import { SortableTerminalTab } from "@/components/session"
 import { Terminal } from "@/components/terminal"
@@ -40,7 +37,6 @@ export function TerminalPanel() {
 
   const [store, setStore] = createStore({
     autoCreated: false,
-    activeDraggable: undefined as string | undefined,
     recovered: {} as Record<string, boolean>,
     view: typeof window === "undefined" ? 1000 : (window.visualViewport?.height ?? window.innerHeight),
   })
@@ -165,35 +161,6 @@ export function TerminalPanel() {
     trim(id)
   }
 
-  const handleTerminalDragStart = (event: unknown) => {
-    const id = getDraggableId(event)
-    if (!id) return
-    setStore("activeDraggable", id)
-  }
-
-  const handleTerminalDragOver = (event: DragEvent) => {
-    const { draggable, droppable } = event
-    if (!draggable || !droppable) return
-
-    const terminals = terminal.all()
-    const fromIndex = terminals.findIndex((t) => t.id === draggable.id.toString())
-    const toIndex = terminals.findIndex((t) => t.id === droppable.id.toString())
-    if (fromIndex !== -1 && toIndex !== -1 && fromIndex !== toIndex) {
-      terminal.move(draggable.id.toString(), toIndex)
-    }
-  }
-
-  const handleTerminalDragEnd = () => {
-    setStore("activeDraggable", undefined)
-
-    const activeId = terminal.active()
-    if (!activeId) return
-    requestAnimationFrame(() => {
-      if (terminal.active() !== activeId) return
-      focusTerminalById(activeId)
-    })
-  }
-
   return (
     <div
       ref={root}
@@ -256,83 +223,55 @@ export function TerminalPanel() {
             </div>
           }
         >
-          <DragDropProvider
-            onDragStart={handleTerminalDragStart}
-            onDragEnd={handleTerminalDragEnd}
-            onDragOver={handleTerminalDragOver}
-            collisionDetector={closestCenter}
-          >
-            <DragDropSensors />
-            <ConstrainDragYAxis />
-            <div class="flex flex-col h-full">
-              <Tabs
-                variant="alt"
-                value={terminal.active()}
-                onChange={(id) => terminal.open(id)}
-                class="!h-auto !flex-none"
-              >
-                <Tabs.List class="h-10 border-b border-border-weaker-base">
-                  <SortableProvider ids={ids()}>
-                    <For each={all()}>{(pty) => <SortableTerminalTab terminal={pty} onClose={close} />}</For>
-                  </SortableProvider>
-                  <div class="h-full flex items-center justify-center">
-                    <TooltipKeybind
-                      title={language.t("command.terminal.new")}
-                      keybind={command.keybind("terminal.new")}
-                      class="flex items-center"
-                    >
-                      <IconButton
-                        icon="plus-small"
-                        variant="ghost"
-                        iconSize="large"
-                        onClick={terminal.new}
-                        aria-label={language.t("command.terminal.new")}
-                      />
-                    </TooltipKeybind>
-                  </div>
-                </Tabs.List>
-              </Tabs>
-              <div class="flex-1 min-h-0 relative">
-                <Show when={opened() && terminal.active()} keyed>
-                  {(id) => {
-                    const ops = terminal.bind()
-                    return (
-                      <Show when={all().find((pty) => pty.id === id)}>
-                        {(pty) => (
-                          <div id={`terminal-wrapper-${id}`} class="absolute inset-0">
-                            <Terminal
-                              pty={pty()}
-                              autoFocus={opened()}
-                              onConnect={() => markTerminalConnected(terminalRecoveryKey(pty()), id, ops.trim)}
-                              onCleanup={ops.update}
-                              onConnectError={() => recoverTerminal(terminalRecoveryKey(pty()), id, ops.clone)}
-                            />
-                          </div>
-                        )}
-                      </Show>
-                    )
-                  }}
-                </Show>
-              </div>
-            </div>
-            <DragOverlay>
-              <Show when={store.activeDraggable} keyed>
-                {(id) => (
-                  <Show when={all().find((pty) => pty.id === id)}>
-                    {(t) => (
-                      <div class="relative p-1 h-10 flex items-center bg-background-stronger text-14-regular">
-                        {terminalTabLabel({
-                          title: t().title,
-                          titleNumber: t().titleNumber,
-                          t: language.t as (key: string, vars?: Record<string, string | number | boolean>) => string,
-                        })}
-                      </div>
-                    )}
-                  </Show>
-                )}
+          <div class="flex flex-col h-full">
+            <Tabs
+              variant="alt"
+              value={terminal.active()}
+              onChange={(id) => terminal.open(id)}
+              class="!h-auto !flex-none"
+            >
+              <Tabs.List class="h-10 border-b border-border-weaker-base">
+                <For each={all()}>{(pty) => <SortableTerminalTab terminal={pty} onClose={close} />}</For>
+                <div class="h-full flex items-center justify-center">
+                  <TooltipKeybind
+                    title={language.t("command.terminal.new")}
+                    keybind={command.keybind("terminal.new")}
+                    class="flex items-center"
+                  >
+                    <IconButton
+                      icon="plus-small"
+                      variant="ghost"
+                      iconSize="large"
+                      onClick={terminal.new}
+                      aria-label={language.t("command.terminal.new")}
+                    />
+                  </TooltipKeybind>
+                </div>
+              </Tabs.List>
+            </Tabs>
+            <div class="flex-1 min-h-0 relative">
+              <Show when={opened() && terminal.active()} keyed>
+                {(id) => {
+                  const ops = terminal.bind()
+                  return (
+                    <Show when={all().find((pty) => pty.id === id)}>
+                      {(pty) => (
+                        <div id={`terminal-wrapper-${id}`} class="absolute inset-0">
+                          <Terminal
+                            pty={pty()}
+                            autoFocus={opened()}
+                            onConnect={() => markTerminalConnected(terminalRecoveryKey(pty()), id, ops.trim)}
+                            onCleanup={ops.update}
+                            onConnectError={() => recoverTerminal(terminalRecoveryKey(pty()), id, ops.clone)}
+                          />
+                        </div>
+                      )}
+                    </Show>
+                  )
+                }}
               </Show>
-            </DragOverlay>
-          </DragDropProvider>
+            </div>
+          </div>
         </Show>
       </div>
     </div>

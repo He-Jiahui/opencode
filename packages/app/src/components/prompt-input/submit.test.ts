@@ -98,6 +98,7 @@ beforeAll(async () => {
 
   mock.module("@opencode-ai/core/util/encode", () => ({
     base64Encode: (value: string) => value,
+    checksum: (value: string) => (value ? String(value.length) : undefined),
   }))
 
   mock.module("@/context/local", () => ({
@@ -140,6 +141,14 @@ beforeAll(async () => {
 
   mock.module("@/context/prompt", () => ({
     usePrompt: () => prompt,
+  }))
+
+  mock.module("@/context/settings", () => ({
+    useSettings: () => ({
+      general: {
+        defaultPrompt: () => undefined,
+      },
+    }),
   }))
 
   mock.module("@/context/layout", () => ({

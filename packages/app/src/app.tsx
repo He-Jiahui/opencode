@@ -49,7 +49,6 @@ import { SDKProvider, useSDK } from "@/context/sdk"
 import { WslServersProvider } from "@/wsl/context"
 import DirectoryLayout, { DirectoryDataProvider } from "@/pages/directory-layout"
 import LegacyLayout from "@/pages/layout"
-import NewLayout from "@/pages/layout-new"
 import { ErrorPage } from "./pages/error"
 import { useCheckServerHealth } from "./utils/server-health"
 import { legacySessionServer, requireServerKey, sessionHref } from "./utils/session-route"
@@ -287,7 +286,7 @@ function NewAppLayout(props: ParentProps) {
   return (
     <SelectedServerProviders>
       <ServerScopedProviders>
-        <NewLayout>{props.children}</NewLayout>
+        <LegacyLayout>{props.children}</LegacyLayout>
       </ServerScopedProviders>
     </SelectedServerProviders>
   )
@@ -492,24 +491,23 @@ export function AppInterface(props: {
       <GlobalProvider>
         <SettingsProvider>
           <ConnectionGate disableHealthCheck={props.disableHealthCheck}>
-            <Show when={useSettings().general.newLayoutDesigns().toString()} keyed>
-              <Dynamic
-                component={props.router ?? Router}
-                root={(routerProps) => (
-                  <TabsProvider>
-                    <NotificationProvider>
-                      <ServerShell>
-                        <Show when={useSettings().general.newLayoutDesigns()} fallback={routerProps.children}>
-                          <NewAppLayout>{routerProps.children}</NewAppLayout>
-                        </Show>
-                      </ServerShell>
-                    </NotificationProvider>
-                  </TabsProvider>
-                )}
-              >
-                <Routes />
-              </Dynamic>
-            </Show>
+            {/* Keep Router/Tabs stable while persisted settings hydrate; keyed remounts leave stale tab commands behind. */}
+            <Dynamic
+              component={props.router ?? Router}
+              root={(routerProps) => (
+                <TabsProvider>
+                  <NotificationProvider>
+                    <ServerShell>
+                      <Show when={useSettings().general.newLayoutDesigns()} fallback={routerProps.children}>
+                        <NewAppLayout>{routerProps.children}</NewAppLayout>
+                      </Show>
+                    </ServerShell>
+                  </NotificationProvider>
+                </TabsProvider>
+              )}
+            >
+              <Routes />
+            </Dynamic>
           </ConnectionGate>
         </SettingsProvider>
       </GlobalProvider>

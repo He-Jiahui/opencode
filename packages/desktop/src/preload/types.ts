@@ -38,6 +38,12 @@ export type FatalRendererError = {
   version?: string
   platform: string
   os?: string
+  kind?: "error" | "unhandledrejection" | "console" | "route"
+  stack?: string
+  source?: string
+  line?: number
+  column?: number
+  userAgent?: string
 }
 
 export type ElectronAPI = {

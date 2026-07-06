@@ -7,7 +7,7 @@ import { Spinner } from "@opencode-ai/ui/spinner"
 import { Tooltip } from "@opencode-ai/ui/tooltip"
 import { ContextMenu } from "@opencode-ai/ui/context-menu"
 import { getFilename } from "@opencode-ai/core/util/path"
-import { A, useParams } from "@solidjs/router"
+import { A, useNavigate, useParams } from "@solidjs/router"
 import { type Accessor, createEffect, createMemo, For, type JSX, Match, Show, Switch } from "solid-js"
 import { createStore } from "solid-js/store"
 import { useServerSync } from "@/context/server-sync"
@@ -25,6 +25,7 @@ import {
   sessionOnPath,
   sortedChildSessions,
 } from "./helpers"
+import { handleSidebarNavigation } from "./sidebar-navigation"
 
 export const ProjectIcon = (props: {
   project: LocalProject
@@ -162,17 +163,19 @@ const SessionRow = (props: {
   warmFocus: () => void
   workflowProgress: Accessor<WorkflowProgress | undefined>
 }): JSX.Element => {
+  const navigate = useNavigate()
+  const href = () => `/${props.slug}/session/${props.session.id}`
   const title = () => sessionTitle(props.session.title)
 
   return (
     <A
-      href={`/${props.slug}/session/${props.session.id}`}
+      href={href()}
       class={`flex items-center gap-2 min-w-0 w-full text-left focus:outline-none ${props.dense ? "py-0.5" : "py-1"}`}
       onPointerDown={props.warmPress}
       onFocus={props.warmFocus}
-      onClick={() => {
-        if (props.sidebarOpened()) return
-        props.clearHoverProjectSoon()
+      onClick={(event) => {
+        if (!handleSidebarNavigation(event, navigate, href())) return
+        if (!props.sidebarOpened()) props.clearHoverProjectSoon()
       }}
     >
       <Show when={props.isWorking() || props.hasPermissions() || props.hasError() || props.unseenCount() > 0}>
@@ -428,18 +431,20 @@ export const NewSessionItem = (props: {
   sidebarExpanded: Accessor<boolean>
   clearHoverProjectSoon: () => void
 }): JSX.Element => {
+  const navigate = useNavigate()
   const layout = useLayout()
   const language = useLanguage()
   const label = language.t("command.session.new")
   const tooltip = () => props.mobile || !props.sidebarExpanded()
+  const href = () => `/${props.slug}/session`
   const item = (
     <A
-      href={`/${props.slug}/session`}
+      href={href()}
       end
       class={`flex items-center gap-2 min-w-0 w-full text-left focus:outline-none ${props.dense ? "py-0.5" : "py-1"}`}
-      onClick={() => {
-        if (layout.sidebar.opened()) return
-        props.clearHoverProjectSoon()
+      onClick={(event) => {
+        if (!handleSidebarNavigation(event, navigate, href())) return
+        if (!layout.sidebar.opened()) props.clearHoverProjectSoon()
       }}
     >
       <div class="shrink-0 size-6 flex items-center justify-center">

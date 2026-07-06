@@ -25,6 +25,12 @@ export type FatalRendererErrorLog = {
   version?: string
   platform: PlatformName
   os?: DesktopOS
+  kind?: "error" | "unhandledrejection" | "console" | "route"
+  stack?: string
+  source?: string
+  line?: number
+  column?: number
+  userAgent?: string
 }
 
 type PlatformBase = {

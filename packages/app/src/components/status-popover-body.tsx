@@ -5,7 +5,7 @@ import { Switch } from "@opencode-ai/ui/switch"
 import { Tabs } from "@opencode-ai/ui/tabs"
 import { showToast } from "@/utils/toast"
 import { useNavigate } from "@solidjs/router"
-import { type Accessor, createEffect, createMemo, For, type JSXElement, onCleanup, Show } from "solid-js"
+import { type Accessor, batch, createEffect, createMemo, For, type JSXElement, onCleanup, Show } from "solid-js"
 import { createStore } from "solid-js/store"
 import { ServerHealthIndicator, ServerRow } from "@/components/server/server-row"
 import { useLanguage } from "@/context/language"
@@ -141,8 +141,13 @@ export function StatusPopoverServerBody() {
         blocked: global.servers.health[key]?.healthy === false,
         active: !!server.current && key === ServerConnection.key(server.current),
         onSelect: () => {
-          navigate("/")
-          queueMicrotask(() => server.setActive(key))
+          // Run navigate + setActive in the same tick so Solid disposes the
+          // old subtree once instead of cascading the route change disposal
+          // into the ServerKey remount.
+          batch(() => {
+            navigate("/")
+            server.setActive(key)
+          })
         },
       }
     }),
@@ -340,8 +345,13 @@ export function StatusPopoverBody(props: { shown: Accessor<boolean> }) {
                         aria-disabled={blocked()}
                         onClick={() => {
                           if (blocked()) return
-                          navigate("/")
-                          queueMicrotask(() => server.setActive(key))
+                          // Run navigate + setActive in the same tick so Solid
+                          // disposes the old subtree once instead of cascading
+                          // the route change disposal into the ServerKey remount.
+                          batch(() => {
+                            navigate("/")
+                            server.setActive(key)
+                          })
                         }}
                       >
                         <ServerHealthIndicator health={global.servers.health[key]} />

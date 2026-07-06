@@ -1,20 +1,16 @@
-import { For, Match, Show, Switch, createEffect, createMemo, onCleanup, type JSX } from "solid-js"
-import { createStore } from "solid-js/store"
+import { For, Match, Show, Switch, createEffect, createMemo, createSignal, onCleanup, type JSX } from "solid-js"
 import { createMediaQuery } from "@solid-primitives/media"
 import { Tabs } from "@opencode-ai/ui/tabs"
 import { IconButton } from "@opencode-ai/ui/icon-button"
 import { TooltipKeybind } from "@opencode-ai/ui/tooltip"
 import { ResizeHandle } from "@opencode-ai/ui/resize-handle"
 import { Mark } from "@opencode-ai/ui/logo"
-import { DragDropProvider, DragDropSensors, DragOverlay, SortableProvider, closestCenter } from "@thisbeyond/solid-dnd"
-import type { DragEvent } from "@thisbeyond/solid-dnd"
 import type { SnapshotFileDiff, VcsFileDiff } from "@opencode-ai/sdk/v2"
-import { ConstrainDragYAxis, getDraggableId } from "@/utils/solid-dnd"
 import { useDialog } from "@opencode-ai/ui/context/dialog"
 
 import FileTree from "@/components/file-tree"
 import { SessionContextUsage } from "@/components/session-context-usage"
-import { SessionContextTab, SortableTab, FileVisual } from "@/components/session"
+import { SessionContextTab, SortableTab } from "@/components/session"
 import { useCommand } from "@/context/command"
 import { useFile, type SelectedLineRange } from "@/context/file"
 import { useLanguage } from "@/context/language"
@@ -26,7 +22,6 @@ import { FileTabContent } from "@/pages/session/file-tabs"
 import {
   createOpenSessionFileTab,
   createSessionTabs,
-  getTabReorderIndex,
   shouldShowFileTree,
   type Sizing,
 } from "@/pages/session/helpers"
@@ -155,6 +150,14 @@ export function SessionSidePanel(props: {
   const openedTabs = tabState.openedTabs
   const activeTab = tabState.activeTab
   const activeFileTab = tabState.activeFileTab
+  const [fileTabList, setFileTabList] = createSignal<HTMLDivElement>()
+
+  createEffect(() => {
+    const el = fileTabList()
+    if (!el) return
+    const stop = createFileTabListSync({ el, contextOpen })
+    onCleanup(stop)
+  })
 
   const fileTreeTab = () => layout.fileTree.tab()
 
@@ -166,30 +169,6 @@ export function SessionSidePanel(props: {
   const showAllFiles = () => {
     if (fileTreeTab() !== "changes") return
     layout.fileTree.setTab("all")
-  }
-
-  const [store, setStore] = createStore({
-    activeDraggable: undefined as string | undefined,
-  })
-
-  const handleDragStart = (event: unknown) => {
-    const id = getDraggableId(event)
-    if (!id) return
-    setStore("activeDraggable", id)
-  }
-
-  const handleDragOver = (event: DragEvent) => {
-    const { draggable, droppable } = event
-    if (!draggable || !droppable) return
-
-    const currentTabs = tabs().all()
-    const toIndex = getTabReorderIndex(currentTabs, draggable.id.toString(), droppable.id.toString())
-    if (toIndex === undefined) return
-    tabs().move(draggable.id.toString(), toIndex)
-  }
-
-  const handleDragEnd = () => {
-    setStore("activeDraggable", undefined)
   }
 
   createEffect(() => {
@@ -248,22 +227,9 @@ export function SessionSidePanel(props: {
               }}
             >
               <div class="size-full min-w-0 h-full bg-background-base">
-                <DragDropProvider
-                  onDragStart={handleDragStart}
-                  onDragEnd={handleDragEnd}
-                  onDragOver={handleDragOver}
-                  collisionDetector={closestCenter}
-                >
-                  <DragDropSensors />
-                  <ConstrainDragYAxis />
-                  <Tabs value={activeTab()} onChange={openTab}>
+                <Tabs value={activeTab()} onChange={openTab}>
                     <div class="sticky top-0 shrink-0 flex">
-                      <Tabs.List
-                        ref={(el: HTMLDivElement) => {
-                          const stop = createFileTabListSync({ el, contextOpen })
-                          onCleanup(stop)
-                        }}
-                      >
+                      <Tabs.List ref={setFileTabList}>
                         <Show when={reviewTab() && props.canReview()}>
                           <Tabs.Trigger value="review">
                             <div class="flex items-center gap-1.5">
@@ -302,9 +268,7 @@ export function SessionSidePanel(props: {
                             </div>
                           </Tabs.Trigger>
                         </Show>
-                        <SortableProvider ids={openedTabs()}>
-                          <For each={openedTabs()}>{(tab) => <SortableTab tab={tab} onTabClose={tabs().close} />}</For>
-                        </SortableProvider>
+                        <For each={openedTabs()}>{(tab) => <SortableTab tab={tab} onTabClose={tabs().close} />}</For>
                         <div class="bg-background-stronger h-full shrink-0 sticky right-0 z-10 flex items-center justify-center pr-3">
                           <TooltipKeybind
                             title={language.t("command.file.open")}
@@ -360,20 +324,7 @@ export function SessionSidePanel(props: {
                     <Show when={activeFileTab()} keyed>
                       {(tab) => <FileTabContent tab={tab} />}
                     </Show>
-                  </Tabs>
-                  <DragOverlay>
-                    <Show when={store.activeDraggable} keyed>
-                      {(tab) => {
-                        const path = file.pathFromTab(tab)
-                        return (
-                          <div data-component="tabs-drag-preview">
-                            <Show when={path}>{(p) => <FileVisual active path={p()} />}</Show>
-                          </div>
-                        )
-                      }}
-                    </Show>
-                  </DragOverlay>
-                </DragDropProvider>
+                </Tabs>
               </div>
             </div>
 

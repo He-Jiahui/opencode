@@ -15,7 +15,7 @@ import { useCommand } from "@/context/command"
 import { useTabs } from "@/context/tabs"
 import { createTabPromptState } from "@/context/prompt"
 import { base64Encode } from "@opencode-ai/core/util/encode"
-import { canStartTabDrag, isTabCloseTarget } from "./titlebar-tab-gesture"
+import { canStartTabDrag, isTabCloseTarget, isTabInteractiveTarget } from "./titlebar-tab-gesture"
 
 function SessionTabSlot(props: {
   tab: SessionTab
@@ -219,6 +219,7 @@ export function TitlebarTabStrip(props: {
               preventActivation: (event) =>
                 !canStartTabDrag(event.pointerType) ||
                 isTabCloseTarget(event.target) ||
+                isTabInteractiveTarget(event.target) ||
                 (event.target instanceof Element && !!event.target.closest('[contenteditable="true"]')),
             }),
           ]}
@@ -252,7 +253,7 @@ export function TitlebarTabStrip(props: {
               {(tab, index) => {
                 const id = tabKey(tab)
                 let ref!: HTMLDivElement
-                useTabShortcut(index, () => props.onNavigate(tab, ref))
+                useTabShortcut(id, index, () => props.onNavigate(tab, ref))
                 const serverCtx = createMemo(() => {
                   if (tab.type !== "session") return
                   const conn = global.servers.list().find((item) => ServerConnection.key(item) === tab.server)
@@ -310,10 +311,10 @@ export function TitlebarTabStrip(props: {
   )
 }
 
-function useTabShortcut(index: () => number, onSelect: () => void) {
+function useTabShortcut(id: string, index: () => number, onSelect: () => void) {
   const command = useCommand()
 
-  command.register(() => {
+  command.register(`tab.shortcut.${id}`, () => {
     const number = index() + 1
     if (number > 9) return []
     return [

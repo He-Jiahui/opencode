@@ -27,6 +27,7 @@ type WorkflowModelWhitelistEntry = {
   cacheMinutes: number
 }
 type WorkflowModelWhitelist = Record<WorkflowModelWhitelistRole, WorkflowModelWhitelistEntry[]>
+type WorkflowStartControl = { signal: AbortSignal }
 
 const defaultStaffing: WorkflowStaffing = {
   mainPM: 1,
@@ -55,6 +56,8 @@ const modelWhitelistRoles = [
   ["tester", "session.workflow.staffing.tester"],
   ["expert", "session.workflow.staffing.expert"],
 ] as const
+
+const workflowStartTimeoutMS = 45_000
 
 const emptyModelWhitelist = (): WorkflowModelWhitelist => ({
   requester: [],
@@ -89,7 +92,12 @@ export function DialogStartWorkflow(props: {
   variants?: string[]
   initialVariant?: string
   pending?: boolean
-  onStart: (input: { request: string; variant?: string; staffing: WorkflowStaffing; modelWhitelist: WorkflowModelWhitelist }) => void
+  onStart: (input: {
+    request: string
+    variant?: string
+    staffing: WorkflowStaffing
+    modelWhitelist: WorkflowModelWhitelist
+  }, control: WorkflowStartControl) => void | Promise<unknown>
 }) {
   const dialog = useDialog()
   const language = useLanguage()
@@ -111,6 +119,8 @@ export function DialogStartWorkflow(props: {
     variant: props.initialVariant,
     staffing: { ...defaultStaffing },
     modelWhitelist: emptyModelWhitelist(),
+    submitting: false,
+    error: "",
   })
 
   const addWhitelistModel = (role: WorkflowModelWhitelistRole) => {
@@ -150,15 +160,33 @@ export function DialogStartWorkflow(props: {
 
   const submit = (event: SubmitEvent) => {
     event.preventDefault()
-    if (props.pending) return
+    if (props.pending || store.submitting) return
     const request = store.request.trim()
     if (!request) return
-    props.onStart({
+    setStore({ submitting: true, error: "" })
+    const input = {
       request,
       variant: store.variant === "default" ? undefined : store.variant,
       staffing: store.staffing,
       modelWhitelist: store.modelWhitelist,
+    }
+    const controller = new AbortController()
+    let timeoutID: number | undefined
+    const timeout = new Promise<never>((_, reject) => {
+      timeoutID = window.setTimeout(
+        () => {
+          controller.abort()
+          reject(new Error("Workflow start request timed out. Please retry after the service recovers."))
+        },
+        workflowStartTimeoutMS,
+      )
     })
+    Promise.race([Promise.resolve().then(() => props.onStart(input, { signal: controller.signal })), timeout])
+      .catch((error) => setStore("error", error instanceof Error ? error.message : String(error)))
+      .finally(() => {
+        if (timeoutID !== undefined) window.clearTimeout(timeoutID)
+        setStore("submitting", false)
+      })
   }
 
   return (
@@ -315,14 +343,19 @@ export function DialogStartWorkflow(props: {
                 </For>
               </div>
             </details>
+            <Show when={store.error}>
+              <div class="rounded-md border border-danger/30 bg-danger/10 px-3 py-2 text-12-regular text-danger">
+                {store.error}
+              </div>
+            </Show>
           </div>
         </div>
         <div class="flex shrink-0 justify-end gap-2 border-t border-border-weak-base px-6 py-4">
           <Button type="button" variant="ghost" size="large" onClick={() => dialog.close()}>
             {language.t("common.cancel")}
           </Button>
-          <Button type="submit" variant="primary" size="large" disabled={props.pending || !store.request.trim()}>
-            {props.pending ? language.t("common.loading") : language.t("session.workflow.start")}
+          <Button type="submit" variant="primary" size="large" disabled={props.pending || store.submitting || !store.request.trim()}>
+            {props.pending || store.submitting ? language.t("common.loading") : language.t("session.workflow.start")}
           </Button>
         </div>
       </form>

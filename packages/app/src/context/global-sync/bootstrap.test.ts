@@ -28,6 +28,7 @@ function directoryState() {
     workflow: [],
     workflow_session: {},
     workflow_graph: {},
+    workflow_graph_version: {},
     session_status: {},
     session_working(id: string) {
       return this.session_status[id]?.type !== "idle"

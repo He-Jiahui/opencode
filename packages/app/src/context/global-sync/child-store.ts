@@ -120,8 +120,14 @@ export function createChildStoreManager(input: {
     mcpToggles.delete(key)
     const dispose = disposers.get(key)
     if (dispose) {
-      dispose()
       disposers.delete(key)
+      // Defer the solid-js root disposal. disposeDirectory can run from
+      // pinForOwner's onCleanup, and calling dispose() there starts a nested
+      // cleanNode cascade on this root while the outer cascade is still
+      // walking its owned array, corrupting solid's graph traversal
+      // ("Cannot read properties of null (reading '1')"). Synchronous
+      // bookkeeping above still runs now; only the reactive teardown waits.
+      queueMicrotask(dispose)
     }
     delete children[key]
     input.onDispose(key)
@@ -220,6 +226,7 @@ export function createChildStoreManager(input: {
             workflow: [],
             workflow_session: {},
             workflow_graph: {},
+            workflow_graph_version: {},
             session_status: {},
             session_working(id: string) {
               const type = this.session_status[id]?.type

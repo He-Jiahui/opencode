@@ -277,6 +277,21 @@ export const SettingsGeneralV2: Component<{
         </SettingsRowV2>
 
         <SettingsRowV2
+          title={language.t("settings.general.row.defaultPrompt.title")}
+          description={language.t("settings.general.row.defaultPrompt.description")}
+        >
+          <textarea
+            data-action="settings-default-prompt"
+            class="min-h-24 w-full resize-y rounded-[8px] border border-border-weak-base bg-v2-background-bg-base px-3 py-2 text-13-regular text-v2-text-text-base outline-none focus:border-border-strong sm:w-[360px]"
+            value={settings.general.defaultPrompt()}
+            placeholder={language.t("settings.general.row.defaultPrompt.placeholder")}
+            onInput={(event) => settings.general.setDefaultPrompt(event.currentTarget.value)}
+            spellcheck={false}
+            aria-label={language.t("settings.general.row.defaultPrompt.title")}
+          />
+        </SettingsRowV2>
+
+        <SettingsRowV2
           title={language.t("settings.general.row.reasoningSummaries.title")}
           description={language.t("settings.general.row.reasoningSummaries.description")}
         >

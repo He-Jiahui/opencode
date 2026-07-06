@@ -1,4 +1,4 @@
-import type { Project, UserMessage } from "@opencode-ai/sdk/v2"
+import type { Project, UserMessage, WorkflowGraph } from "@opencode-ai/sdk/v2"
 import { useDialog } from "@opencode-ai/ui/context/dialog"
 import { createQuery, skipToken, useMutation, useQueryClient } from "@tanstack/solid-query"
 import {
@@ -13,9 +13,12 @@ import {
   createComputed,
   on,
   onMount,
+  For,
+  createSignal,
   type ParentProps,
   untrack,
 } from "solid-js"
+import { Portal } from "solid-js/web"
 import { makeEventListener } from "@solid-primitives/event-listener"
 import { createMediaQuery } from "@solid-primitives/media"
 import { createResizeObserver } from "@solid-primitives/resize-observer"
@@ -37,6 +40,14 @@ import { showToast } from "@/utils/toast"
 import { base64Encode, checksum } from "@opencode-ai/core/util/encode"
 import { Navigate, useLocation, useNavigate, useParams, useSearchParams } from "@solidjs/router"
 import { NewSessionView, SessionHeader } from "@/components/session"
+import {
+  mountWorkflowReactFlow,
+  type WorkflowReactFlowContextTarget,
+  type WorkflowReactFlowInstance,
+  type WorkflowReactFlowProps,
+  type WorkflowReactFlowSessionState,
+  type WorkflowReactFlowTarget,
+} from "@/components/workflow-react-flow"
 import { ErrorPage } from "@/pages/error"
 import { CommentsProvider, useComments } from "@/context/comments"
 import { DirectoryDataProvider } from "@/pages/directory-layout"
@@ -94,9 +105,138 @@ import { createSessionLineage } from "./session/session-lineage"
 type FollowupItem = FollowupDraft & { id: string }
 type FollowupEdit = Pick<FollowupItem, "id" | "prompt" | "context">
 const emptyFollowups: FollowupItem[] = []
+const emptyWorkflowList: WorkflowGraph["workflow"][] = []
 
 type ChangeMode = "git" | "branch" | "turn"
 type VcsMode = "git" | "branch"
+type WorkflowSessionLogRole = NonNullable<WorkflowGraph["nodes"][number]["role"]>
+type WorkflowSessionLogSource = "workflow" | "trigger" | "staff"
+type WorkflowSessionLogEntry = {
+  role: WorkflowSessionLogRole
+  source: WorkflowSessionLogSource
+  title: string
+  status: string
+  sessionID?: string
+  specialty?: string
+  milestoneID?: string
+  milestoneTitle?: string
+  attempt?: number
+  current: boolean
+}
+type WorkflowSessionLogGroup = {
+  role: WorkflowSessionLogRole
+  entries: WorkflowSessionLogEntry[]
+}
+const workflowSessionLogRoleOrder: WorkflowSessionLogRole[] = [
+  "requester",
+  "main_pm",
+  "department_pm",
+  "expert",
+  "executor",
+  "reviewer",
+  "tester",
+]
+
+const workflowSessionRefKey = (role: WorkflowSessionLogRole, sessionID: string) => `${role}:${sessionID}`
+const workflowStatusTone = (status: string) => {
+  if (status === "approved" || status === "completed" || status === "done") return "bg-success/10 text-success"
+  if (status === "rejected" || status === "blocked" || status === "failed" || status === "cancelled")
+    return "bg-danger/10 text-danger"
+  if (status === "pending") return "bg-surface-element text-text-weak"
+  return "bg-accent/10 text-accent"
+}
+const workflowSessionLogStatusTone = (status: string) => {
+  if (status === "approved" || status === "completed" || status === "done" || status === "active" || status === "running")
+    return "bg-success/10 text-success"
+  if (status === "rejected" || status === "blocked" || status === "failed" || status === "cancelled" || status === "paused")
+    return "bg-danger/10 text-danger"
+  if (status === "pending" || status === "untriggered") return "bg-surface-element text-text-weak"
+  return "bg-accent/10 text-accent"
+}
+const workflowSessionLogAttempt = (attempt: WorkflowGraph["milestones"][number]["attempt"] | undefined) =>
+  typeof attempt === "number" ? attempt : undefined
+
+const workflowSessionLogGroups = (
+  graph: WorkflowGraph,
+  currentSessionID: string | undefined,
+  sessionRunning: (sessionID: string) => boolean,
+): WorkflowSessionLogGroup[] => {
+  const memberBySessionRole = new Map(
+    graph.members.map((member) => [workflowSessionRefKey(member.role, member.sessionID), member] as const),
+  )
+  const baseEntryCandidates: (WorkflowSessionLogEntry | undefined)[] = [
+    graph.workflow.rootSessionID
+      ? {
+          role: "requester",
+          source: "workflow",
+          title: graph.workflow.title,
+          status: sessionRunning(graph.workflow.rootSessionID) ? "running" : graph.workflow.status,
+          sessionID: graph.workflow.rootSessionID,
+          current: graph.workflow.rootSessionID === currentSessionID,
+        }
+      : undefined,
+    graph.workflow.pmSessionID
+      ? {
+          role: "main_pm",
+          source: "workflow",
+          title: "Main product manager",
+          status: sessionRunning(graph.workflow.pmSessionID) ? "running" : graph.workflow.status,
+          sessionID: graph.workflow.pmSessionID,
+          current: graph.workflow.pmSessionID === currentSessionID,
+        }
+      : undefined,
+    graph.workflow.testerSessionID
+      ? {
+          role: "tester",
+          source: "workflow",
+          title: "Tester",
+          status: sessionRunning(graph.workflow.testerSessionID) ? "running" : graph.workflow.status,
+          sessionID: graph.workflow.testerSessionID,
+          current: graph.workflow.testerSessionID === currentSessionID,
+        }
+      : undefined,
+  ]
+  const baseEntries = baseEntryCandidates.filter((entry): entry is WorkflowSessionLogEntry => !!entry)
+  const triggerEntries = graph.milestones.flatMap((milestone) =>
+    milestone.session.map((ref): WorkflowSessionLogEntry => {
+      const member = memberBySessionRole.get(workflowSessionRefKey(ref.role, ref.sessionID))
+      return {
+        role: ref.role,
+        source: "trigger",
+        title: member?.title ?? `${ref.role} ${milestone.title ?? milestone.id}`,
+        status: sessionRunning(ref.sessionID) ? "running" : milestone.status,
+        sessionID: ref.sessionID,
+        specialty: member?.specialty ?? milestone.department,
+        milestoneID: String(ref.milestoneID ?? milestone.id),
+        milestoneTitle: milestone.title,
+        attempt: workflowSessionLogAttempt(ref.attempt ?? milestone.attempt),
+        current: ref.sessionID === currentSessionID,
+      }
+    }),
+  )
+  const usedSessions = new Set(
+    [...baseEntries, ...triggerEntries]
+      .filter((entry): entry is WorkflowSessionLogEntry & { sessionID: string } => !!entry.sessionID)
+      .map((entry) => workflowSessionRefKey(entry.role, entry.sessionID)),
+  )
+  const staffEntries = graph.members
+    .filter((member) => !usedSessions.has(workflowSessionRefKey(member.role, member.sessionID)))
+    .map(
+      (member): WorkflowSessionLogEntry => ({
+        role: member.role,
+        source: "staff",
+        title: member.title,
+        status: sessionRunning(member.sessionID) ? "running" : "untriggered",
+        sessionID: member.sessionID,
+        specialty: member.specialty,
+        current: member.sessionID === currentSessionID,
+      }),
+    )
+  const entries = [...baseEntries, ...triggerEntries, ...staffEntries]
+  return workflowSessionLogRoleOrder
+    .map((role) => ({ role, entries: entries.filter((entry) => entry.role === role) }))
+    .filter((group) => group.entries.length > 0)
+}
 
 const sessionViewState = () => ({
   messageId: undefined as string | undefined,
@@ -345,6 +485,7 @@ export default function Page() {
   const language = useLanguage()
   const sdk = useSDK()
   const serverSDK = useServerSDK()
+  const server = useServer()
   const settings = useSettings()
   const platform = usePlatform()
   const prompt = usePrompt()
@@ -541,6 +682,10 @@ export default function Page() {
   const [store, setStore] = createStore({
     ...sessionViewState(),
     newSessionWorktree: "main",
+    workflowPending: false,
+    workflowExpanded: false,
+    workflowFullscreen: false,
+    workflowSessionLog: false,
     deferRender: false,
   })
 
@@ -658,6 +803,338 @@ export default function Page() {
     if (project && sdk().directory !== project.worktree) return sdk().directory
     return "main"
   })
+
+  const workflowReferencesSession = (workflow: WorkflowGraph["workflow"], sessionID: string) => {
+    if (workflow.rootSessionID === sessionID || workflow.pmSessionID === sessionID || workflow.testerSessionID === sessionID)
+      return true
+    if (sync().data.workflow_session[sessionID]?.includes(workflow.id)) return true
+    const graph = sync().data.workflow_graph[workflow.id]
+    return (
+      graph?.members?.some((member) => member.sessionID === sessionID) ||
+      graph?.milestones?.some((milestone) => milestone.session?.some((ref) => ref.sessionID === sessionID)) ||
+      false
+    )
+  }
+
+  const sessionWorkflows = createMemo(() => {
+    if (!params.id) return emptyWorkflowList
+    return sync().data.workflow.filter((workflow) => workflowReferencesSession(workflow, params.id!))
+  })
+  const activeWorkflow = createMemo(() => sessionWorkflows().at(-1))
+  const activeWorkflowGraph = createMemo(() => {
+    const workflow = activeWorkflow()
+    if (!workflow) return
+    return sync().data.workflow_graph[workflow.id]
+  })
+  const refreshWorkflowGraph = (workflowID: string) =>
+    sdk()
+      .client.workflow.graph({ workflowID })
+      .then((result) => {
+        if (result.data) sync().set("workflow_graph", workflowID, result.data)
+        return result.data
+      })
+  const refreshWorkflow = (workflowID: string) =>
+    sdk()
+      .client.workflow.get({ workflowID })
+      .then((result) => {
+        if (result.data) sync().set("workflow", (items) => [...items.filter((item) => item.id !== result.data!.id), result.data!])
+        return result.data
+      })
+  const sessionBelongsToWorkflow = createMemo(() => {
+    const id = params.id
+    const workflow = activeWorkflow()
+    if (!id || !workflow) return false
+    return workflow.rootSessionID !== id && workflowReferencesSession(workflow, id)
+  })
+  const workflowSessionLog = createMemo(() => {
+    const graph = activeWorkflowGraph()
+    if (!graph) return []
+    return workflowSessionLogGroups(graph, params.id, (sessionID) => sync().data.session_working(sessionID))
+  })
+  const [workflowMenu, setWorkflowMenu] = createSignal<WorkflowReactFlowContextTarget>()
+
+  createEffect(
+    on(
+      () => activeWorkflow()?.id,
+      (workflowID) => {
+        if (!workflowID) return
+        if (sync().data.workflow_graph[workflowID]) return
+        void refreshWorkflowGraph(workflowID)
+      },
+    ),
+  )
+
+  const workflowPrompt = () => {
+    const message = lastUserMessage()
+    if (message) {
+      const text = extractPromptFromParts(sync().data.part[message.id] ?? [], {
+        directory: sdk().directory,
+        attachmentName: language.t("common.attachment"),
+      })
+        .map((part) => {
+          if (part.type === "image") return `[image:${part.filename}]`
+          if (part.type === "file") return `@${part.path}`
+          if (part.type === "agent") return `@${part.name}`
+          return part.content
+        })
+        .join("")
+        .trim()
+      if (text) return text
+    }
+    return info()?.title ?? ""
+  }
+
+  const workflowModel = () => {
+    const model = local.model.current()
+    if (!model) return
+    return `${model.provider.id}/${model.id}`
+  }
+
+  const workflowVariants = () => {
+    const variants = local.model.variant.list()
+    if (variants.length === 0) return []
+    return variants.includes("default") ? variants : ["default", ...variants]
+  }
+
+  const openStartWorkflowDialog = () => {
+    void import("@/components/dialog-start-workflow").then((x) => {
+      dialog.show(() => (
+        <x.DialogStartWorkflow
+          initialRequest={workflowPrompt()}
+          variants={workflowVariants()}
+          initialVariant={local.model.variant.current() ?? "default"}
+          pending={store.workflowPending}
+          onStart={(input) => {
+            setStore("workflowPending", true)
+            void sdk()
+              .client.workflow.start({
+                workflowStartInput: {
+                  ...(params.id ? { sessionID: params.id } : {}),
+                  prompt: input.request,
+                  model: workflowModel(),
+                  variant: input.variant,
+                  agent: local.agent.current()?.name,
+                  staffing: input.staffing,
+                  modelWhitelist: input.modelWhitelist,
+                },
+              })
+              .then((result) => {
+                dialog.close()
+                if (result.data) {
+                  sync().set("workflow", (items) => [...items.filter((item) => item.id !== result.data!.id), result.data!])
+                  void refreshWorkflowGraph(result.data.id)
+                }
+                showToast({
+                  variant: "success",
+                  icon: "circle-check",
+                  title: language.t("session.workflow.started.title"),
+                })
+              })
+              .catch((error: unknown) =>
+                showToast({
+                  variant: "error",
+                  title: language.t("common.requestFailed"),
+                  description: formatServerError(error, language.t),
+                }),
+              )
+              .finally(() => setStore("workflowPending", false))
+          }}
+        />
+      ))
+    })
+  }
+
+  const startWorkflowFromNewSession = () => {
+    void import("@/components/dialog-start-workflow").then((x) => {
+      dialog.show(() => (
+        <x.DialogStartWorkflow
+          initialRequest={searchParams.prompt ?? ""}
+          variants={workflowVariants()}
+          initialVariant={local.model.variant.current() ?? "default"}
+          pending={store.workflowPending}
+          onStart={(input) => {
+            setStore("workflowPending", true)
+            void sdk()
+              .client.workflow.start({
+                workflowStartInput: {
+                  prompt: input.request,
+                  model: workflowModel(),
+                  variant: input.variant,
+                  agent: local.agent.current()?.name,
+                  staffing: input.staffing,
+                  modelWhitelist: input.modelWhitelist,
+                },
+              })
+              .then((result) => {
+                dialog.close()
+                showToast({
+                  variant: "success",
+                  icon: "circle-check",
+                  title: language.t("session.workflow.started.title"),
+                })
+                const rootSessionID = result.data?.rootSessionID
+                if (rootSessionID) navigate(sessionHref(server.key, rootSessionID))
+              })
+              .catch((error: unknown) =>
+                showToast({
+                  variant: "error",
+                  title: language.t("common.requestFailed"),
+                  description: formatServerError(error, language.t),
+                }),
+              )
+              .finally(() => setStore("workflowPending", false))
+          }}
+        />
+      ))
+    })
+  }
+
+  const resumeWorkflowMutation = useMutation(() => ({
+    mutationFn: async () => {
+      const workflow = activeWorkflow()
+      if (!workflow) return
+      const sessionID = params.id
+      if (sessionID && sessionBelongsToWorkflow()) {
+        const result = await sdk().client.session.command({
+          sessionID,
+          command: "workflow-continue",
+          arguments: "",
+          ...(local.agent.current()?.name ? { agent: local.agent.current()?.name } : {}),
+          ...(workflowModel() ? { model: workflowModel() } : {}),
+          ...(local.model.variant.current() ? { variant: local.model.variant.current() } : {}),
+        })
+        if (!result.data) return
+        return sdk().client.workflow.get({ workflowID: workflow.id }).then((next) => next.data)
+      }
+      return sdk().client.workflow.resume({ workflowID: workflow.id }).then((result) => result.data)
+    },
+    onSuccess: (workflow) => {
+      if (!workflow) return
+      sync().set("workflow", (items) => [...items.filter((item) => item.id !== workflow.id), workflow])
+      void refreshWorkflow(workflow.id)
+      void refreshWorkflowGraph(workflow.id)
+      void sync().session.fetch(0)
+    },
+    onError: (error) => {
+      showToast({
+        variant: "error",
+        title: language.t("common.requestFailed"),
+        description: formatServerError(error, language.t),
+      })
+    },
+  }))
+
+  const cancelWorkflowMutation = useMutation(() => ({
+    mutationFn: async () => {
+      const workflow = activeWorkflow()
+      if (!workflow) return
+      return sdk().client.workflow.cancel({ workflowID: workflow.id }).then((result) => result.data)
+    },
+    onSuccess: (workflow) => {
+      if (!workflow) return
+      sync().set("workflow", (items) => [...items.filter((item) => item.id !== workflow.id), workflow])
+      void refreshWorkflow(workflow.id)
+      void refreshWorkflowGraph(workflow.id)
+      void sync().session.fetch(0)
+    },
+    onError: (error) => {
+      showToast({
+        variant: "error",
+        title: language.t("common.requestFailed"),
+        description: formatServerError(error, language.t),
+      })
+    },
+  }))
+
+  const openWorkflowPath = (path: string | undefined) => {
+    if (!path) return
+    setWorkflowMenu(undefined)
+    openReviewFile(path)
+    openReviewPanel()
+  }
+
+  const openWorkflowSession = (sessionID: string | undefined) => {
+    if (!sessionID) return
+    setWorkflowMenu(undefined)
+    setStore("workflowFullscreen", false)
+    setStore("workflowSessionLog", false)
+    navigate(sessionHref(server.key, sessionID))
+  }
+
+  const workflowNodeClick = (target: WorkflowReactFlowTarget) => {
+    openWorkflowSession(target.sessionID)
+  }
+
+  const workflowSessionState = (graph: WorkflowGraph) =>
+    Object.fromEntries(
+      graph.nodes
+        .map((node): [string, WorkflowReactFlowSessionState] | undefined => {
+          if (!node.sessionID) return
+          if (sync().data.session_working(node.sessionID)) return [node.sessionID, "running"]
+          if (node.type === "session") return [node.sessionID, "completed"]
+          return
+        })
+        .filter((entry): entry is [string, WorkflowReactFlowSessionState] => !!entry),
+    )
+
+  const workflowNodeContextMenu = (target: WorkflowReactFlowContextTarget) => {
+    setWorkflowMenu(target)
+  }
+
+  const workflowSessionLogRoleLabel = (role: WorkflowSessionLogRole) => {
+    if (role === "requester") return language.t("session.workflow.sessionLog.requester")
+    if (role === "main_pm") return language.t("session.workflow.staffing.mainPM")
+    if (role === "department_pm") return language.t("session.workflow.staffing.departmentPM")
+    if (role === "executor") return language.t("session.workflow.staffing.executor")
+    if (role === "reviewer") return language.t("session.workflow.staffing.reviewer")
+    if (role === "tester") return language.t("session.workflow.staffing.tester")
+    return language.t("session.workflow.staffing.expert")
+  }
+
+  const workflowSessionLogSourceLabel = (source: WorkflowSessionLogSource) => {
+    if (source === "workflow") return language.t("session.workflow.sessionLog.source.workflow")
+    if (source === "trigger") return language.t("session.workflow.sessionLog.source.trigger")
+    return language.t("session.workflow.sessionLog.source.staff")
+  }
+
+  const workflowSessionLogStatusLabel = (status: string) =>
+    status === "untriggered" ? language.t("session.workflow.sessionLog.untriggered") : status
+
+  const WorkflowGraphView = (props: { graph: WorkflowGraph; fullscreen?: boolean }) => {
+    const [host, setHost] = createSignal<HTMLDivElement>()
+    let flow: WorkflowReactFlowInstance | undefined
+    createEffect(() => {
+      const element = host()
+      if (!element) return
+      const next: WorkflowReactFlowProps = {
+        graph: props.graph,
+        milestoneLabel: language.t("session.workflow.milestone"),
+        viewport: props.fullscreen ? "fullscreen" : "panel",
+        currentSessionID: params.id,
+        sessionState: workflowSessionState(props.graph),
+        onNodeSelect: workflowNodeClick,
+        onNodeContextMenu: workflowNodeContextMenu,
+      }
+      if (!flow) {
+        flow = mountWorkflowReactFlow(element, next)
+        return
+      }
+      flow.update(next)
+    })
+    onCleanup(() => flow?.dispose())
+    return (
+      <div
+        ref={setHost}
+        class={
+          props.fullscreen
+            ? "h-full min-h-0 w-full overflow-hidden rounded-md border border-border-weak-base bg-surface-panel/60"
+            : "h-[260px] min-h-[220px] overflow-hidden rounded-md border border-border-weak-base bg-surface-panel/60"
+        }
+      />
+    )
+  }
+
+  makeEventListener(window, "click", () => setWorkflowMenu(undefined))
 
   const setActiveMessage = (message: UserMessage | undefined) => {
     messageMark = scrollMark
@@ -2021,12 +2498,302 @@ export default function Page() {
     return <SessionErrorFallback error={error} sessionID={params.id} />
   }
 
+  const workflowContextMenu = () => (
+    <Show when={workflowMenu()}>
+      {(target) => (
+        <Portal>
+          <div
+            class="fixed z-[100] flex min-w-44 flex-col gap-1 rounded-md border border-border-weak-base bg-surface-panel p-1 shadow-lg"
+            style={{
+              left: `${Math.max(8, Math.min(target().x, window.innerWidth - 184))}px`,
+              top: `${Math.max(8, Math.min(target().y, window.innerHeight - 88))}px`,
+            }}
+            onClick={(event) => event.stopPropagation()}
+            onContextMenu={(event) => event.preventDefault()}
+          >
+            <button
+              type="button"
+              class="rounded px-2 py-1.5 text-left text-12-regular text-text-strong hover:bg-surface-hover disabled:cursor-not-allowed disabled:text-text-disabled"
+              disabled={!target().sessionID}
+              onClick={() => openWorkflowSession(target().sessionID)}
+            >
+              {language.t("session.workflow.openSession")}
+            </button>
+            <button
+              type="button"
+              class="rounded px-2 py-1.5 text-left text-12-regular text-text-strong hover:bg-surface-hover disabled:cursor-not-allowed disabled:text-text-disabled"
+              disabled={!target().planPath}
+              onClick={() => openWorkflowPath(target().planPath)}
+            >
+              {language.t("session.workflow.openPlan")}
+            </button>
+          </div>
+        </Portal>
+      )}
+    </Show>
+  )
+
+  const workflowSessionLogWindow = () => (
+    <Show when={store.workflowSessionLog && activeWorkflowGraph()}>
+      {(graph) => (
+        <Portal>
+          <div
+            class="fixed inset-0 z-[1000] isolate flex items-center justify-center bg-black/70 p-4 backdrop-blur-sm"
+            onClick={() => setStore("workflowSessionLog", false)}
+          >
+            <div
+              class="relative z-[1] flex max-h-[82vh] w-full max-w-5xl flex-col overflow-hidden rounded-lg border border-border-strong bg-surface-raised-stronger-non-alpha shadow-xl"
+              onClick={(event) => event.stopPropagation()}
+            >
+              <div class="flex items-center gap-3 border-b border-border-weak-base bg-surface-raised-stronger-non-alpha px-4 py-3">
+                <div class="min-w-0 flex-1">
+                  <div class="text-15-medium text-text-strong">{language.t("session.workflow.sessionLog")}</div>
+                  <div class="truncate text-12-regular text-text-weak">
+                    {graph().workflow.title} · {graph().workflow.id}
+                  </div>
+                </div>
+                <Button type="button" size="small" variant="ghost" icon="close-small" onClick={() => setStore("workflowSessionLog", false)}>
+                  {language.t("common.close")}
+                </Button>
+              </div>
+              <div class="min-h-0 overflow-y-auto bg-background-base p-4">
+                <div class="mb-3 text-12-regular text-text-weak">
+                  {language.t("session.workflow.sessionLog.description")}
+                </div>
+                <div class="flex flex-col gap-3">
+                  <For
+                    each={workflowSessionLog()}
+                    fallback={
+                      <div class="rounded-md border border-border-weak-base bg-background px-3 py-4 text-12-regular text-text-weak">
+                        {language.t("session.workflow.sessionLog.empty")}
+                      </div>
+                    }
+                  >
+                    {(group) => (
+                      <section class="overflow-hidden rounded-md border border-border-weak-base bg-background-base">
+                        <div class="flex items-center gap-2 border-b border-border-weak-base bg-surface-raised-stronger-non-alpha px-3 py-2">
+                          <div class="min-w-0 flex-1">
+                            <div class="text-13-medium text-text-strong">{workflowSessionLogRoleLabel(group.role)}</div>
+                            <div class="text-11-regular text-text-weaker">
+                              {language.t("session.workflow.sessionLog.count", { count: group.entries.length })}
+                            </div>
+                          </div>
+                        </div>
+                        <div class="divide-y divide-border-weak-base">
+                          <For each={group.entries}>
+                            {(entry) => (
+                              <div
+                                class="grid grid-cols-[minmax(0,1fr)_auto] gap-3 bg-background-base px-3 py-2"
+                                classList={{
+                                  "border-l-2 border-accent bg-accent/5": entry.current,
+                                }}
+                              >
+                                <div class="min-w-0">
+                                  <div class="flex min-w-0 flex-wrap items-center gap-1.5">
+                                    <span class="truncate text-12-medium text-text-strong">{entry.title}</span>
+                                    <span class={`rounded px-1.5 py-0.5 text-[10px] leading-4 ${workflowSessionLogStatusTone(entry.status)}`}>
+                                      {workflowSessionLogStatusLabel(entry.status)}
+                                    </span>
+                                  </div>
+                                  <div class="mt-1 flex min-w-0 flex-wrap gap-x-3 gap-y-1 text-11-regular text-text-weak">
+                                    <span>{workflowSessionLogSourceLabel(entry.source)}</span>
+                                    <Show when={entry.specialty}>{(specialty) => <span>{specialty()}</span>}</Show>
+                                    <Show when={entry.milestoneID}>
+                                      {(milestoneID) => (
+                                        <span class="truncate">
+                                          {milestoneID()}
+                                          <Show when={entry.milestoneTitle}> · {entry.milestoneTitle}</Show>
+                                        </span>
+                                      )}
+                                    </Show>
+                                    <Show when={entry.attempt !== undefined}>
+                                      <span>{language.t("session.workflow.sessionLog.attempt", { count: entry.attempt ?? 0 })}</span>
+                                    </Show>
+                                    <Show when={entry.sessionID}>
+                                      {(sessionID) => <span class="max-w-60 truncate font-mono text-text-weaker">{sessionID()}</span>}
+                                    </Show>
+                                  </div>
+                                </div>
+                                <Button
+                                  type="button"
+                                  size="small"
+                                  variant="ghost"
+                                  icon="enter"
+                                  disabled={!entry.sessionID}
+                                  onClick={() => openWorkflowSession(entry.sessionID)}
+                                >
+                                  {language.t("session.workflow.openSession")}
+                                </Button>
+                              </div>
+                            )}
+                          </For>
+                        </div>
+                      </section>
+                    )}
+                  </For>
+                </div>
+              </div>
+            </div>
+          </div>
+        </Portal>
+      )}
+    </Show>
+  )
+
+  const workflowFullscreenPreview = () => (
+    <Show when={store.workflowFullscreen && activeWorkflowGraph()}>
+      {(graph) => (
+        <Portal>
+          <div class="workflow-fullscreen-preview fixed inset-0 z-[90] flex flex-col gap-3 p-4">
+            <div class="flex min-h-8 items-center gap-2">
+              <div class="min-w-0 flex-1">
+                <div class="truncate text-13-medium text-text-strong">{graph().workflow.title}</div>
+                <div class="truncate text-11-regular text-text-weaker">{graph().workflow.id}</div>
+              </div>
+              <Button type="button" size="small" variant="secondary" icon="bullet-list" onClick={() => setStore("workflowSessionLog", true)}>
+                {language.t("session.workflow.sessionLog")}
+              </Button>
+              <Button type="button" size="small" variant="secondary" icon="collapse" onClick={() => setStore("workflowFullscreen", false)}>
+                {language.t("session.workflow.exitFullscreen")}
+              </Button>
+            </div>
+            <div class="workflow-fullscreen-preview__graph min-h-0 flex-1 overflow-hidden rounded-md">
+              <WorkflowGraphView graph={graph()} fullscreen />
+            </div>
+          </div>
+        </Portal>
+      )}
+    </Show>
+  )
+
+  const workflowSessionControl = () => (
+    <>
+      <Show when={params.id && !mobileChanges()}>
+        <div class="shrink-0 px-3 pt-2 pb-1 flex max-w-full flex-col gap-2">
+          <div class="rounded-md border border-border-weak-base bg-surface-panel shadow-sm">
+            <div class="flex items-center gap-2 px-2 py-1.5">
+              <Show
+                when={sessionBelongsToWorkflow()}
+                fallback={
+                  <Button
+                    type="button"
+                    size="small"
+                    variant={activeWorkflow() ? "secondary" : "primary"}
+                    icon="branch"
+                    disabled={store.workflowPending || !params.id}
+                    onClick={openStartWorkflowDialog}
+                  >
+                    {activeWorkflow() ? language.t("session.workflow.startAnother") : language.t("session.workflow.start")}
+                  </Button>
+                }
+              >
+                <span class="shrink-0 rounded border border-border-weak-base px-2 py-1 text-12-medium text-text-weak">
+                  {language.t("session.workflow.belongsTo")}
+                </span>
+              </Show>
+              <Show when={activeWorkflow()} keyed>
+                {(workflow) => (
+                  <>
+                    <button
+                      type="button"
+                      class="min-w-0 flex-1 text-left"
+                      onClick={() => setStore("workflowExpanded", !store.workflowExpanded)}
+                    >
+                      <div class="flex min-w-0 items-center gap-2">
+                        <span class={`shrink-0 rounded px-1.5 py-0.5 text-[10px] leading-4 ${workflowStatusTone(workflow.status)}`}>
+                          {workflow.status}
+                        </span>
+                        <span class="truncate text-12-medium text-text-strong">{workflow.title}</span>
+                      </div>
+                      <div class="truncate text-11-regular text-text-weaker">{workflow.id}</div>
+                    </button>
+                    <Button
+                      type="button"
+                      size="small"
+                      variant="ghost"
+                      icon="expand"
+                      disabled={!activeWorkflowGraph()}
+                      onClick={() => setStore("workflowFullscreen", true)}
+                    >
+                      {language.t("session.workflow.fullscreen")}
+                    </Button>
+                    <Button
+                      type="button"
+                      size="small"
+                      variant="ghost"
+                      icon="bullet-list"
+                      disabled={!activeWorkflowGraph()}
+                      onClick={() => setStore("workflowSessionLog", true)}
+                    >
+                      {language.t("session.workflow.sessionLog")}
+                    </Button>
+                    <Button
+                      type="button"
+                      size="small"
+                      variant="ghost"
+                      icon="circle-check"
+                      disabled={resumeWorkflowMutation.isPending || workflow.status === "completed"}
+                      onClick={() => resumeWorkflowMutation.mutate()}
+                    >
+                      {language.t("session.workflow.resume")}
+                    </Button>
+                    <Button
+                      type="button"
+                      size="small"
+                      variant="ghost"
+                      icon="close-small"
+                      disabled={cancelWorkflowMutation.isPending || workflow.status === "cancelled"}
+                      onClick={() => cancelWorkflowMutation.mutate()}
+                    >
+                      {language.t("session.workflow.cancel")}
+                    </Button>
+                  </>
+                )}
+              </Show>
+            </div>
+            <Show when={store.workflowExpanded && activeWorkflow()}>
+              <div class="border-t border-border-weak-base p-2 flex flex-col gap-2">
+                <Show
+                  when={activeWorkflowGraph()}
+                  fallback={<div class="px-1 py-2 text-12-regular text-text-weak">{language.t("common.loading")}</div>}
+                >
+                  {(graph) => (
+                    <>
+                      <WorkflowGraphView graph={graph()} />
+                      <div class="flex flex-wrap gap-1.5">
+                        <For each={graph().milestones}>
+                          {(milestone) => (
+                            <Show when={milestone.planPath}>
+                              {(path) => (
+                                <Button type="button" size="small" variant="ghost" icon="open-file" onClick={() => openWorkflowPath(path())}>
+                                  {milestone.id}
+                                </Button>
+                              )}
+                            </Show>
+                          )}
+                        </For>
+                      </div>
+                    </>
+                  )}
+                </Show>
+              </div>
+            </Show>
+          </div>
+        </div>
+      </Show>
+      {workflowContextMenu()}
+      {workflowFullscreenPreview()}
+      {workflowSessionLogWindow()}
+    </>
+  )
+
   const sessionPanelContent = () => (
     <>
       {sessionSync() ?? ""}
       <Show when={!isDesktop() && !!params.id && settings.general.newLayoutDesigns() && !mobileTabsBottom()}>
         {mobileTabs(true)}
       </Show>
+      {workflowSessionControl()}
       <div class="flex-1 min-h-0 overflow-hidden">
         <Switch>
           <Match when={params.id && mobileChanges()}>
@@ -2086,7 +2853,11 @@ export default function Page() {
             </Show>
           </Match>
           <Match when={true}>
-            <NewSessionView worktree={newSessionWorktree()} />
+            <NewSessionView
+              worktree={newSessionWorktree()}
+              workflowPending={store.workflowPending}
+              onStartWorkflow={startWorkflowFromNewSession}
+            />
           </Match>
         </Switch>
       </div>
